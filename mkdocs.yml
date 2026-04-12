@@ -1,0 +1,30 @@
+site_name: trnsparse
+site_description: Sparse matrix operations for AWS Trainium via NKI
+site_url: https://trnsci.github.io/trnsparse/
+repo_url: https://github.com/trnsci/trnsparse
+repo_name: trnsci/trnsparse
+
+theme:
+  name: material
+  palette:
+    scheme: default
+    primary: indigo
+  features:
+    - content.code.copy
+    - navigation.sections
+
+nav:
+  - Home: index.md
+  - Installation: installation.md
+  - Quickstart: quickstart.md
+  - API Reference: api.md
+  - Architecture: architecture.md
+  - Deployment:
+      - AWS Setup for Neuron CI: aws_setup.md
+
+markdown_extensions:
+  - pymdownx.highlight
+  - pymdownx.superfences
+  - admonition
+  - toc:
+      permalink: true

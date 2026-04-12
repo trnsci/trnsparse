@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68.0", "setuptools-scm>=8.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trnsparse"
+version = "0.1.1"
+description = "Sparse matrix operations for AWS Trainium via NKI"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+authors = [
+    { name = "Scott Friedman", email = "scott@playgroundlogic.co" },
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering",
+]
+dependencies = [
+    "torch>=2.1",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+neuron = [
+    # Pinned >=2.24 for NKI 2.24+ nc_matmul calling convention (unified
+    # across the trnsci suite).
+    "neuronxcc>=2.24",
+    "torch-neuronx>=2.9",
+]
+dev = ["pytest>=7.0", "pytest-benchmark>=4.0", "scipy>=1.11"]
+
+[project.urls]
+Homepage = "https://github.com/trnsci/trnsparse"
+Repository = "https://github.com/trnsci/trnsparse"
+Issues = "https://github.com/trnsci/trnsparse/issues"
+
+[tool.setuptools.packages.find]
+include = ["trnsparse*"]
+
+[tool.pytest.ini_options]
+markers = ["neuron: requires Neuron hardware"]
+testpaths = ["tests"]
