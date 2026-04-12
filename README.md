@@ -8,7 +8,7 @@
 
 Sparse matrix operations for AWS Trainium via NKI.
 
-CSR/COO formats, SpMV, SpMM, and integral screening for sparse scientific computing on Trainium. Part of the **trn-\*** suite by [Playground Logic](https://playgroundlogic.co).
+CSR/COO formats, SpMV, SpMM, and integral screening for sparse scientific computing on Trainium. Part of the trnsci scientific computing suite ([github.com/trnsci](https://github.com/trnsci)).
 
 ## Install
 
@@ -55,4 +55,4 @@ stats = trnsparse.sparsity_stats(Q)
 
 ## License
 
-Apache 2.0 — Playground Logic LLC
+Apache 2.0 — Copyright 2026 Scott Friedman

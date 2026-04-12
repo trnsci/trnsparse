@@ -1,14 +1,14 @@
 # trnsparse
 
 Sparse matrix operations for AWS Trainium via NKI.
-Part of the trn-* scientific computing suite by Playground Logic.
+Part of the trnsci scientific computing suite.
 
 ## What This Is
 
 A cuSPARSE-equivalent for Trainium. CSR/COO formats, SpMV, SpMM,
 and integral screening for sparse scientific computing.
 
-**Primary use case:** Schwarz-screened Fock builds for Janesko/TCU.
+**Primary use case:** Schwarz-screened Fock builds for DF-MP2 quantum chemistry.
 At >3000 basis functions, >99% of shell quartets screen to zero.
 Storing and operating on the integral tensor in dense format wastes
 both memory and compute. trnsparse makes the sparsity explicit.

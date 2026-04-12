@@ -2,7 +2,7 @@
 trnsparse — Sparse matrix operations for AWS Trainium via NKI.
 
 CSR/COO formats, SpMV, SpMM, and integral screening for
-sparse scientific computing. Part of the trn-* suite by Playground Logic.
+sparse scientific computing. Part of the trnsci scientific computing suite.
 """
 
 __version__ = "0.1.0"
