@@ -1,6 +1,6 @@
 site_name: trnsparse
 site_description: Sparse matrix operations for AWS Trainium via NKI
-site_url: https://trnsci.github.io/trnsparse/
+site_url: https://trnsci.dev/trnsparse/
 repo_url: https://github.com/trnsci/trnsparse
 repo_name: trnsci/trnsparse
 
