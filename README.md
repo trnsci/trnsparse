@@ -14,7 +14,7 @@ CSR/COO formats, SpMV, SpMM, and integral screening for sparse scientific comput
 
 trnsparse follows the [trnsci 5-phase roadmap](https://trnsci.dev/roadmap/). Active work is tracked in phase-labeled GitHub issues:
 
-- **[Phase 1 — correctness](https://github.com/trnsci/trnsparse/issues/14)** (active): SpMM gather-matmul-scatter NKI kernel in place (via densify-then-GEMM); awaiting hardware validation + `@pytest.mark.neuron` coverage.
+- **[Phase 1 — correctness](https://github.com/trnsci/trnsparse/issues/14)** ✅ v0.2.0: NKI SpMM validated on trn1 via densify-then-GEMM; first `torch.autograd.Function`-wrapped NKI kernel in the suite (see [`trnsci/trnsci#3`](https://github.com/trnsci/trnsci/issues/3)). Benchmarks in [`docs/benchmarks.md`](https://trnsci.dev/trnsparse/benchmarks/).
 - **[Phase 3 — perf](https://github.com/trnsci/trnsparse/issues/15)**: nnz-bucketing SpMM, streaming large-sparse, NEFF cache reuse.
 - **[Phase 4 — multi-chip](https://github.com/trnsci/trnsparse/issues/16)**: sharded sparse matrices across chips.
 - **[Phase 5 — generation](https://github.com/trnsci/trnsparse/issues/17)**: trn2 DMA bandwidth exploitation.

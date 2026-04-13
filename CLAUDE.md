@@ -35,14 +35,22 @@ trnsparse/
 
 ## NKI SpMM Strategy
 
-SpMM on Trainium uses a gather-matmul-scatter pattern:
-1. **DMA engine**: gather non-zero column indices into dense SBUF tiles
-2. **Tensor Engine**: matmul the dense tile against B columns
-3. **DMA engine**: scatter results back to output rows
+**v0.2.0 (current):** SpMM materializes the CSR into a dense `(M, K)` tile
+and runs stationary-tile-reuse GEMM on the Tensor Engine. Validated on
+trn1; forward + `torch.autograd.Function` backward both pass parity +
+`gradcheck` at `atol=1e-4`. The dense materialization means no sparsity
+advantage yet — NKI is slower than the PyTorch fallback at small sparse
+sizes (see `docs/benchmarks.md`).
 
-This is the same pattern used in sparse attention. The efficiency depends
-on the nnz distribution per row — uniform nnz maps cleanly to fixed-size
-tiles; highly variable nnz needs row-bucketing.
+**v0.3.0 (planned, #15):** gather-matmul-scatter with row-bucketing.
+For each bucket of rows with similar nnz:
+1. **DMA engine**: gather non-zero column indices into dense SBUF tiles.
+2. **Tensor Engine**: matmul the tile against B columns.
+3. **DMA engine**: scatter results back to output rows.
+
+Same pattern used in sparse attention. Uniform nnz maps cleanly to fixed-
+size tiles; variable nnz is handled by bucketing rows by nnz quantile so
+each bucket pads only within itself.
 
 ## Dependencies
 

@@ -5,6 +5,41 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] — 2026-04-13
+
+### Added
+
+- **NKI SpMM kernel** validated on `trn1.2xlarge`. `set_backend("nki")`
+  routes `spmm` through `trnsparse.nki.kernels._spmm_dense_kernel`,
+  which runs stationary-tile-reuse GEMM on the Tensor Engine.
+- **`torch.autograd.Function` wrapping** (`_SpMMFunction`) with analytic
+  backward — the first differentiable NKI kernel in the trnsci suite.
+  Satisfies [`trnsci/trnsci#3`](https://github.com/trnsci/trnsci/issues/3);
+  validated via `torch.autograd.gradcheck` at `atol=1e-4`.
+- `tests/test_nki_spmm.py` — hardware-gated parity + gradcheck coverage
+  for tile-aligned, unaligned, and low-density inputs.
+- `benchmarks/bench_spmm.py` — four-backend SpMM table
+  (scipy / torch.sparse / trnsparse pytorch / trnsparse nki) in one
+  pytest pass.
+- `docs/benchmarks.md` populated with real `trn1.2xlarge` numbers.
+
+### Changed
+
+- `docs/architecture.md` describes the v0.2.0 SpMM dispatch path end to
+  end (materialize → pad → NKI GEMM → slice) and documents the known
+  dense-materialization cost that lands for row-bucketing (#15) in v0.3.0.
+
+### Known limits
+
+- SpMM NKI is slower than CPU backends in v0.2.0 — the dense materialization
+  removes the sparsity advantage. This is Phase 1 (correctness). Row-
+  bucketing in Phase 3 (#15) is where sparse speedups live.
+- SpMV stays on the PyTorch path — single-output-column NKI dispatch
+  doesn't amortize compile + HBM round-trip cost.
+
+Closes #14 (Phase 1). Addresses #4 (NKI column populated). Unblocks #15
+(Phase 3 perf).
+
 ## [0.1.3] — 2026-04-12
 
 ### Changed

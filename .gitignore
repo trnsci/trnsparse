@@ -17,3 +17,12 @@ venv/
 *.swo
 *~
 files.zip
+
+# terraform — state and downloaded plugins; lock file IS committed.
+infra/terraform/.terraform/
+infra/terraform/terraform.tfstate
+infra/terraform/terraform.tfstate.backup
+infra/terraform/*.tfvars
+
+# mkdocs build output
+/site/
