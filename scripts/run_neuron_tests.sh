@@ -105,18 +105,20 @@ CMD_ID=$(aws ssm send-command \
 echo "Command ID: $CMD_ID"
 echo "Waiting for command to complete (this may take several minutes)..."
 
-# aws ssm wait command-executed exits 255 if the command fails. We want to
-# capture output even on failure, so don't fail-fast here.
-aws ssm wait command-executed \
-  --command-id "$CMD_ID" \
-  --instance-id "$INSTANCE_ID" \
-  --region "$REGION" || true
-
-STATUS=$(aws ssm get-command-invocation \
-  --command-id "$CMD_ID" \
-  --instance-id "$INSTANCE_ID" \
-  --region "$REGION" \
-  --query 'Status' --output text)
+# `aws ssm wait command-executed` defaults to 20 polls × 30s = 10 min, which
+# is too short for a cold-start run where pip install of torch-neuronx /
+# neuronxcc pulls hundreds of MB. Poll manually with up to 40 min total.
+for _ in $(seq 1 240); do
+  STATUS=$(aws ssm get-command-invocation \
+    --command-id "$CMD_ID" \
+    --instance-id "$INSTANCE_ID" \
+    --region "$REGION" \
+    --query 'Status' --output text 2>/dev/null || echo "Unknown")
+  case "$STATUS" in
+    Success|Failed|TimedOut|Cancelled) break ;;
+  esac
+  sleep 10
+done
 
 echo ""
 echo "=== STDOUT ==="
