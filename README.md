@@ -4,7 +4,7 @@
 [![PyPI](https://img.shields.io/pypi/v/trnsparse)](https://pypi.org/project/trnsparse/)
 [![Python](https://img.shields.io/pypi/pyversions/trnsparse)](https://pypi.org/project/trnsparse/)
 [![License](https://img.shields.io/github/license/trnsci/trnsparse)](LICENSE)
-[![Docs](https://img.shields.io/badge/docs-mkdocs-blue)](https://trnsci.github.io/trnsparse/)
+[![Docs](https://img.shields.io/badge/docs-trnsci.dev-blue)](https://trnsci.dev/trnsparse/)
 
 Sparse matrix operations for AWS Trainium via NKI.
 

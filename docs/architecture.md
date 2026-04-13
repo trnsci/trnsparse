@@ -34,4 +34,4 @@ Conversions `csr_to_coo()` / `coo_to_csr()` are cheap (bucket sort).
 
 ## Dispatch
 
-All compute entry points (`spmv`, `spmm`, screening) route through `nki/dispatch.py`, which picks `pytorch` or `nki` based on `set_backend(...)` and hardware detection.
+`nki/dispatch.py` exposes `HAS_NKI`, `set_backend("auto"|"pytorch"|"nki")`, and `get_backend()`. The backend selector is scaffolded but not yet wired through the public ops — in v0.1.x, `spmv` / `spmm` / screening always run the PyTorch path regardless of `set_backend`. Routing through `_use_nki()` and the gather-matmul-scatter kernel lands in v0.2.0 once validated on trn1 / trn2 (see [issue #7](https://github.com/trnsci/trnsparse/issues/7) and [#2](https://github.com/trnsci/trnsparse/issues/2)).

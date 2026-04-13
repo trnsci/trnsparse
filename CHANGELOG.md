@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.2] — 2026-04-12
+
+### Changed
+
+- Sync `trnsparse.__version__` with `pyproject.toml` (both now `0.1.2`).
+  Previously `__init__.py` reported `0.1.0` while the package version was `0.1.1`.
+- Docs badge in `README.md` and `site_url` in `mkdocs.yml` point at
+  `trnsci.dev/trnsparse/` instead of `trnsci.github.io/trnsparse/`. Per-repo
+  GitHub Pages is superseded by the centralized trnsci.dev site.
+- `docs/architecture.md` clarifies that the NKI backend is scaffolded only —
+  the PyTorch path runs regardless of `set_backend` in v0.1.x. Routing +
+  on-hardware validation land in v0.2.0.
+
 ## [0.1.1] — 2026-04-12
 
 ### Added
