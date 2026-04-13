@@ -10,6 +10,19 @@ Sparse matrix operations for AWS Trainium via NKI.
 
 CSR/COO formats, SpMV, SpMM, and integral screening for sparse scientific computing on Trainium. Part of the trnsci scientific computing suite ([github.com/trnsci](https://github.com/trnsci)).
 
+## Current phase
+
+trnsparse follows the [trnsci 5-phase roadmap](https://trnsci.dev/roadmap/). Active work is tracked in phase-labeled GitHub issues:
+
+- **[Phase 1 — correctness](https://github.com/trnsci/trnsparse/issues/14)** (active): SpMM gather-matmul-scatter NKI kernel in place (via densify-then-GEMM); awaiting hardware validation + `@pytest.mark.neuron` coverage.
+- **[Phase 3 — perf](https://github.com/trnsci/trnsparse/issues/15)**: nnz-bucketing SpMM, streaming large-sparse, NEFF cache reuse.
+- **[Phase 4 — multi-chip](https://github.com/trnsci/trnsparse/issues/16)**: sharded sparse matrices across chips.
+- **[Phase 5 — generation](https://github.com/trnsci/trnsparse/issues/17)**: trn2 DMA bandwidth exploitation.
+
+_(No Phase 2 for trnsparse — the precision story is inherited from trnblas.)_
+
+Suite-wide tracker: [trnsci/trnsci#1](https://github.com/trnsci/trnsci/issues/1).
+
 ## Install
 
 ```bash
