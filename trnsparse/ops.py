@@ -18,7 +18,7 @@ from __future__ import annotations
 import torch
 from typing import Optional
 
-from .formats import CSRMatrix, COOMatrix
+from .formats import BSRMatrix, CSRMatrix, COOMatrix
 
 
 def _as_torch_csr(A: CSRMatrix) -> torch.Tensor:
@@ -146,3 +146,52 @@ def sparse_transpose(A: CSRMatrix) -> CSRMatrix:
 def nnz_per_row(A: CSRMatrix) -> torch.Tensor:
     """Number of non-zeros per row."""
     return A.row_ptrs[1:] - A.row_ptrs[:-1]
+
+
+def _bsr_spmm_pytorch(A: BSRMatrix, B: torch.Tensor) -> torch.Tensor:
+    """Block-sparse × dense matmul — PyTorch fallback reference.
+
+    Iterates over stored blocks, does `block @ B[j*b:(j+1)*b, :]` and
+    accumulates into the output row-block. This is the semantic spec
+    for the NKI kernel to match.
+    """
+    m, n = A.shape
+    _, k = B.shape
+    b = A.block_size
+    m_pad = ((m + b - 1) // b) * b
+    n_pad = ((n + b - 1) // b) * b
+    mb = m_pad // b
+
+    if B.shape[0] != n:
+        raise AssertionError(f"Dimension mismatch: A is {A.shape}, B is {B.shape}")
+
+    # Pad B up to block-aligned rows
+    if n_pad != n:
+        B_p = torch.zeros(n_pad, k, dtype=B.dtype, device=B.device)
+        B_p[:n, :] = B
+        B = B_p
+
+    out = torch.zeros(m_pad, k, dtype=A.dtype, device=B.device)
+    for i in range(mb):
+        start = A.block_row_ptrs[i].item()
+        end = A.block_row_ptrs[i + 1].item()
+        for idx in range(start, end):
+            j = A.block_col_indices[idx].item()
+            out[i * b:(i + 1) * b] += A.blocks[idx] @ B[j * b:(j + 1) * b]
+    return out[:m]
+
+
+def bsr_spmm(A: BSRMatrix, B: torch.Tensor) -> torch.Tensor:
+    """Block-sparse × dense matmul: C = A @ B.
+
+    On NKI backend: routes through `_BSRSpMMFunction`, which runs one
+    `nc_matmul` per nonzero block (zero gather overhead — each block is
+    already a Tensor Engine tile).
+
+    On PyTorch backend: the reference loop in `_bsr_spmm_pytorch`.
+    """
+    from .nki.dispatch import _use_nki
+    if _use_nki():
+        from .nki.dispatch import nki_bsr_spmm
+        return nki_bsr_spmm(A, B)
+    return _bsr_spmm_pytorch(A, B)

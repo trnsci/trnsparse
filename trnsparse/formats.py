@@ -127,6 +127,139 @@ class COOMatrix:
         return f"COOMatrix(shape={self.shape}, nnz={self.nnz}, density={self.density:.4f})"
 
 
+@dataclass
+class BSRMatrix:
+    """Block-Sparse Row format.
+
+    The Trainium-native sparse representation: every nonzero block is a
+    dense `(block_size, block_size)` tile that matches the Tensor Engine's
+    stationary-operand partition dim (128). A nonzero block becomes exactly
+    one `nc_matmul` call with zero gather overhead — the block is already
+    in the shape the systolic array wants.
+
+    For an (M, N) matrix with `block_size = b` and `nb` nonzero blocks:
+        blocks:           (nb, b, b)         — stacked dense blocks
+        block_col_indices: (nb,)             — column-block index for each block
+        block_row_ptrs:   (M/b + 1,)         — row-block i spans
+                                               block_row_ptrs[i]:block_row_ptrs[i+1]
+        shape:            (M, N)             — element-wise shape (multiples of b)
+        block_size:       int                — defaults to 128 (Tensor Engine tile)
+
+    `M` and `N` must be multiples of `block_size`. `from_dense`/`from_csr`
+    handle padding for non-aligned inputs.
+
+    BSR is the headline format for v0.3.0+. CSR/COO remain for construction
+    and interop; on-device compute should go through BSR wherever the
+    matrix has block structure (Fock matrices, FEM stiffness, GNN
+    adjacencies, block-sparse attention masks).
+    """
+
+    blocks: torch.Tensor
+    block_col_indices: torch.Tensor
+    block_row_ptrs: torch.Tensor
+    shape: Tuple[int, int]
+    block_size: int = 128
+
+    @property
+    def n_blocks(self) -> int:
+        return self.blocks.shape[0]
+
+    @property
+    def nnz(self) -> int:
+        """Effective nnz = n_blocks * block_size^2 (counts zeros inside nonzero blocks)."""
+        return self.n_blocks * self.block_size * self.block_size
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self.blocks.dtype
+
+    @property
+    def density(self) -> float:
+        """Block density: fraction of blocks stored (not fraction of elements nonzero)."""
+        m, n = self.shape
+        total_blocks = (m // self.block_size) * (n // self.block_size)
+        return self.n_blocks / total_blocks if total_blocks else 0.0
+
+    @classmethod
+    def from_dense(cls, A: torch.Tensor, block_size: int = 128, threshold: float = 0.0) -> "BSRMatrix":
+        """Build a BSR from a dense matrix.
+
+        A block is stored iff it has at least one element with `|v| > threshold`.
+        Shapes are padded up to a multiple of `block_size`.
+        """
+        m, n = A.shape
+        # Pad to block alignment
+        m_pad = ((m + block_size - 1) // block_size) * block_size
+        n_pad = ((n + block_size - 1) // block_size) * block_size
+        if (m_pad, n_pad) != (m, n):
+            padded = torch.zeros(m_pad, n_pad, dtype=A.dtype, device=A.device)
+            padded[:m, :n] = A
+            A = padded
+
+        mb = m_pad // block_size
+        nb_cols = n_pad // block_size
+        # View as a block grid: (mb, block_size, nb_cols, block_size) -> (mb, nb_cols, block_size, block_size)
+        block_grid = A.reshape(mb, block_size, nb_cols, block_size).permute(0, 2, 1, 3).contiguous()
+        # Nonzero block mask
+        block_max = block_grid.abs().amax(dim=(-2, -1))  # (mb, nb_cols)
+        nonzero_mask = block_max > threshold
+
+        block_row_ptrs = torch.zeros(mb + 1, dtype=torch.long)
+        block_row_ptrs[1:] = nonzero_mask.sum(dim=1).cumsum(dim=0)
+
+        block_col_indices = nonzero_mask.nonzero(as_tuple=False)[:, 1].to(torch.long)
+        kept_blocks = block_grid[nonzero_mask]  # (n_blocks, block_size, block_size)
+
+        return cls(
+            blocks=kept_blocks.contiguous(),
+            block_col_indices=block_col_indices,
+            block_row_ptrs=block_row_ptrs,
+            shape=(m, n),  # report the original shape, not the padded one
+            block_size=block_size,
+        )
+
+    @classmethod
+    def from_csr(cls, csr: CSRMatrix, block_size: int = 128, threshold: float = 0.0) -> "BSRMatrix":
+        """Convert CSR → BSR. Simple path: densify then block.
+
+        For large matrices this materializes the dense intermediate; BSR is
+        most useful when the caller already has block structure and can
+        skip the CSR step entirely (`from_dense` or a direct constructor).
+        """
+        return cls.from_dense(csr.to_dense(), block_size=block_size, threshold=threshold)
+
+    def to_dense(self) -> torch.Tensor:
+        """Expand the stored blocks back into a dense `(M, N)` tensor."""
+        m, n = self.shape
+        b = self.block_size
+        # Round up to block alignment for the internal layout
+        m_pad = ((m + b - 1) // b) * b
+        n_pad = ((n + b - 1) // b) * b
+        mb = m_pad // b
+        nb_cols = n_pad // b
+
+        grid = torch.zeros(mb, nb_cols, b, b, dtype=self.dtype)
+        for i in range(mb):
+            start = self.block_row_ptrs[i].item()
+            end = self.block_row_ptrs[i + 1].item()
+            for k in range(start, end):
+                j = self.block_col_indices[k].item()
+                grid[i, j] = self.blocks[k]
+        dense = grid.permute(0, 2, 1, 3).reshape(m_pad, n_pad)
+        return dense[:m, :n].contiguous()
+
+    def to_csr(self) -> CSRMatrix:
+        """Convert BSR → CSR via dense intermediate. See from_csr caveat."""
+        from . import formats  # noqa: F401 — avoid circular at module import
+        return from_dense(self.to_dense(), threshold=0.0)
+
+    def __repr__(self) -> str:
+        return (
+            f"BSRMatrix(shape={self.shape}, block_size={self.block_size}, "
+            f"n_blocks={self.n_blocks}, block_density={self.density:.4f})"
+        )
+
+
 # --- Construction helpers ---
 
 def from_dense(A: torch.Tensor, threshold: float = 0.0) -> CSRMatrix:
