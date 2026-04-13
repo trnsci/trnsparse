@@ -6,6 +6,9 @@ repo_name: trnsci/trnsparse
 
 theme:
   name: material
+  font:
+    text: Atkinson Hyperlegible
+    code: Atkinson Hyperlegible Mono
   palette:
     scheme: default
     primary: indigo
@@ -19,6 +22,7 @@ nav:
   - Quickstart: quickstart.md
   - API Reference: api.md
   - Architecture: architecture.md
+  - Benchmarks: benchmarks.md
   - Deployment:
       - AWS Setup for Neuron CI: aws_setup.md
 
