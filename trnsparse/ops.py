@@ -48,13 +48,21 @@ def spmm(A: CSRMatrix, B: torch.Tensor, alpha: float = 1.0,
          C: Optional[torch.Tensor] = None, beta: float = 0.0) -> torch.Tensor:
     """Sparse matrix × dense matrix: C = alpha * A @ B + beta * C
 
-    Lowers to `torch.sparse_csr_tensor @ B`. On NKI (future v0.2.0):
-    gather selected B rows into a dense tile, matmul, scatter.
+    On NKI backend (v0.2.0): routes through `nki_spmm`, which
+    materializes A dense, runs the NKI GEMM kernel on the Tensor Engine,
+    and returns the dense result. Autograd-aware via `_SpMMFunction`.
+
+    On PyTorch backend: lowers to `torch.sparse_csr_tensor @ B` (v0.1.3
+    vectorized fallback).
     """
+    from .nki.dispatch import _use_nki, nki_spmm
     m, n = A.shape
     assert B.shape[0] == n, f"Dimension mismatch: A is {A.shape}, B is {B.shape}"
 
-    result = alpha * (_as_torch_csr(A) @ B)
+    if _use_nki():
+        result = alpha * nki_spmm(A, B)
+    else:
+        result = alpha * (_as_torch_csr(A) @ B)
     if C is not None and beta != 0.0:
         result = result + beta * C
     return result
