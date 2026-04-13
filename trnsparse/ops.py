@@ -21,26 +21,24 @@ from typing import Optional
 from .formats import CSRMatrix, COOMatrix
 
 
+def _as_torch_csr(A: CSRMatrix) -> torch.Tensor:
+    """View CSRMatrix as a torch.sparse_csr_tensor (no copy)."""
+    return torch.sparse_csr_tensor(
+        A.row_ptrs, A.col_indices, A.values, size=A.shape
+    )
+
+
 def spmv(A: CSRMatrix, x: torch.Tensor, alpha: float = 1.0,
          y: Optional[torch.Tensor] = None, beta: float = 0.0) -> torch.Tensor:
     """Sparse matrix × dense vector: y = alpha * A @ x + beta * y
 
-    CSR row-wise dot products — each row's non-zeros dot with
-    corresponding entries of x.
+    Lowers to `torch.sparse_csr_tensor @ x` — a single vectorized call
+    instead of a per-row Python loop.
     """
     m, n = A.shape
     assert x.shape[0] == n, f"Dimension mismatch: A is {A.shape}, x is {x.shape}"
 
-    result = torch.zeros(m, dtype=A.dtype)
-    for i in range(m):
-        start = A.row_ptrs[i].item()
-        end = A.row_ptrs[i + 1].item()
-        if start < end:
-            cols = A.col_indices[start:end]
-            vals = A.values[start:end]
-            result[i] = torch.dot(vals, x[cols])
-
-    result = alpha * result
+    result = alpha * (_as_torch_csr(A) @ x)
     if y is not None and beta != 0.0:
         result = result + beta * y
     return result
@@ -50,24 +48,13 @@ def spmm(A: CSRMatrix, B: torch.Tensor, alpha: float = 1.0,
          C: Optional[torch.Tensor] = None, beta: float = 0.0) -> torch.Tensor:
     """Sparse matrix × dense matrix: C = alpha * A @ B + beta * C
 
-    Each row of A selects and weights rows of B.
-    On NKI: gather selected B rows into dense tile, matmul, scatter.
+    Lowers to `torch.sparse_csr_tensor @ B`. On NKI (future v0.2.0):
+    gather selected B rows into a dense tile, matmul, scatter.
     """
     m, n = A.shape
-    k = B.shape[1]
     assert B.shape[0] == n, f"Dimension mismatch: A is {A.shape}, B is {B.shape}"
 
-    result = torch.zeros(m, k, dtype=A.dtype)
-    for i in range(m):
-        start = A.row_ptrs[i].item()
-        end = A.row_ptrs[i + 1].item()
-        if start < end:
-            cols = A.col_indices[start:end]
-            vals = A.values[start:end]
-            # vals (nnz_row,) × B[cols] (nnz_row, k) → (k,)
-            result[i] = vals @ B[cols]
-
-    result = alpha * result
+    result = alpha * (_as_torch_csr(A) @ B)
     if C is not None and beta != 0.0:
         result = result + beta * C
     return result
@@ -78,24 +65,26 @@ def spmv_symmetric(A: CSRMatrix, x: torch.Tensor, alpha: float = 1.0,
     """Symmetric sparse matrix × vector using only stored triangle.
 
     For symmetric matrices (like the overlap matrix S or density P),
-    only half the non-zeros need to be stored. This computes A @ x
-    using only the upper or lower triangle entries.
+    only half the non-zeros need to be stored. Computes
+    `A @ x + (A_strict_triangle)ᵀ @ x` as two vectorized SpMVs.
     """
     m, n = A.shape
     assert m == n, "Matrix must be square for symmetric SpMV"
-    result = torch.zeros(m, dtype=A.dtype)
 
-    for i in range(m):
-        start = A.row_ptrs[i].item()
-        end = A.row_ptrs[i + 1].item()
-        for idx in range(start, end):
-            j = A.col_indices[idx].item()
-            v = A.values[idx].item()
-            result[i] += v * x[j]
-            if i != j:
-                result[j] += v * x[i]  # Symmetric contribution
+    rows = torch.repeat_interleave(
+        torch.arange(m), A.row_ptrs[1:] - A.row_ptrs[:-1]
+    )
+    cols = A.col_indices
+    strict_mask = rows != cols
+    A_sparse = _as_torch_csr(A)
 
-    return alpha * result
+    strict = torch.sparse_coo_tensor(
+        torch.stack([rows[strict_mask], cols[strict_mask]]),
+        A.values[strict_mask],
+        size=A.shape,
+    ).coalesce()
+
+    return alpha * (A_sparse @ x + strict.t() @ x)
 
 
 def sparse_add(A: CSRMatrix, B: CSRMatrix, alpha: float = 1.0, beta: float = 1.0) -> CSRMatrix:

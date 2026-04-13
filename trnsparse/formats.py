@@ -47,14 +47,10 @@ class CSRMatrix:
 
     def to_dense(self) -> torch.Tensor:
         """Convert to dense tensor."""
-        m, n = self.shape
-        dense = torch.zeros(m, n, dtype=self.dtype)
-        for i in range(m):
-            start, end = self.row_ptrs[i].item(), self.row_ptrs[i + 1].item()
-            cols = self.col_indices[start:end]
-            vals = self.values[start:end]
-            dense[i, cols] = vals
-        return dense
+        t = torch.sparse_csr_tensor(
+            self.row_ptrs, self.col_indices, self.values, size=self.shape
+        )
+        return t.to_dense()
 
     def to_coo(self) -> COOMatrix:
         """Convert to COO format."""

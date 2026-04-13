@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.3] — 2026-04-12
+
+### Changed
+
+- `spmv`, `spmm`, `spmv_symmetric`, and `CSRMatrix.to_dense` now lower
+  to `torch.sparse_csr_tensor` operations instead of per-row Python loops.
+- Measured on CPU (256×256, density 0.01) the change is 26× faster for
+  SpMV (958 μs → 37 μs) and 52–88× faster for SpMM (1.2 ms → 13–24 μs
+  depending on RHS width), putting trnsparse's PyTorch fallback within
+  2× of `torch.sparse`.
+
+Does not affect public API or numeric outputs — existing tests pass
+unchanged. NKI backend remains scaffolded (routing lands in v0.2.0).
+
+### Added
+
+- `benchmarks/` directory (`conftest.py`, `bench_spmv.py`, `bench_spmm.py`,
+  `bench_screening.py`) running trnsparse vs `scipy.sparse` vs
+  `torch.sparse` on the same numeric inputs. Closes #11; partial #4.
+
 ## [0.1.2] — 2026-04-12
 
 ### Changed
