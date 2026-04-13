@@ -3,12 +3,23 @@
 Sizes and densities are parametrized on the fixtures below. Each fixture
 returns matrices in multiple formats so different backends can be timed
 against the same numeric data.
+
+Set `TRNSPARSE_BACKEND=nki` (e.g. inside `scripts/run_benchmarks.sh`) to
+run `trnsparse` ops via the NKI dispatch. Default is `auto` / PyTorch.
 """
+
+import os
 
 import pytest
 import torch
 
 import trnsparse
+
+
+def pytest_configure(config):
+    backend = os.environ.get("TRNSPARSE_BACKEND", "auto")
+    if backend != "auto":
+        trnsparse.set_backend(backend)
 
 
 SIZES = [256, 1024, 4096]
