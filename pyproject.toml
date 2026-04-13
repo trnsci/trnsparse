@@ -31,7 +31,7 @@ neuron = [
     "neuronxcc>=2.24",
     "torch-neuronx>=2.9",
 ]
-dev = ["pytest>=7.0", "pytest-benchmark>=4.0", "scipy>=1.11"]
+dev = ["pytest>=7.0", "pytest-benchmark>=4.0", "pytest-cov>=4.1", "scipy>=1.11"]
 
 [project.urls]
 Homepage = "https://github.com/trnsci/trnsparse"
