@@ -1,5 +1,35 @@
 # Architecture
 
+## Why BSR is Trainium-native
+
+Trainium's Tensor Engine is a 128×128 systolic array. `nisa.nc_matmul`
+moves a 128-partition stationary tile against a moving operand of up to
+128 × 512, all on-chip. The natural "unit of sparse work" on this
+architecture is therefore not a single nonzero — it's a 128×128 block.
+
+**BSR (block-sparse row)** at `block_size=128` stores a matrix as a list
+of these blocks plus a block-level CSR pattern. Every stored block is
+already in the shape the systolic array wants: one `nc_matmul` per block,
+no gather step, no padding-within-tile waste. The architectural match is
+exact.
+
+Contrast with CSR, which stores individual nonzero elements. The v0.2.0
+NKI path for CSR materializes the matrix into a dense `(M, K)` tile
+before the matmul (see the [SpMM path](#v020-csr-spmm-path) below) —
+necessary for correctness, but it pays the full `M × K` cost whether the
+matrix is sparse or not. BSR skips this because blocks are already dense.
+
+**Consequence for the library's shape:** CSR remains the construction and
+interop format (scipy compatibility, PyTorch's `torch.sparse_csr_tensor`
+interop). BSR is the compute format for the NKI path. For matrices with
+real block structure — Fock/ERI tensors after Schwarz screening, FEM
+stiffness matrices, graph adjacencies, block-sparse attention masks —
+BSR is strictly preferred. For truly unstructured sparse (random CSR),
+the PyTorch fallback is already within 2× of scipy; NKI adds nothing.
+
+See [Benchmarks](benchmarks.md) for numbers that validate this framing.
+
+
 ```
 trnsparse/
 ├── trnsparse/
@@ -36,7 +66,7 @@ Conversions `csr_to_coo()` / `coo_to_csr()` are cheap (bucket sort).
 
 `nki/dispatch.py` exposes `HAS_NKI`, `set_backend("auto"|"pytorch"|"nki")`, `get_backend()`, and the NKI entry points. In v0.2.0, `spmm` routes through `_use_nki()` and calls `_spmm_dense_kernel` on the Tensor Engine. `spmv`, `spmv_symmetric`, and screening still run the PyTorch path (single-column NKI matmul doesn't pay off).
 
-### v0.2.0 SpMM path
+### v0.2.0 CSR SpMM path
 
 Forward — `_SpMMFunction.forward`:
 

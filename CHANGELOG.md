@@ -5,6 +5,59 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] — 2026-04-13
+
+### Added
+
+- **`BSRMatrix`** — block-sparse row format at 128×128 (the Tensor-Engine
+  tile size). Every nonzero block is already a dense tile that maps
+  one-to-one to `nisa.nc_matmul`. Conversions from `CSRMatrix` and dense
+  plus back. See `docs/architecture.md` for why BSR is the Trainium-native
+  sparse representation.
+- **`bsr_spmm(A_bsr, B)`** with NKI + PyTorch dispatch. On NKI, routes
+  through `_BSRSpMMFunction` (suite-second `torch.autograd.Function`-
+  wrapped kernel after v0.2.0's CSR SpMM). Per-block `nc_matmul` with
+  zero gather overhead — uniform K_max per block-row via host-side
+  zero-padding.
+- **`tests/test_bsr.py`** — 9 CPU tests (format roundtrips, SpMM parity
+  across block densities + rectangular shapes).
+- **`tests/test_nki_bsr.py`** — 7 `@pytest.mark.neuron` tests including
+  `torch.autograd.gradcheck` at `atol=1e-4`. Validated on
+  `trn1.2xlarge`.
+- **`benchmarks/bench_bsr_spmm.py`** — BSR PyTorch + BSR NKI + dense
+  GEMM ceiling across `(m_blocks, n_blocks, block_density, N)`.
+- **`docs/benchmarks.md`** BSR section with real hardware numbers + an
+  honest reading of why v0.3.0 BSR NKI doesn't beat CPU at small sizes
+  (kernel dispatch overhead dominates; architectural wins are in
+  follow-up issues #19, #20, #21).
+- **`docs/architecture.md`** lede rewritten around "why BSR is
+  Trainium-native."
+- **`sparse_add`** no longer materializes an `N×N` dense intermediate —
+  uses `torch.sparse_coo_tensor.coalesce()` for pattern union. Closes #8.
+- **`density_screen`** test coverage (false-negative check + degenerate
+  thresholds). Closes #10.
+
+### Changed
+
+- Issue #15 (row-bucketing CSR) demoted to backlog. Under the
+  architectural frame, the CSR path is served by the PyTorch fallback
+  (v0.1.3) and BSR is the NKI-side story. Row-bucketing would only help
+  if NKI 2.24 exposed an indirect-DMA primitive, which it doesn't.
+
+### Closed
+
+- #8 sparse_add pattern union
+- #9 density_screen bound clarification (current 2D bound is already tight)
+- #10 density_screen test coverage
+- #12 scipy migration guide
+- #18 BSR format + NKI block-sparse SpMM
+
+### New (architectural roadmap)
+
+- #19 Fused screen + matmul NKI kernel
+- #20 On-chip iterative solvers over BSR (SBUF-resident A)
+- #21 Block-sparse attention primitive
+
 ## [0.2.0] — 2026-04-13
 
 ### Added

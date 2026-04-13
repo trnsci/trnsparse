@@ -5,7 +5,7 @@ CSR/COO formats, SpMV, SpMM, and integral screening for
 sparse scientific computing. Part of the trnsci scientific computing suite.
 """
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 from .formats import CSRMatrix, COOMatrix, BSRMatrix, from_dense, from_scipy, eye_sparse
 from .ops import (spmv, spmm, spmv_symmetric, bsr_spmm, sparse_add,
