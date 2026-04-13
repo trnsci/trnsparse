@@ -98,13 +98,27 @@ def spmv_symmetric(A: CSRMatrix, x: torch.Tensor, alpha: float = 1.0,
 def sparse_add(A: CSRMatrix, B: CSRMatrix, alpha: float = 1.0, beta: float = 1.0) -> CSRMatrix:
     """Sparse matrix addition: C = alpha * A + beta * B
 
-    Result may have more non-zeros than either input (union of patterns).
+    Result is the union of A's and B's patterns. Memory usage is
+    O(nnz(A) + nnz(B)) — no dense intermediate.
     """
     assert A.shape == B.shape, f"Shape mismatch: {A.shape} vs {B.shape}"
-    # Simple implementation via dense (fine for moderate sizes)
-    dense = alpha * A.to_dense() + beta * B.to_dense()
-    from .formats import from_dense
-    return from_dense(dense, threshold=0.0)
+
+    coo_a = A.to_coo()
+    coo_b = B.to_coo()
+    indices = torch.stack([
+        torch.cat([coo_a.row_indices, coo_b.row_indices]),
+        torch.cat([coo_a.col_indices, coo_b.col_indices]),
+    ])
+    values = torch.cat([alpha * coo_a.values, beta * coo_b.values])
+
+    coalesced = torch.sparse_coo_tensor(indices, values, size=A.shape).coalesce()
+    csr = coalesced.to_sparse_csr()
+    return CSRMatrix(
+        values=csr.values(),
+        col_indices=csr.col_indices(),
+        row_ptrs=csr.crow_indices(),
+        shape=A.shape,
+    )
 
 
 def sparse_scale(A: CSRMatrix, alpha: float) -> CSRMatrix:
