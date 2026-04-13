@@ -32,9 +32,7 @@ def nki_backend():
 
 def _random_sparse(M, K, density, seed=0):
     g = torch.Generator().manual_seed(seed)
-    dense = torch.randn(M, K, generator=g) * (
-        torch.rand(M, K, generator=g) < density
-    )
+    dense = torch.randn(M, K, generator=g) * (torch.rand(M, K, generator=g) < density)
     return dense
 
 
@@ -44,11 +42,11 @@ class TestNkiSpmmParity:
     @pytest.mark.parametrize(
         "M,K,N,density",
         [
-            (128, 128, 128, 0.1),     # tile-aligned, moderate density
-            (256, 256, 128, 0.05),    # default case
-            (256, 256, 128, 0.01),    # sparse
-            (512, 256, 256, 0.05),    # non-square
-            (200, 137, 64, 0.05),     # unaligned dimensions (exercise padding)
+            (128, 128, 128, 0.1),  # tile-aligned, moderate density
+            (256, 256, 128, 0.05),  # default case
+            (256, 256, 128, 0.01),  # sparse
+            (512, 256, 256, 0.05),  # non-square
+            (200, 137, 64, 0.05),  # unaligned dimensions (exercise padding)
         ],
     )
     def test_parity(self, nki_backend, M, K, N, density):
@@ -92,6 +90,7 @@ class TestNkiSpmmDifferentiability:
         B = torch.randn(K, N, requires_grad=True)
 
         from trnsparse.nki.dispatch import _SpMMFunction
+
         C = _SpMMFunction.apply(A_dense, B)
         loss = C.pow(2).sum()
         loss.backward()

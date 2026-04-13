@@ -36,24 +36,24 @@ def _block_random(m_blocks, n_blocks, block_size, block_density, seed):
     for i in range(m_blocks):
         for j in range(n_blocks):
             if mask[i, j]:
-                A[i * b:(i + 1) * b, j * b:(j + 1) * b] = torch.randn(b, b)
+                A[i * b : (i + 1) * b, j * b : (j + 1) * b] = torch.randn(b, b)
     return A, mask.sum().item()
 
 
 class TestNkiBSRSpmm:
-
     @pytest.mark.parametrize(
         "m_blocks,n_blocks,N,block_density",
         [
-            (2, 2, 128, 0.5),    # tile-aligned, dense block pattern
-            (4, 4, 128, 0.25),   # quarter of blocks nonzero
-            (3, 3, 256, 0.5),    # larger RHS
-            (4, 2, 128, 0.5),    # rectangular
+            (2, 2, 128, 0.5),  # tile-aligned, dense block pattern
+            (4, 4, 128, 0.25),  # quarter of blocks nonzero
+            (3, 3, 256, 0.5),  # larger RHS
+            (4, 2, 128, 0.5),  # rectangular
         ],
     )
     def test_parity(self, nki_backend, m_blocks, n_blocks, N, block_density):
-        A, _ = _block_random(m_blocks, n_blocks, block_size=128,
-                             block_density=block_density, seed=42)
+        A, _ = _block_random(
+            m_blocks, n_blocks, block_size=128, block_density=block_density, seed=42
+        )
         bsr = trnsparse.BSRMatrix.from_dense(A, block_size=128)
         B = torch.randn(n_blocks * 128, N)
 
@@ -102,10 +102,12 @@ class TestNkiBSRDifferentiability:
 
         def func(blocks, B):
             return _BSRSpMMFunction.apply(
-                blocks, bsr.block_col_indices, bsr.block_row_ptrs,
-                bsr.shape, bsr.block_size, B,
+                blocks,
+                bsr.block_col_indices,
+                bsr.block_row_ptrs,
+                bsr.shape,
+                bsr.block_size,
+                B,
             )
 
-        assert torch.autograd.gradcheck(
-            func, (bsr.blocks, B), eps=1e-6, atol=1e-4
-        )
+        assert torch.autograd.gradcheck(func, (bsr.blocks, B), eps=1e-6, atol=1e-4)

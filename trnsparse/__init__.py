@@ -7,17 +7,40 @@ sparse scientific computing. Part of the trnsci scientific computing suite.
 
 __version__ = "0.3.0"
 
-from .formats import CSRMatrix, COOMatrix, BSRMatrix, from_dense, from_scipy, eye_sparse
-from .ops import (spmv, spmm, spmv_symmetric, bsr_spmm, sparse_add,
-                  sparse_scale, sparse_transpose, nnz_per_row)
-from .screening import schwarz_bounds, screen_quartets, density_screen, sparsity_stats
-from .nki import HAS_NKI, set_backend, get_backend
+from .formats import BSRMatrix, COOMatrix, CSRMatrix, eye_sparse, from_dense, from_scipy
+from .nki import HAS_NKI, get_backend, set_backend
+from .ops import (
+    bsr_spmm,
+    nnz_per_row,
+    sparse_add,
+    sparse_scale,
+    sparse_transpose,
+    spmm,
+    spmv,
+    spmv_symmetric,
+)
+from .screening import density_screen, schwarz_bounds, screen_quartets, sparsity_stats
 
 __all__ = [
-    "CSRMatrix", "COOMatrix", "BSRMatrix",
-    "from_dense", "from_scipy", "eye_sparse",
-    "spmv", "spmm", "spmv_symmetric", "bsr_spmm",
-    "sparse_add", "sparse_scale", "sparse_transpose", "nnz_per_row",
-    "schwarz_bounds", "screen_quartets", "density_screen", "sparsity_stats",
-    "HAS_NKI", "set_backend", "get_backend",
+    "CSRMatrix",
+    "COOMatrix",
+    "BSRMatrix",
+    "from_dense",
+    "from_scipy",
+    "eye_sparse",
+    "spmv",
+    "spmm",
+    "spmv_symmetric",
+    "bsr_spmm",
+    "sparse_add",
+    "sparse_scale",
+    "sparse_transpose",
+    "nnz_per_row",
+    "schwarz_bounds",
+    "screen_quartets",
+    "density_screen",
+    "sparsity_stats",
+    "HAS_NKI",
+    "set_backend",
+    "get_backend",
 ]

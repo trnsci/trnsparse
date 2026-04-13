@@ -21,12 +21,11 @@ def _block_random(m_blocks, n_blocks, block_size, block_density, seed=0):
     for i in range(m_blocks):
         for j in range(n_blocks):
             if mask[i, j]:
-                A[i * b:(i + 1) * b, j * b:(j + 1) * b] = torch.randn(b, b)
+                A[i * b : (i + 1) * b, j * b : (j + 1) * b] = torch.randn(b, b)
     return A
 
 
 class TestBSRConstruction:
-
     def test_from_dense_roundtrip_aligned(self):
         A = _block_random(2, 3, block_size=8, block_density=0.5, seed=1)
         bsr = trnsparse.BSRMatrix.from_dense(A, block_size=8)

@@ -16,20 +16,22 @@ gather non-zero rows/cols into dense tiles, matmul, scatter back.
 from __future__ import annotations
 
 import torch
-from typing import Optional
 
-from .formats import BSRMatrix, CSRMatrix, COOMatrix
+from .formats import BSRMatrix, COOMatrix, CSRMatrix
 
 
 def _as_torch_csr(A: CSRMatrix) -> torch.Tensor:
     """View CSRMatrix as a torch.sparse_csr_tensor (no copy)."""
-    return torch.sparse_csr_tensor(
-        A.row_ptrs, A.col_indices, A.values, size=A.shape
-    )
+    return torch.sparse_csr_tensor(A.row_ptrs, A.col_indices, A.values, size=A.shape)
 
 
-def spmv(A: CSRMatrix, x: torch.Tensor, alpha: float = 1.0,
-         y: Optional[torch.Tensor] = None, beta: float = 0.0) -> torch.Tensor:
+def spmv(
+    A: CSRMatrix,
+    x: torch.Tensor,
+    alpha: float = 1.0,
+    y: torch.Tensor | None = None,
+    beta: float = 0.0,
+) -> torch.Tensor:
     """Sparse matrix × dense vector: y = alpha * A @ x + beta * y
 
     Lowers to `torch.sparse_csr_tensor @ x` — a single vectorized call
@@ -44,8 +46,13 @@ def spmv(A: CSRMatrix, x: torch.Tensor, alpha: float = 1.0,
     return result
 
 
-def spmm(A: CSRMatrix, B: torch.Tensor, alpha: float = 1.0,
-         C: Optional[torch.Tensor] = None, beta: float = 0.0) -> torch.Tensor:
+def spmm(
+    A: CSRMatrix,
+    B: torch.Tensor,
+    alpha: float = 1.0,
+    C: torch.Tensor | None = None,
+    beta: float = 0.0,
+) -> torch.Tensor:
     """Sparse matrix × dense matrix: C = alpha * A @ B + beta * C
 
     On NKI backend (v0.2.0): routes through `nki_spmm`, which
@@ -56,6 +63,7 @@ def spmm(A: CSRMatrix, B: torch.Tensor, alpha: float = 1.0,
     vectorized fallback).
     """
     from .nki.dispatch import _use_nki, nki_spmm
+
     m, n = A.shape
     assert B.shape[0] == n, f"Dimension mismatch: A is {A.shape}, B is {B.shape}"
 
@@ -68,8 +76,9 @@ def spmm(A: CSRMatrix, B: torch.Tensor, alpha: float = 1.0,
     return result
 
 
-def spmv_symmetric(A: CSRMatrix, x: torch.Tensor, alpha: float = 1.0,
-                   uplo: str = "upper") -> torch.Tensor:
+def spmv_symmetric(
+    A: CSRMatrix, x: torch.Tensor, alpha: float = 1.0, uplo: str = "upper"
+) -> torch.Tensor:
     """Symmetric sparse matrix × vector using only stored triangle.
 
     For symmetric matrices (like the overlap matrix S or density P),
@@ -79,9 +88,7 @@ def spmv_symmetric(A: CSRMatrix, x: torch.Tensor, alpha: float = 1.0,
     m, n = A.shape
     assert m == n, "Matrix must be square for symmetric SpMV"
 
-    rows = torch.repeat_interleave(
-        torch.arange(m), A.row_ptrs[1:] - A.row_ptrs[:-1]
-    )
+    rows = torch.repeat_interleave(torch.arange(m), A.row_ptrs[1:] - A.row_ptrs[:-1])
     cols = A.col_indices
     strict_mask = rows != cols
     A_sparse = _as_torch_csr(A)
@@ -105,10 +112,12 @@ def sparse_add(A: CSRMatrix, B: CSRMatrix, alpha: float = 1.0, beta: float = 1.0
 
     coo_a = A.to_coo()
     coo_b = B.to_coo()
-    indices = torch.stack([
-        torch.cat([coo_a.row_indices, coo_b.row_indices]),
-        torch.cat([coo_a.col_indices, coo_b.col_indices]),
-    ])
+    indices = torch.stack(
+        [
+            torch.cat([coo_a.row_indices, coo_b.row_indices]),
+            torch.cat([coo_a.col_indices, coo_b.col_indices]),
+        ]
+    )
     values = torch.cat([alpha * coo_a.values, beta * coo_b.values])
 
     coalesced = torch.sparse_coo_tensor(indices, values, size=A.shape).coalesce()
@@ -177,7 +186,7 @@ def _bsr_spmm_pytorch(A: BSRMatrix, B: torch.Tensor) -> torch.Tensor:
         end = A.block_row_ptrs[i + 1].item()
         for idx in range(start, end):
             j = A.block_col_indices[idx].item()
-            out[i * b:(i + 1) * b] += A.blocks[idx] @ B[j * b:(j + 1) * b]
+            out[i * b : (i + 1) * b] += A.blocks[idx] @ B[j * b : (j + 1) * b]
     return out[:m]
 
 
@@ -191,7 +200,9 @@ def bsr_spmm(A: BSRMatrix, B: torch.Tensor) -> torch.Tensor:
     On PyTorch backend: the reference loop in `_bsr_spmm_pytorch`.
     """
     from .nki.dispatch import _use_nki
+
     if _use_nki():
         from .nki.dispatch import nki_bsr_spmm
+
         return nki_bsr_spmm(A, B)
     return _bsr_spmm_pytorch(A, B)

@@ -1,13 +1,13 @@
 """Test integral screening utilities."""
 
+import numpy as np
 import pytest
 import torch
-import numpy as np
+
 import trnsparse
 
 
 class TestSchwarz:
-
     def test_bounds_positive(self):
         diag = torch.rand(10, 10) * 0.1
         Q = trnsparse.schwarz_bounds(diag)
@@ -74,7 +74,6 @@ class TestDensityScreen:
 
 
 class TestSparsityStats:
-
     def test_fully_dense(self):
         Q = torch.ones(10, 10)
         stats = trnsparse.sparsity_stats(Q, threshold=1e-20)

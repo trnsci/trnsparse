@@ -12,9 +12,6 @@ large molecules. The sparsity pattern feeds into trnsparse CSR matrices.
 from __future__ import annotations
 
 import torch
-from typing import Tuple
-
-from .formats import CSRMatrix, from_dense
 
 
 def schwarz_bounds(diagonal_integrals: torch.Tensor) -> torch.Tensor:
@@ -39,8 +36,8 @@ def screen_quartets(
     A quartet (μν|λσ) is significant if Q_μν * Q_λσ > threshold.
     """
     # Significant pairs: Q_μν > √threshold (since Q_μν * Q_λσ > threshold)
-    pair_threshold = threshold ** 0.5
-    return Q > pair_threshold
+    pair_threshold = threshold**0.5
+    return pair_threshold < Q
 
 
 def density_screen(

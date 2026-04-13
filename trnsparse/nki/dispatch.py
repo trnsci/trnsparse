@@ -17,7 +17,7 @@ import os
 
 import torch
 
-from .kernels import HAS_NKI, _TILE_K, _TILE_M, _TILE_N
+from .kernels import _TILE_K, _TILE_M, _TILE_N, HAS_NKI
 
 if HAS_NKI:
     from .kernels import _bsr_spmm_kernel, _spmm_dense_kernel  # noqa: F401 — NKI-only
@@ -25,7 +25,9 @@ if HAS_NKI:
 # When set, kernel-path failures re-raise instead of falling back to
 # PyTorch. Used by the hardware validation suite.
 _REQUIRE_NKI = os.environ.get("TRNSPARSE_REQUIRE_NKI", "").lower() in (
-    "1", "true", "yes",
+    "1",
+    "true",
+    "yes",
 )
 
 _backend = "auto"
@@ -58,6 +60,7 @@ def _round_up(n: int, multiple: int) -> int:
 def _to_xla(*tensors):
     """Move tensors to the XLA device for NKI kernel dispatch."""
     import torch_xla.core.xla_model as xm
+
     device = xm.xla_device()
     orig = tensors[0].device
     return [t.to(device) for t in tensors], orig
@@ -71,9 +74,7 @@ def _csr_to_dense_padded(A) -> torch.Tensor:
     per-bucket dense tile keyed on nnz quantile, which is where the
     actual sparse speedup comes from.
     """
-    t = torch.sparse_csr_tensor(
-        A.row_ptrs, A.col_indices, A.values, size=A.shape
-    )
+    t = torch.sparse_csr_tensor(A.row_ptrs, A.col_indices, A.values, size=A.shape)
     return t.to_dense()
 
 
@@ -152,8 +153,9 @@ def nki_spmm(A, B: torch.Tensor) -> torch.Tensor:
     return _SpMMFunction.apply(A_dense, B)
 
 
-def _nki_bsr_spmm_impl(blocks_pad: torch.Tensor, b_gathered: torch.Tensor,
-                       out_rows: int, out_cols: int) -> torch.Tensor:
+def _nki_bsr_spmm_impl(
+    blocks_pad: torch.Tensor, b_gathered: torch.Tensor, out_rows: int, out_cols: int
+) -> torch.Tensor:
     """Dispatch `_bsr_spmm_kernel` on the XLA device.
 
     `blocks_pad` is `(M_tiles, K_max, 128, 128)` and `b_gathered` is
@@ -176,7 +178,7 @@ def _nki_bsr_spmm_impl(blocks_pad: torch.Tensor, b_gathered: torch.Tensor,
         out = torch.zeros(M_tiles * B, N_pad, dtype=blocks_pad.dtype, device=blocks_pad.device)
         for m in range(M_tiles):
             for k in range(K_max):
-                out[m * B:(m + 1) * B] += blocks_pad[m, k] @ b_gathered[m, k]
+                out[m * B : (m + 1) * B] += blocks_pad[m, k] @ b_gathered[m, k]
         return out[:out_rows, :out_cols].contiguous()
 
 
@@ -225,8 +227,9 @@ def _bsr_pad_and_gather(A, B: torch.Tensor):
     # Pad A with a single zero block at index `n_blocks` for masked slots.
     zero_block = torch.zeros(1, b, b, dtype=A.dtype, device=A.blocks.device)
     blocks_with_zero = torch.cat([A.blocks, zero_block], dim=0)
-    masked_idx = torch.where(block_idx_grid >= 0, block_idx_grid,
-                             torch.tensor(A.n_blocks, dtype=torch.long))
+    masked_idx = torch.where(
+        block_idx_grid >= 0, block_idx_grid, torch.tensor(A.n_blocks, dtype=torch.long)
+    )
     blocks_pad = blocks_with_zero[masked_idx]  # (M_tiles, K_max, b, b)
 
     # Gather B slices per slot. For masked slots, a zero slice (columns 0..b)
@@ -253,8 +256,7 @@ class _BSRSpMMFunction(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, A_blocks, A_block_col_indices, A_block_row_ptrs,
-                A_shape, A_block_size, B):
+    def forward(ctx, A_blocks, A_block_col_indices, A_block_row_ptrs, A_shape, A_block_size, B):
         # Reconstruct a lightweight BSR-like handle for the host-side prep
         class _BSRHandle:
             shape = A_shape
@@ -299,7 +301,7 @@ class _BSRSpMMFunction(torch.autograd.Function):
                 end = row_ptrs[i + 1].item()
                 for k in range(start, end):
                     j = col_idx[k].item()
-                    grad_blocks[k] = grad_out[i * b:(i + 1) * b] @ B[j * b:(j + 1) * b].T
+                    grad_blocks[k] = grad_out[i * b : (i + 1) * b] @ B[j * b : (j + 1) * b].T
 
         if ctx.needs_input_grad[5]:
             # dB = A.T @ grad_out — reconstruct A dense and multiply.
@@ -313,7 +315,7 @@ class _BSRSpMMFunction(torch.autograd.Function):
                 end = row_ptrs[i + 1].item()
                 for k in range(start, end):
                     j = col_idx[k].item()
-                    A_dense[i * b:(i + 1) * b, j * b:(j + 1) * b] = A_blocks[k]
+                    A_dense[i * b : (i + 1) * b, j * b : (j + 1) * b] = A_blocks[k]
             A_dense = A_dense[:m, :n]
             grad_B = A_dense.T @ grad_out
 
@@ -325,6 +327,10 @@ class _BSRSpMMFunction(torch.autograd.Function):
 def nki_bsr_spmm(A, B: torch.Tensor) -> torch.Tensor:
     """BSR SpMM entry point — wraps `_BSRSpMMFunction.apply` for autograd."""
     return _BSRSpMMFunction.apply(
-        A.blocks, A.block_col_indices, A.block_row_ptrs,
-        A.shape, A.block_size, B,
+        A.blocks,
+        A.block_col_indices,
+        A.block_row_ptrs,
+        A.shape,
+        A.block_size,
+        B,
     )

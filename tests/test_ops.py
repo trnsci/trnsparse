@@ -1,13 +1,13 @@
 """Test sparse matrix operations."""
 
+import numpy as np
 import pytest
 import torch
-import numpy as np
+
 import trnsparse
 
 
 class TestSpMV:
-
     def test_identity(self):
         I = trnsparse.eye_sparse(4)
         x = torch.tensor([1.0, 2.0, 3.0, 4.0])
@@ -44,7 +44,6 @@ class TestSpMV:
 
 
 class TestSpMM:
-
     def test_identity(self):
         I = trnsparse.eye_sparse(3)
         B = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
@@ -69,7 +68,6 @@ class TestSpMM:
 
 
 class TestSymmetricSpMV:
-
     def test_symmetric(self):
         A = torch.tensor([[4.0, 1.0, 0.0], [1.0, 3.0, 2.0], [0.0, 2.0, 5.0]])
         # Store only upper triangle
@@ -82,7 +80,6 @@ class TestSymmetricSpMV:
 
 
 class TestSparseAdd:
-
     def test_basic(self):
         A = trnsparse.from_dense(torch.tensor([[1.0, 0.0], [0.0, 2.0]]))
         B = trnsparse.from_dense(torch.tensor([[0.0, 3.0], [4.0, 0.0]]))
@@ -92,7 +89,6 @@ class TestSparseAdd:
 
 
 class TestSparseScale:
-
     def test_basic(self):
         A = trnsparse.from_dense(torch.tensor([[1.0, 0.0], [0.0, 2.0]]))
         B = trnsparse.sparse_scale(A, 3.0)
@@ -101,7 +97,6 @@ class TestSparseScale:
 
 
 class TestNnzPerRow:
-
     def test_basic(self):
         A = torch.tensor([[1.0, 0.0, 2.0], [0.0, 0.0, 0.0], [3.0, 4.0, 5.0]])
         csr = trnsparse.from_dense(A)

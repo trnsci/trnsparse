@@ -13,9 +13,9 @@ the difference between O(N⁴) and O(N²) effective cost.
 
 from __future__ import annotations
 
-import torch
-from typing import Optional, Tuple
 from dataclasses import dataclass
+
+import torch
 
 
 @dataclass
@@ -28,10 +28,11 @@ class CSRMatrix:
         row_ptrs: (m+1,) — row_ptrs[i]:row_ptrs[i+1] span row i's entries
         shape: (m, n)
     """
+
     values: torch.Tensor
     col_indices: torch.Tensor
     row_ptrs: torch.Tensor
-    shape: Tuple[int, int]
+    shape: tuple[int, int]
 
     @property
     def nnz(self) -> int:
@@ -47,9 +48,7 @@ class CSRMatrix:
 
     def to_dense(self) -> torch.Tensor:
         """Convert to dense tensor."""
-        t = torch.sparse_csr_tensor(
-            self.row_ptrs, self.col_indices, self.values, size=self.shape
-        )
+        t = torch.sparse_csr_tensor(self.row_ptrs, self.col_indices, self.values, size=self.shape)
         return t.to_dense()
 
     def to_coo(self) -> COOMatrix:
@@ -78,10 +77,11 @@ class COOMatrix:
     col_indices: (nnz,) — column index for each value
     shape: (m, n)
     """
+
     values: torch.Tensor
     row_indices: torch.Tensor
     col_indices: torch.Tensor
-    shape: Tuple[int, int]
+    shape: tuple[int, int]
 
     @property
     def nnz(self) -> int:
@@ -157,7 +157,7 @@ class BSRMatrix:
     blocks: torch.Tensor
     block_col_indices: torch.Tensor
     block_row_ptrs: torch.Tensor
-    shape: Tuple[int, int]
+    shape: tuple[int, int]
     block_size: int = 128
 
     @property
@@ -181,7 +181,9 @@ class BSRMatrix:
         return self.n_blocks / total_blocks if total_blocks else 0.0
 
     @classmethod
-    def from_dense(cls, A: torch.Tensor, block_size: int = 128, threshold: float = 0.0) -> "BSRMatrix":
+    def from_dense(
+        cls, A: torch.Tensor, block_size: int = 128, threshold: float = 0.0
+    ) -> BSRMatrix:
         """Build a BSR from a dense matrix.
 
         A block is stored iff it has at least one element with `|v| > threshold`.
@@ -219,7 +221,7 @@ class BSRMatrix:
         )
 
     @classmethod
-    def from_csr(cls, csr: CSRMatrix, block_size: int = 128, threshold: float = 0.0) -> "BSRMatrix":
+    def from_csr(cls, csr: CSRMatrix, block_size: int = 128, threshold: float = 0.0) -> BSRMatrix:
         """Convert CSR → BSR. Simple path: densify then block.
 
         For large matrices this materializes the dense intermediate; BSR is
@@ -251,6 +253,7 @@ class BSRMatrix:
     def to_csr(self) -> CSRMatrix:
         """Convert BSR → CSR via dense intermediate. See from_csr caveat."""
         from . import formats  # noqa: F401 — avoid circular at module import
+
         return from_dense(self.to_dense(), threshold=0.0)
 
     def __repr__(self) -> str:
@@ -261,6 +264,7 @@ class BSRMatrix:
 
 
 # --- Construction helpers ---
+
 
 def from_dense(A: torch.Tensor, threshold: float = 0.0) -> CSRMatrix:
     """Convert dense matrix to CSR, dropping values with |v| <= threshold."""
@@ -277,6 +281,7 @@ def from_dense(A: torch.Tensor, threshold: float = 0.0) -> CSRMatrix:
 def from_scipy(sp_matrix) -> CSRMatrix:
     """Convert scipy.sparse matrix to CSRMatrix."""
     import scipy.sparse as sp
+
     csr = sp.csr_matrix(sp_matrix)
     return CSRMatrix(
         values=torch.tensor(csr.data, dtype=torch.float32),

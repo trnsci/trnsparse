@@ -20,8 +20,9 @@ from __future__ import annotations
 
 try:
     import neuronxcc.nki as nki
-    import neuronxcc.nki.language as nl
     import neuronxcc.nki.isa as nisa
+    import neuronxcc.nki.language as nl
+
     HAS_NKI = True
 except ImportError:
     HAS_NKI = False
@@ -67,12 +68,12 @@ if HAS_NKI:
 
                 for k in nl.affine_range(K_max):
                     a_t = nl.load_transpose2d(blocks_pad[m, k, :, :])
-                    b_tile = nl.load(b_gathered[m, k, :, n * TILE_N:(n + 1) * TILE_N])
+                    b_tile = nl.load(b_gathered[m, k, :, n * TILE_N : (n + 1) * TILE_N])
                     psum[...] += nisa.nc_matmul(a_t, b_tile)
 
                 c_sbuf = nl.copy(psum, dtype=blocks_pad.dtype)
                 nl.store(
-                    out[m * TILE_M:(m + 1) * TILE_M, n * TILE_N:(n + 1) * TILE_N],
+                    out[m * TILE_M : (m + 1) * TILE_M, n * TILE_N : (n + 1) * TILE_N],
                     value=c_sbuf,
                 )
 
@@ -111,18 +112,14 @@ if HAS_NKI:
                 for k in nl.affine_range(K // TILE_K):
                     k_off = k * TILE_K
 
-                    a_t = nl.load_transpose2d(
-                        a[m_off:m_off + TILE_M, k_off:k_off + TILE_K]
-                    )
-                    b_tile = nl.load(
-                        b[k_off:k_off + TILE_K, n_off:n_off + TILE_N]
-                    )
+                    a_t = nl.load_transpose2d(a[m_off : m_off + TILE_M, k_off : k_off + TILE_K])
+                    b_tile = nl.load(b[k_off : k_off + TILE_K, n_off : n_off + TILE_N])
 
                     psum[...] += nisa.nc_matmul(a_t, b_tile)
 
                 c_sbuf = nl.copy(psum, dtype=a.dtype)
                 nl.store(
-                    c[m_off:m_off + TILE_M, n_off:n_off + TILE_N],
+                    c[m_off : m_off + TILE_M, n_off : n_off + TILE_N],
                     value=c_sbuf,
                 )
 

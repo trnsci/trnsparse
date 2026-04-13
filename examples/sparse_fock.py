@@ -12,7 +12,9 @@ Usage:
 
 import argparse
 import time
+
 import torch
+
 import trnsparse
 
 
@@ -27,7 +29,7 @@ def main():
         args.nbasis = 50
 
     n = args.nbasis
-    print(f"Sparse Fock build:")
+    print("Sparse Fock build:")
     print(f"  Basis functions: {n}")
     print(f"  Threshold:       {args.threshold:.0e}")
 
@@ -40,7 +42,7 @@ def main():
 
     # Screen
     stats = trnsparse.sparsity_stats(Q, args.threshold)
-    print(f"\n  Sparsity statistics:")
+    print("\n  Sparsity statistics:")
     print(f"    Total shell pairs:       {stats['total_pairs']}")
     print(f"    Significant pairs:       {stats['significant_pairs']}")
     print(f"    Pair sparsity:           {stats['pair_sparsity']:.1%}")
@@ -51,7 +53,7 @@ def main():
     integrals_dense = torch.randn(n, n) * Q * 0.01
     integrals_dense[~mask] = 0.0
     integrals_sparse = trnsparse.from_dense(integrals_dense)
-    print(f"    Integral matrix nnz:     {integrals_sparse.nnz} / {n*n}")
+    print(f"    Integral matrix nnz:     {integrals_sparse.nnz} / {n * n}")
 
     # Density matrix (random SPD for demo)
     P = torch.randn(n, n) * 0.1

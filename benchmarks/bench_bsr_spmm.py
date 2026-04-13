@@ -21,8 +21,7 @@ import torch
 import trnsparse
 from trnsparse.nki.dispatch import HAS_NKI
 
-
-M_BLOCKS = [4, 8]         # matrix has M_BLOCKS * 128 rows
+M_BLOCKS = [4, 8]  # matrix has M_BLOCKS * 128 rows
 N_BLOCKS = [4, 8]
 BLOCK_DENSITIES = [0.1, 0.25, 0.5]
 RHS_COLS = [128, 256]
@@ -58,7 +57,7 @@ def bsr_and_B(m_blocks, n_blocks, block_density, bsr_rhs_cols):
     for i in range(m_blocks):
         for j in range(n_blocks):
             if mask[i, j]:
-                A[i * b:(i + 1) * b, j * b:(j + 1) * b] = torch.randn(b, b)
+                A[i * b : (i + 1) * b, j * b : (j + 1) * b] = torch.randn(b, b)
     bsr = trnsparse.BSRMatrix.from_dense(A, block_size=b)
     B = torch.randn(N, bsr_rhs_cols)
     return bsr, B, A

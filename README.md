@@ -1,6 +1,8 @@
 # trnsparse
 
 [![CI](https://github.com/trnsci/trnsparse/actions/workflows/ci.yml/badge.svg)](https://github.com/trnsci/trnsparse/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/trnsci/trnsparse/graph/badge.svg)](https://codecov.io/gh/trnsci/trnsparse)
+[![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
 [![PyPI](https://img.shields.io/pypi/v/trnsparse)](https://pypi.org/project/trnsparse/)
 [![Python](https://img.shields.io/pypi/pyversions/trnsparse)](https://pypi.org/project/trnsparse/)
 [![License](https://img.shields.io/github/license/trnsci/trnsparse)](LICENSE)

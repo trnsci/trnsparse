@@ -1,14 +1,14 @@
 """Test sparse matrix formats and conversions."""
 
+import numpy as np
 import pytest
 import torch
-import numpy as np
+
 import trnsparse
-from trnsparse import CSRMatrix, COOMatrix
+from trnsparse import COOMatrix, CSRMatrix
 
 
 class TestCSR:
-
     def test_from_dense(self):
         A = torch.tensor([[1.0, 0.0, 2.0], [0.0, 3.0, 0.0], [4.0, 0.0, 5.0]])
         csr = trnsparse.from_dense(A)
@@ -40,7 +40,6 @@ class TestCSR:
 
 
 class TestCOO:
-
     def test_coo_to_csr_roundtrip(self):
         A = torch.tensor([[0.0, 1.0], [2.0, 0.0], [3.0, 4.0]])
         csr = trnsparse.from_dense(A)
@@ -60,7 +59,6 @@ class TestCOO:
 
 
 class TestTranspose:
-
     def test_transpose(self):
         A = torch.tensor([[1.0, 2.0], [0.0, 3.0], [4.0, 0.0]])
         csr = trnsparse.from_dense(A)

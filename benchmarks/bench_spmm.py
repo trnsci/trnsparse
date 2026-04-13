@@ -14,6 +14,7 @@ On Trainium + neuronxcc installed, all four run in one pytest invocation.
 """
 
 import pytest
+
 import trnsparse
 from trnsparse.nki.dispatch import HAS_NKI
 
