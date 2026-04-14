@@ -5,6 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.2] — 2026-04-14
+
+### Added
+
+- **`cg_bsr`** and **`power_iteration_bsr`** — Conjugate Gradient and
+  power iteration on block-sparse row matrices. Plumbing on top of
+  `bsr_spmm` (one kernel dispatch per iteration). Closes Phase 1 of
+  #22 on-chip iterative solvers.
+- **`jacobi_preconditioner_bsr(A)`** — builds a diagonal preconditioner
+  for `cg_bsr`'s `M=` argument.
+- **`bsr_diagonal(A)`** — extracts the main diagonal from a BSR matrix.
+- **`docs/iterative_solvers.md`** — design note covering the v0.3.2
+  plumbing and the v0.4.0 fused-kernel goal (#24). Explains the
+  architectural win Trainium offers (A SBUF-resident across iterations)
+  vs the current per-iteration HBM round-trip.
+- **`tests/test_iterative.py`** — 8 CPU tests including scipy parity at
+  `atol=1e-4` on a 128×128 SPD system.
+- **`benchmarks/bench_iterative.py`** — cg_bsr vs scipy.sparse.linalg.cg.
+  At 128×128 SPD: scipy 310 μs, trnsparse 369 μs (1.19×).
+
+### Notes
+
+- Algorithm body for CG is a local copy of `trnsolver.iterative.cg`;
+  kept local to avoid a cross-repo runtime dependency for one function.
+- v0.4.0 will layer the fused CG/power-iteration NKI kernel on top —
+  tracked in #24. The API stays stable across the transition; users
+  upgrading from v0.3.2 get the fused-kernel speedup automatically
+  when the fused path is available.
+
 ## [0.3.1] — 2026-04-14
 
 ### Changed
