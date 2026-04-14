@@ -15,11 +15,14 @@ from __future__ import annotations
 
 import os
 
+import numpy as np
 import torch
 
 from .kernels import _TILE_K, _TILE_M, _TILE_N, HAS_NKI
 
 if HAS_NKI:
+    import nki
+
     from .kernels import _bsr_spmm_kernel, _spmm_dense_kernel  # noqa: F401 — NKI-only
 
 # When set, kernel-path failures re-raise instead of falling back to
@@ -29,6 +32,23 @@ _REQUIRE_NKI = os.environ.get("TRNSPARSE_REQUIRE_NKI", "").lower() in (
     "true",
     "yes",
 )
+
+# When set, dispatch bypasses torch_xla and runs kernels through
+# `nki.simulate(kernel)(np_args)` on CPU. Lets us iterate kernels on any
+# x86_64 Linux box without paying the NEFF compile + hardware dispatch
+# cost. Semantics follow NKI 0.3.0's simulator: no NEFF compile, no
+# SBUF/PSUM capacity checks, no latency/parallelism modelling. For
+# correctness iteration only; hardware still owns perf numbers.
+_USE_SIMULATOR = os.environ.get("TRNSPARSE_USE_SIMULATOR", "").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
+
+def _use_simulator() -> bool:
+    return _USE_SIMULATOR and HAS_NKI
+
 
 _backend = "auto"
 
@@ -102,11 +122,20 @@ def _nki_spmm_impl(A_dense: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
             A_p[:M, :K] = A_dense
             B_p = torch.zeros(K_pad, N_pad, dtype=B.dtype, device=B.device)
             B_p[:K, :N] = B
-            (a, b), orig_device = _to_xla(A_p.contiguous(), B_p.contiguous())
+            A_feed, B_feed = A_p.contiguous(), B_p.contiguous()
         else:
-            (a, b), orig_device = _to_xla(A_dense.contiguous(), B.contiguous())
-        c = _spmm_dense_kernel(a, b)
-        result = c.to(orig_device)
+            A_feed, B_feed = A_dense.contiguous(), B.contiguous()
+
+        if _use_simulator():
+            # CPU-side: feed NumPy arrays to nki.simulate(kernel). Bypasses
+            # torch_xla entirely.
+            out_np = nki.simulate(_spmm_dense_kernel)(A_feed.cpu().numpy(), B_feed.cpu().numpy())
+            result = torch.from_numpy(np.asarray(out_np)).to(A_dense.device)
+        else:
+            (a, b), orig_device = _to_xla(A_feed, B_feed)
+            c = _spmm_dense_kernel(a, b)
+            result = c.to(orig_device)
+
         return result[:M, :N] if needs_pad else result
     except Exception:
         if _REQUIRE_NKI:
@@ -165,9 +194,17 @@ def _nki_bsr_spmm_impl(
     if not HAS_NKI:
         raise RuntimeError("NKI not available")
     try:
-        (bp, bg), orig_device = _to_xla(blocks_pad.contiguous(), b_gathered.contiguous())
-        c = _bsr_spmm_kernel(bp, bg)
-        result = c.to(orig_device)
+        bp_feed = blocks_pad.contiguous()
+        bg_feed = b_gathered.contiguous()
+
+        if _use_simulator():
+            out_np = nki.simulate(_bsr_spmm_kernel)(bp_feed.cpu().numpy(), bg_feed.cpu().numpy())
+            result = torch.from_numpy(np.asarray(out_np)).to(blocks_pad.device)
+        else:
+            (bp, bg), orig_device = _to_xla(bp_feed, bg_feed)
+            c = _bsr_spmm_kernel(bp, bg)
+            result = c.to(orig_device)
+
         return result[:out_rows, :out_cols].contiguous()
     except Exception:
         if _REQUIRE_NKI:
