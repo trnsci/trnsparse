@@ -19,9 +19,9 @@ pinned to NKI 2.24 partition limits: TILE_M = TILE_K = 128, TILE_N = 512.
 from __future__ import annotations
 
 try:
-    import neuronxcc.nki as nki
-    import neuronxcc.nki.isa as nisa
-    import neuronxcc.nki.language as nl
+    import nki
+    import nki.isa as nisa
+    import nki.language as nl
 
     HAS_NKI = True
 except ImportError:

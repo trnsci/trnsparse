@@ -26,8 +26,12 @@ dependencies = [
 
 [project.optional-dependencies]
 neuron = [
-    # Pinned >=2.24 for NKI 2.24+ nc_matmul calling convention (unified
-    # across the trnsci suite).
+    # NKI 0.3.0 Stable (Neuron SDK 2.29+, April 2026). trnsparse imports
+    # from the canonical `nki.*` namespace; the legacy `neuronxcc.nki.*`
+    # shim is not used. SDK 2.29 DLAMI bundles nki==0.3.0 alongside
+    # neuronxcc==2.24.5133. Hosts without an `nki` wheel (macOS,
+    # non-Linux archs) still hit HAS_NKI=False and get the torch fallback.
+    "nki>=0.3.0",
     "neuronxcc>=2.24",
     "torch-neuronx>=2.9",
 ]

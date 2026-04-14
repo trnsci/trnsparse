@@ -37,7 +37,7 @@ def set_backend(backend: str) -> None:
     global _backend
     assert backend in ("auto", "pytorch", "nki")
     if backend == "nki" and not HAS_NKI:
-        raise RuntimeError("NKI backend requires neuronxcc")
+        raise RuntimeError("NKI backend requires nki>=0.3.0 (Neuron SDK 2.29+)")
     _backend = backend
 
 
