@@ -8,6 +8,7 @@ sparse scientific computing. Part of the trnsci scientific computing suite.
 __version__ = "0.3.1"
 
 from .formats import BSRMatrix, COOMatrix, CSRMatrix, eye_sparse, from_dense, from_scipy
+from .iterative import bsr_diagonal, cg_bsr, jacobi_preconditioner_bsr, power_iteration_bsr
 from .nki import HAS_NKI, get_backend, set_backend
 from .ops import (
     bsr_spmm,
@@ -40,6 +41,10 @@ __all__ = [
     "screen_quartets",
     "density_screen",
     "sparsity_stats",
+    "cg_bsr",
+    "power_iteration_bsr",
+    "jacobi_preconditioner_bsr",
+    "bsr_diagonal",
     "HAS_NKI",
     "set_backend",
     "get_backend",
