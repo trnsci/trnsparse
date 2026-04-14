@@ -5,6 +5,44 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **Migrated NKI imports to the `nki.*` namespace** (NKI 0.3.0 Stable,
+  Neuron SDK 2.29, April 2026). Legacy `neuronxcc.nki.*` shim is no
+  longer used. `pyproject.toml` `[neuron]` extra gains `nki>=0.3.0`
+  alongside the existing `neuronxcc>=2.24` and `torch-neuronx>=2.9`.
+  Hosts without an `nki` wheel (macOS, non-Linux archs) still hit
+  `HAS_NKI=False` and get the torch fallback. Kernel bodies unchanged —
+  the trnblas audit confirmed the positional `nisa.nc_matmul` +
+  `nl.copy(psum, ...)` pattern complies with NKI 0.3.0.
+- `test` CI job now filters `-m "not neuron and not nki_simulator"` so
+  each test runs in exactly one job.
+
+### Added
+
+- **`TRNSPARSE_USE_SIMULATOR=1` dispatch branch** through
+  `nki.simulate(kernel)(np_args)`. Bypasses torch_xla + NEFF compile;
+  kernels run on CPU for correctness iteration. Hardware still owns
+  perf numbers.
+- **`nki-simulator` CI job on `ubuntu-latest`** — installs `nki>=0.3.0`
+  from the AWS pip index and runs the simulator suite on every push/PR.
+  Kernel correctness gate without AWS cost. Catches Python-trace-level
+  errors (bad kwargs, dropped ops, shape mismatches); MLIR verifier
+  errors remain hardware-only (NKI 0.3.0 has no documented device-free
+  NEFF compile API).
+- `tests/test_nki_sim.py` — curated simulator suite (4 tests: CSR
+  aligned + rectangular, BSR block-dense + block-diagonal). Skips
+  cleanly off-hardware.
+- `scripts/run_simulator_tests.sh` — SSM runner mirroring
+  `run_neuron_tests.sh` with `TRNSPARSE_USE_SIMULATOR=1` in the env.
+- `tests/conftest.py` — registers the `nki_simulator` pytest marker.
+
+Addresses [trnsci/trnsparse#23](https://github.com/trnsci/trnsparse/issues/23).
+Follows the trnblas reference commits `c693561`, `f24993b`, `77eeb82`
+(suite-wide coordination in `trnsci/trnsci#5`).
+
 ## [0.3.0] — 2026-04-13
 
 ### Added
