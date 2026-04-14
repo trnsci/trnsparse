@@ -80,6 +80,72 @@ if HAS_NKI:
         return out
 
     @nki.jit
+    def _screened_spmm_kernel(a, q, threshold_sqrt, b):
+        """Fused Schwarz-screened dense matmul: `C = (A * mask) @ B`.
+
+        mask[i,j] = `Q[i] * Q[j] > threshold_sqrt`, where Q is
+        `sqrt(|diag_integrals|)` pre-computed on the host.
+
+        Fuses: outer-product pair bound → threshold → mask-apply → nc_matmul
+        into one kernel. Saves one mask-memory pass + one kernel dispatch
+        vs the unfused flow.
+
+        Caller guarantees: A is square (M, K) with M==K, padded to
+        TILE_M=TILE_K=128. B has K padded likewise and N either ≤ 512
+        or a multiple of 512. `q` is the 1-D Schwarz bounds of length M.
+        `threshold_sqrt` is a 0-d fp32 tensor (scalar).
+        """
+        M, K = a.shape
+        _, N = b.shape
+
+        TILE_M = _TILE_M
+        TILE_K = _TILE_K
+        TILE_N = N if N <= _TILE_N else _TILE_N
+
+        c = nl.ndarray((M, N), dtype=a.dtype, buffer=nl.shared_hbm)
+
+        for m in nl.affine_range(M // TILE_M):
+            for n in nl.affine_range(N // TILE_N):
+                m_off = m * TILE_M
+                n_off = n * TILE_N
+
+                psum = nl.zeros((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
+
+                # Row Q slice used for every k-tile in this (m, n) output tile.
+                q_m = nl.load(q[m_off : m_off + TILE_M])  # (TILE_M,)
+
+                for k in nl.affine_range(K // TILE_K):
+                    k_off = k * TILE_K
+
+                    a_tile = nl.load(a[m_off : m_off + TILE_M, k_off : k_off + TILE_K])
+                    q_k = nl.load(q[k_off : k_off + TILE_K])  # (TILE_K,)
+
+                    # Outer-product pair bound (TILE_M, TILE_K). nl broadcasting
+                    # via explicit reshape — partition-dim-safe.
+                    pair_bound = q_m.reshape((TILE_M, 1)) * q_k.reshape((1, TILE_K))
+                    mask = nl.greater(pair_bound, threshold_sqrt)
+                    a_masked = nl.multiply(a_tile, mask.astype(a.dtype))
+
+                    # Transpose for stationary-A nc_matmul via a staging buffer.
+                    # nl.load_transpose2d loads+transposes from HBM, but a_masked
+                    # is already in SBUF, so we need to store-and-reload or use
+                    # an in-SBUF transpose primitive. nl.transpose is available
+                    # in NKI 0.3.0; if the simulator rejects, fall back to
+                    # storing to an HBM staging tile and load_transpose2d-ing.
+                    a_t = nl.transpose(a_masked)
+                    b_tile = nl.load(b[k_off : k_off + TILE_K, n_off : n_off + TILE_N])
+
+                    psum[...] += nisa.nc_matmul(a_t, b_tile)
+
+                c_sbuf = nl.copy(psum, dtype=a.dtype)
+                nl.store(
+                    c[m_off : m_off + TILE_M, n_off : n_off + TILE_N],
+                    value=c_sbuf,
+                )
+
+        return c
+
+    @nki.jit
     def _spmm_dense_kernel(a, b):
         """Densified SpMM: C = A @ B with stationary A-tile reuse.
 

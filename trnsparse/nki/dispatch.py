@@ -23,7 +23,11 @@ from .kernels import _TILE_K, _TILE_M, _TILE_N, HAS_NKI
 if HAS_NKI:
     import nki
 
-    from .kernels import _bsr_spmm_kernel, _spmm_dense_kernel  # noqa: F401 — NKI-only
+    from .kernels import (  # noqa: F401 — NKI-only
+        _bsr_spmm_kernel,
+        _screened_spmm_kernel,
+        _spmm_dense_kernel,
+    )
 
 # When set, kernel-path failures re-raise instead of falling back to
 # PyTorch. Used by the hardware validation suite.
@@ -371,3 +375,113 @@ def nki_bsr_spmm(A, B: torch.Tensor) -> torch.Tensor:
         A.block_size,
         B,
     )
+
+
+def _nki_screened_spmm_impl(
+    A: torch.Tensor,
+    Q: torch.Tensor,
+    threshold_sqrt: float,
+    B: torch.Tensor,
+) -> torch.Tensor:
+    """Dispatch `_screened_spmm_kernel` on the XLA device (or simulator).
+
+    `A` is square (M, M); `Q` is the 1-D Schwarz-bound vector of length M.
+    Pads M up to TILE_M and N up to TILE_N when `N > TILE_N`.
+    Falls back to `torch.matmul` on masked A if the kernel errors and
+    `TRNSPARSE_REQUIRE_NKI` is not set.
+    """
+    if not HAS_NKI:
+        raise RuntimeError("NKI not available")
+    M, K = A.shape
+    _, N = B.shape
+    assert M == K, f"screened_spmm currently requires square A; got {A.shape}"
+    M_pad = _round_up(M, _TILE_M)
+    N_pad = N if N <= _TILE_N else _round_up(N, _TILE_N)
+    needs_pad = (M_pad != M) or (N_pad != N)
+
+    threshold_sqrt_t = torch.tensor(threshold_sqrt, dtype=A.dtype)
+
+    try:
+        if needs_pad:
+            A_p = torch.zeros(M_pad, M_pad, dtype=A.dtype, device=A.device)
+            A_p[:M, :M] = A
+            Q_p = torch.zeros(M_pad, dtype=Q.dtype, device=Q.device)
+            Q_p[:M] = Q
+            B_p = torch.zeros(M_pad, N_pad, dtype=B.dtype, device=B.device)
+            B_p[:M, :N] = B
+            A_feed, Q_feed, B_feed = A_p.contiguous(), Q_p.contiguous(), B_p.contiguous()
+        else:
+            A_feed, Q_feed, B_feed = A.contiguous(), Q.contiguous(), B.contiguous()
+
+        if _use_simulator():
+            out_np = nki.simulate(_screened_spmm_kernel)(
+                A_feed.cpu().numpy(),
+                Q_feed.cpu().numpy(),
+                threshold_sqrt_t.cpu().numpy(),
+                B_feed.cpu().numpy(),
+            )
+            result = torch.from_numpy(np.asarray(out_np)).to(A.device)
+        else:
+            (a, q, b), orig_device = _to_xla(A_feed, Q_feed, B_feed)
+            ts = threshold_sqrt_t.to(a.device)
+            c = _screened_spmm_kernel(a, q, ts, b)
+            result = c.to(orig_device)
+
+        return result[:M, :N] if needs_pad else result
+    except Exception:
+        if _REQUIRE_NKI:
+            raise
+        # Torch fallback computes the mask + matmul directly.
+        pair_bound = Q.unsqueeze(-1) * Q.unsqueeze(0)
+        mask = pair_bound > threshold_sqrt
+        return (A * mask.to(A.dtype)) @ B
+
+
+class _ScreenedSpMMFunction(torch.autograd.Function):
+    """Autograd wrapper for fused screened SpMM.
+
+    Forward: NKI-dispatched (or PyTorch fallback). Backward: PyTorch-level,
+    projecting gradients through the mask.
+
+    The mask depends on `diag_integrals` and `threshold` but is discrete —
+    no gradient flows back to them. Gradients flow to `A` (masked) and
+    `B` (transposed masked A).
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        A: torch.Tensor,
+        diag_integrals: torch.Tensor,
+        threshold: float,
+        B: torch.Tensor,
+    ) -> torch.Tensor:
+        import math as _math
+
+        Q = torch.sqrt(torch.abs(diag_integrals))
+        threshold_sqrt = _math.sqrt(threshold)
+        C = _nki_screened_spmm_impl(A, Q, threshold_sqrt, B)
+
+        # Save the effective mask for backward.
+        mask = (Q.unsqueeze(-1) * Q.unsqueeze(0)) > threshold_sqrt
+        ctx.save_for_backward(A, B, mask)
+        return C
+
+    @staticmethod
+    def backward(ctx, grad_out: torch.Tensor):
+        A, B, mask = ctx.saved_tensors
+        m_f = mask.to(A.dtype)
+        grad_A = (grad_out @ B.T) * m_f if ctx.needs_input_grad[0] else None
+        grad_B = (A * m_f).T @ grad_out if ctx.needs_input_grad[3] else None
+        # No gradient to diag_integrals (arg 1) or threshold (arg 2).
+        return grad_A, None, None, grad_B
+
+
+def nki_screened_spmm(
+    A: torch.Tensor,
+    diag_integrals: torch.Tensor,
+    B: torch.Tensor,
+    threshold: float,
+) -> torch.Tensor:
+    """Screened SpMM entry point — wraps `_ScreenedSpMMFunction.apply` for autograd."""
+    return _ScreenedSpMMFunction.apply(A, diag_integrals, threshold, B)

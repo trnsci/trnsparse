@@ -13,6 +13,7 @@ from .nki import HAS_NKI, get_backend, set_backend
 from .ops import (
     bsr_spmm,
     nnz_per_row,
+    screened_spmm,
     sparse_add,
     sparse_scale,
     sparse_transpose,
@@ -33,6 +34,7 @@ __all__ = [
     "spmm",
     "spmv_symmetric",
     "bsr_spmm",
+    "screened_spmm",
     "sparse_add",
     "sparse_scale",
     "sparse_transpose",
