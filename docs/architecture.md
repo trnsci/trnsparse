@@ -84,6 +84,25 @@ Backward — `_SpMMFunction.backward`, PyTorch-level:
 
 This wrapping satisfies [`trnsci/trnsci#3`](https://github.com/trnsci/trnsci/issues/3) — the suite-wide requirement that every NKI kernel live inside a `torch.autograd.Function` so training-time `loss.backward()` works. `torch.autograd.gradcheck` on small inputs is part of the hardware test matrix.
 
+### Fused screened SpMM (v0.4.0)
+
+`screened_spmm(A, diag_integrals, B, threshold)` fuses the
+chemistry-screened SpMM pipeline — Schwarz bound from the diagonal
+integrals, pair-bound threshold mask, masked matmul — into a single
+NKI kernel. The unfused equivalent does four host passes (sqrt, outer
+product, threshold, mask-apply) plus a separate `from_dense` + `spmm`
+call; the fused kernel collapses all of that into one dispatch.
+
+Mask semantics: `mask[i,j] = sqrt(|diag[i]|) * sqrt(|diag[j]|) >
+sqrt(threshold)`, matching `schwarz_bounds` + `screen_quartets`
+composed. No gradient flows back to `diag_integrals` or `threshold` —
+the mask is treated as a discrete gate; `grad_A *= mask` and
+`grad_B = (A * mask).T @ grad_C`.
+
+Restricted to square A (`M == K`) with 1-D `diag_integrals` in v0.4.0
+— the common Fock-build case. Rectangular / asymmetric-bounds
+extension is a follow-up if asked for.
+
 ### Known limits (v0.2.0)
 
 - **No sparsity exploitation.** Materialize-then-GEMM pays the full `M × K` cost. Row-bucketing is the v0.3.0 ([#15](https://github.com/trnsci/trnsparse/issues/15)) Phase 3 story. See [Benchmarks](benchmarks.md) for where NKI sits today vs scipy / torch.sparse.

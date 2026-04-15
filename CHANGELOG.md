@@ -5,6 +5,44 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] — 2026-04-14
+
+### Added
+
+- **`screened_spmm(A, diag_integrals, B, threshold)`** — fused Schwarz-
+  screened dense matmul. One NKI kernel fuses the full pipeline —
+  outer-product pair bound → threshold → mask-apply → `nc_matmul` —
+  into a single dispatch. Saves ~30–50% end-to-end vs the unfused
+  `density_screen + from_dense + spmm` flow on Fock-build-sized inputs.
+  Closes #19.
+- **`_screened_spmm_kernel`** — new `@nki.jit` kernel in
+  `trnsparse/nki/kernels.py`. Stationary-A-tile-reuse GEMM extended with
+  a per-tile pair-bound mask built from the 1-D Schwarz-bound vector.
+- **`_ScreenedSpMMFunction`** — `torch.autograd.Function` wrapper.
+  Third differentiable NKI kernel in the trnsci suite (after v0.2.0
+  CSR SpMM and v0.3.0 BSR SpMM). `torch.autograd.gradcheck` passes at
+  `atol=1e-4` on hardware. Mask is non-differentiable (discrete gate);
+  gradients flow to `A` (masked) and `B` (transposed masked A) only.
+- **Tests**: 4 CPU (`TestScreenedSpmm`), 2 simulator
+  (`TestScreenedSpmmSimulator`), 7 hardware
+  (`TestNkiScreenedSpmmParity` + `TestNkiScreenedSpmmDifferentiability`).
+  All green on `trn1.2xlarge`.
+- **`docs/architecture.md`** — new "Fused screened SpMM" section.
+
+### Closed
+
+- [#24](https://github.com/trnsci/trnsparse/issues/24) — fused-CG NKI
+  kernel was not buildable under NKI 2.24/0.3.0 constraints (no break,
+  no iteration-carried scalar state across `affine_range`, no nested
+  kernels). Per-iteration `_cg_step_kernel` reframe evaluated and
+  found to save only 5–20% — not worth the authoring cost relative to
+  #19's genuine 30–50% savings. See #24 close comment for the audit.
+
+### Known limits
+
+- Restricted to square `A` (`M == K`) with 1-D `diag_integrals`.
+  Rectangular / asymmetric-bounds extension is a follow-up if asked for.
+
 ## [0.3.2] — 2026-04-14
 
 ### Added
