@@ -5,6 +5,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1] — 2026-04-14
+
+### Added
+
+- **`examples/sparse_fock.py`** rewritten around v0.4.0's
+  `screened_spmm`. Three paths side-by-side on the same inputs:
+  (1) v0.1.x unfused `schwarz_bounds → screen → from_dense → spmm`;
+  (2) v0.4.0 fused `screened_spmm` (one call);
+  (3) full Fock build — the coulomb from path 2 contracted against MO
+  coefficients via `trnblas.gemm` for `F_MO = C.T @ J @ C` (falls
+  back to `torch.matmul` if trnblas isn't installed). On a 50-basis
+  synthetic system, the fused path is ~130× faster than the unfused
+  (dominated by eliminating the Python `from_dense` CSR construction).
+  Closes #6.
+- **`examples/pyscf_bridge.py`** (new) — optional PySCF-driven demo.
+  Builds H2O (or benzene, or H2), pulls real AO ERIs via
+  `mol.intor("int2e")`, feeds the `(μμ|μμ)` diagonal into
+  `schwarz_bounds` + `screened_spmm` against a mock density matrix.
+  Reports realistic sparsity at `threshold=1e-8`. Requires
+  `pip install pyscf`; tests skip cleanly if not available.
+  Closes #13.
+- **`tests/test_examples.py`** — 2 CPU smoke tests plus a
+  PySCF-gated test. Exercises the `sparse_fock` unfused + fused
+  paths end-to-end and asserts parity (`atol=1e-6`).
+
+### Notes
+
+No API changes, no kernel changes — pure integration demo release.
+Users already on v0.4.0 can stay there; upgrade to v0.4.1 only to
+pick up the new examples.
+
 ## [0.4.0] — 2026-04-14
 
 ### Added
