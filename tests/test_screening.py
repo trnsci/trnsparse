@@ -73,6 +73,66 @@ class TestDensityScreen:
         )
 
 
+class TestScreenedSpmm:
+    """PyTorch-fallback path for the fused screened SpMM (#19)."""
+
+    def test_threshold_zero_equals_plain_matmul(self):
+        """threshold=0 keeps all entries → screened_spmm == A @ B."""
+        torch.manual_seed(0)
+        n = 64
+        A = torch.randn(n, n)
+        diag = torch.abs(torch.randn(n)) + 0.1
+        B = torch.randn(n, 16)
+
+        got = trnsparse.screened_spmm(A, diag, B, threshold=0.0)
+        torch.testing.assert_close(got, A @ B, atol=1e-5, rtol=1e-5)
+
+    def test_huge_threshold_zeros_output(self):
+        """threshold → ∞ drops all entries → screened_spmm returns zeros."""
+        torch.manual_seed(1)
+        n = 64
+        A = torch.randn(n, n)
+        diag = torch.abs(torch.randn(n))
+        B = torch.randn(n, 16)
+
+        got = trnsparse.screened_spmm(A, diag, B, threshold=1e30)
+        torch.testing.assert_close(got, torch.zeros(n, 16), atol=0, rtol=0)
+
+    def test_parity_vs_explicit_mask(self):
+        """Matches (A * mask) @ B for a non-trivial threshold."""
+        import math
+
+        torch.manual_seed(2)
+        n = 64
+        A = torch.randn(n, n)
+        diag = torch.abs(torch.randn(n)) * 4.0
+        B = torch.randn(n, 16)
+        threshold = 0.5
+
+        got = trnsparse.screened_spmm(A, diag, B, threshold=threshold)
+
+        Q = torch.sqrt(torch.abs(diag))
+        mask = (Q.unsqueeze(-1) * Q.unsqueeze(0)) > math.sqrt(threshold)
+        expected = (A * mask.to(A.dtype)) @ B
+
+        torch.testing.assert_close(got, expected, atol=1e-5, rtol=1e-5)
+
+    def test_non_trivial_mask_setup(self):
+        """Guard: the chosen threshold must drop some but not all entries
+        on the test distribution — otherwise other tests are vacuous.
+        """
+        import math
+
+        torch.manual_seed(3)
+        n = 64
+        diag = torch.abs(torch.randn(n))
+        threshold = 0.5
+        Q = torch.sqrt(torch.abs(diag))
+        mask = (Q.unsqueeze(-1) * Q.unsqueeze(0)) > math.sqrt(threshold)
+        assert not mask.all()
+        assert mask.any()
+
+
 class TestSparsityStats:
     def test_fully_dense(self):
         Q = torch.ones(10, 10)

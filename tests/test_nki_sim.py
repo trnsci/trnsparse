@@ -111,3 +111,43 @@ class TestBsrSpmmSimulator:
         B = torch.randn(2 * b, 32)
         got = trnsparse.bsr_spmm(bsr, B)
         torch.testing.assert_close(got, A_dense @ B, atol=ATOL, rtol=RTOL)
+
+
+class TestScreenedSpmmSimulator:
+    """Fused screened SpMM through the simulator (#19).
+
+    The NKI kernel fuses Q outer-product + threshold mask + nc_matmul.
+    Small tile-aligned shapes so the simulator runs in seconds.
+    """
+
+    def test_threshold_zero_equals_plain_matmul(self, nki_backend):
+        """threshold=0 → mask passes all entries → screened_spmm == A @ B."""
+        torch.manual_seed(10)
+        n = 128
+        A = torch.randn(n, n)
+        diag = torch.abs(torch.randn(n)) + 0.1
+        B = torch.randn(n, 64)
+
+        got = trnsparse.screened_spmm(A, diag, B, threshold=0.0)
+        torch.testing.assert_close(got, A @ B, atol=ATOL, rtol=RTOL)
+
+    def test_non_trivial_threshold_parity(self, nki_backend):
+        """Non-trivial threshold drops some entries; NKI kernel must match
+        the explicit (A * mask) @ B spec.
+        """
+        import math
+
+        torch.manual_seed(11)
+        n = 128
+        A = torch.randn(n, n)
+        diag = torch.abs(torch.randn(n)) * 4.0
+        B = torch.randn(n, 64)
+        threshold = 0.5
+
+        got = trnsparse.screened_spmm(A, diag, B, threshold=threshold)
+
+        Q = torch.sqrt(torch.abs(diag))
+        mask = (Q.unsqueeze(-1) * Q.unsqueeze(0)) > math.sqrt(threshold)
+        expected = (A * mask.to(A.dtype)) @ B
+
+        torch.testing.assert_close(got, expected, atol=ATOL, rtol=RTOL)
