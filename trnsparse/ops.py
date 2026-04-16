@@ -262,9 +262,9 @@ def screened_spmm(
     # PyTorch fallback — semantic spec for the kernel.
     # Requires diag_integrals 1-D of length matching A's rows and cols
     # (common chemistry case: A is square (n, n) with a per-shell bound vector).
-    assert (
-        diag_integrals.dim() == 1
-    ), f"diag_integrals must be 1-D; got shape {diag_integrals.shape}"
+    assert diag_integrals.dim() == 1, (
+        f"diag_integrals must be 1-D; got shape {diag_integrals.shape}"
+    )
     M, K = A.shape
     assert diag_integrals.shape[0] == M == K, (
         "screened_spmm requires square A with diag_integrals of matching length; "
