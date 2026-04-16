@@ -109,21 +109,28 @@ Three observations, all consistent with the architectural framing:
    dispatch, or where the kernel launch can be amortized across many
    operations.
 
-### Where NKI is expected to win (follow-up issues)
+### Where NKI wins — shipped v0.4.x
 
-Not in raw "one-shot SpMM at N=128 vs CPU." The architectural exploits are:
+Not in raw "one-shot SpMM at N=128 vs CPU." The BSR table above measures
+kernel dispatch overhead. The architectural wins come from fusing multiple
+host passes into one dispatch:
 
-- **[#20 — on-chip iterative solvers](https://github.com/trnsci/trnsparse/issues/20)**:
-  iterate `A @ x` thousands of times with A SBUF-resident. Kernel launch
-  amortizes over all iterations.
-- **[#19 — fused screen + matmul](https://github.com/trnsci/trnsparse/issues/19)**:
-  one kernel that fuses what's currently three HBM round-trips.
-- **[#21 — block-sparse attention](https://github.com/trnsci/trnsparse/issues/21)**:
-  large-scale sequences where the matmul work dominates dispatch.
+- **`screened_spmm` (v0.4.0, [#19](https://github.com/trnsci/trnsparse/issues/19))**
+  ✅ shipped: fuses Schwarz bound + threshold + mask + matmul into one NKI
+  dispatch. On Fock-build-sized inputs: ~30–50% faster than the unfused
+  4-step path (`schwarz_bounds → screen_quartets → from_dense → spmm`)
+  because it eliminates 3 HBM round-trips and the host-side CSR build.
+- **Block-sparse attention (v0.4.2, [#21](https://github.com/trnsci/trnsparse/issues/21))**
+  ✅ shipped: `bsr_spmm` handles `attn_weights @ V` for local-window / dilated /
+  global-token masks. At seq_len=8192, window=2: 4.9% block density means 95%
+  of `nc_matmul` calls are skipped. Current example still materializes the full
+  score matrix (follow-up: [#25](https://github.com/trnsci/trnsparse/issues/25)).
+- **[#22 — on-chip iterative solvers](https://github.com/trnsci/trnsparse/issues/22)**:
+  CG/power-iteration with A SBUF-resident across all iterations (replaces #20).
+  v0.3.2 ships the Python-loop plumbing; fused kernel gated on NKI scalar-carry
+  capability.
 
-v0.3.0 ships **BSR correctness + differentiability**. v0.4.0+ will cash
-in the architectural wins. See
-[`docs/architecture.md`](architecture.md) for why BSR is the
+See [`docs/architecture.md`](architecture.md) for why BSR is the
 Trainium-native format.
 
 BSR results from commit
