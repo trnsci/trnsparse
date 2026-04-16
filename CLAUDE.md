@@ -19,38 +19,39 @@ both memory and compute. trnsparse makes the sparsity explicit.
 trnsparse/
 ├── trnsparse/
 │   ├── __init__.py
-│   ├── formats.py       # CSRMatrix, COOMatrix, conversions, from_dense
-│   ├── ops.py           # spmv, spmm, spmv_symmetric, add, scale, transpose
+│   ├── formats.py       # CSRMatrix, COOMatrix, BSRMatrix, from_dense
+│   ├── ops.py           # spmv, spmm, bsr_spmm, screened_spmm, add, scale, transpose
 │   ├── screening.py     # schwarz_bounds, screen_quartets, density_screen
+│   ├── iterative.py     # cg_bsr, power_iteration_bsr, jacobi_preconditioner_bsr
 │   └── nki/
 │       ├── __init__.py
-│       └── dispatch.py  # Gather-matmul-scatter pattern for SpMM
+│       ├── kernels.py   # _bsr_spmm_kernel, _screened_spmm_kernel
+│       └── dispatch.py  # torch.autograd.Function wrappers + NKI/PyTorch routing
 ├── tests/
-│   ├── test_formats.py  # CSR/COO construction, roundtrips
-│   ├── test_ops.py      # SpMV, SpMM vs dense reference
-│   └── test_screening.py
 ├── examples/
-│   └── sparse_fock.py   # Screened Fock build demo
+│   ├── sparse_fock.py             # Schwarz-screened Fock build (3 paths + trnblas)
+│   ├── pyscf_bridge.py            # Real AO integrals via PySCF (optional dep)
+│   └── block_sparse_attention.py  # Block-sparse attention via bsr_spmm
 ```
 
-## NKI SpMM Strategy
+## NKI compute strategy (v0.4.x current)
 
-**v0.2.0 (current):** SpMM materializes the CSR into a dense `(M, K)` tile
-and runs stationary-tile-reuse GEMM on the Tensor Engine. Validated on
-trn1; forward + `torch.autograd.Function` backward both pass parity +
-`gradcheck` at `atol=1e-4`. The dense materialization means no sparsity
-advantage yet — NKI is slower than the PyTorch fallback at small sparse
-sizes (see `docs/benchmarks.md`).
+**Formats:** CSR/COO are interop and PyTorch-fallback formats.
+BSR at `block_size=128` is the NKI compute format — every nonzero block
+is already a 128×128 Tensor Engine tile, zero gather overhead.
 
-**v0.3.0 (planned, #15):** gather-matmul-scatter with row-bucketing.
-For each bucket of rows with similar nnz:
-1. **DMA engine**: gather non-zero column indices into dense SBUF tiles.
-2. **Tensor Engine**: matmul the tile against B columns.
-3. **DMA engine**: scatter results back to output rows.
+**Dispatch hierarchy:**
+1. `spmm(csr, B)` — PyTorch `torch.sparse_csr_tensor` fallback (within
+   2× of scipy; NKI overhead not worth it for CSR at current sizes).
+2. `bsr_spmm(bsr, B)` — NKI kernel `_bsr_spmm_kernel`; one `nc_matmul`
+   per nonzero block. `torch.autograd.Function`-wrapped; gradcheck passes.
+3. `screened_spmm(A, diag, B, threshold)` — fused Schwarz + mask + matmul
+   in one NKI dispatch; avoids 4 host passes + CSR build + separate SpMM.
+4. `block_sparse_attention(Q, K, V, mask_bsr)` — `bsr_spmm` applied to
+   the attention weight matrix; no new kernel, mask is a BSRMatrix.
 
-Same pattern used in sparse attention. Uniform nnz maps cleanly to fixed-
-size tiles; variable nnz is handled by bucketing rows by nnz quantile so
-each bucket pads only within itself.
+**Open gaps (NKI capability-gated):** row-bucketing CSR (#15), sharded BSR
+across NeuronCores (#16), fused tile-level attention scores (#25).
 
 ## Dependencies
 

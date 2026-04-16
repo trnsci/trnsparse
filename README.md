@@ -16,12 +16,16 @@ CSR/COO formats, SpMV, SpMM, and integral screening for sparse scientific comput
 
 trnsparse follows the [trnsci 5-phase roadmap](https://trnsci.dev/roadmap/). Active work is tracked in phase-labeled GitHub issues:
 
-- **[Phase 1 — correctness](https://github.com/trnsci/trnsparse/issues/14)** ✅ v0.2.0: NKI SpMM validated on trn1 via densify-then-GEMM; first `torch.autograd.Function`-wrapped NKI kernel in the suite (see [`trnsci/trnsci#3`](https://github.com/trnsci/trnsci/issues/3)). Benchmarks in [`docs/benchmarks.md`](https://trnsci.dev/trnsparse/benchmarks/).
-- **[Phase 3 — perf](https://github.com/trnsci/trnsparse/issues/15)**: nnz-bucketing SpMM, streaming large-sparse, NEFF cache reuse.
-- **[Phase 4 — multi-chip](https://github.com/trnsci/trnsparse/issues/16)**: sharded sparse matrices across chips.
+- **[Phase 1 — correctness](https://github.com/trnsci/trnsparse/issues/14)** ✅ v0.2.0: NKI SpMM validated on trn1 via densify-then-GEMM (see [`trnsci/trnsci#3`](https://github.com/trnsci/trnsci/issues/3)).
+- **v0.3.0** ✅ [`BSRMatrix`](https://trnsci.dev/trnsparse/architecture/) — Trainium-native 128×128 block-sparse format; `bsr_spmm` NKI kernel. CSR becomes interop; BSR is the compute path.
+- **v0.3.2** ✅ `cg_bsr`, `power_iteration_bsr` — iterative solvers over BSR (Python loop; fused kernel gated on NKI capability).
+- **v0.4.0** ✅ `screened_spmm` — fused Schwarz-screened SpMM in one NKI dispatch.
+- **v0.4.2** ✅ Block-sparse attention — `BSRMatrix` + `bsr_spmm` as the primitive; `examples/block_sparse_attention.py` + [`docs/sparse_attention.md`](https://trnsci.dev/trnsparse/sparse_attention/).
+- **[Phase 3 — perf](https://github.com/trnsci/trnsparse/issues/15)**: nnz-bucketing, fused tile-level attention scores — parked on NKI indirect DMA gather.
+- **[Phase 4 — multi-chip](https://github.com/trnsci/trnsparse/issues/16)**: sharded BSR across NeuronCores.
 - **[Phase 5 — generation](https://github.com/trnsci/trnsparse/issues/17)**: trn2 DMA bandwidth exploitation.
 
-_(No Phase 2 for trnsparse — the precision story is inherited from trnblas.)_
+_(No Phase 2 for trnsparse — precision inherited from trnblas.)_
 
 Suite-wide tracker: [trnsci/trnsci#1](https://github.com/trnsci/trnsci/issues/1).
 
@@ -58,12 +62,18 @@ stats = trnsparse.sparsity_stats(Q)
 
 | Operation | Description |
 |-----------|-------------|
-| `spmv` | Sparse × dense vector |
-| `spmm` | Sparse × dense matrix |
+| `spmv` | Sparse × dense vector (CSR) |
+| `spmm` | Sparse × dense matrix (CSR, PyTorch fallback) |
+| `bsr_spmm` | Block-sparse × dense (BSR-native, Tensor Engine) |
+| `screened_spmm` | Fused Schwarz-screened matmul (one NKI dispatch) |
 | `spmv_symmetric` | Symmetric SpMV (half storage) |
 | `sparse_add` | C = αA + βB |
 | `sparse_scale` | B = αA |
-| `sparse_transpose` | A^T |
+| `sparse_transpose` | Aᵀ |
+| `cg_bsr` | Conjugate Gradient on BSR matrix |
+| `power_iteration_bsr` | Dominant eigenpair via power iteration |
+| `jacobi_preconditioner_bsr` | Diagonal preconditioner for `cg_bsr` |
+| `bsr_diagonal` | Extract main diagonal from BSR matrix |
 | `schwarz_bounds` | Schwarz screening bounds |
 | `screen_quartets` | Shell quartet significance mask |
 | `density_screen` | Density-weighted screening |

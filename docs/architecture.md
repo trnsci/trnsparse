@@ -34,55 +34,73 @@ See [Benchmarks](benchmarks.md) for numbers that validate this framing.
 trnsparse/
 ├── trnsparse/
 │   ├── __init__.py
-│   ├── formats.py       # CSRMatrix, COOMatrix, conversions, from_dense
-│   ├── ops.py           # spmv, spmm, spmv_symmetric, add, scale, transpose
+│   ├── formats.py       # CSRMatrix, COOMatrix, BSRMatrix, from_dense
+│   ├── ops.py           # spmv, spmm, bsr_spmm, screened_spmm, ...
 │   ├── screening.py     # schwarz_bounds, screen_quartets, density_screen
+│   ├── iterative.py     # cg_bsr, power_iteration_bsr, jacobi_preconditioner_bsr
 │   └── nki/
 │       ├── __init__.py
-│       └── dispatch.py  # Gather-matmul-scatter SpMM kernel
+│       ├── kernels.py   # _bsr_spmm_kernel, _screened_spmm_kernel
+│       └── dispatch.py  # torch.autograd.Function wrappers + routing
 ├── tests/
 ├── examples/
-│   └── sparse_fock.py   # Screened Fock build demo
+│   ├── sparse_fock.py             # Schwarz-screened Fock (3 paths + trnblas)
+│   ├── pyscf_bridge.py            # Real AO integrals via PySCF
+│   └── block_sparse_attention.py  # Block-sparse attention via bsr_spmm
 ```
 
-## NKI SpMM strategy
+## NKI dispatch hierarchy
 
-SpMM on Trainium uses a gather-matmul-scatter pattern:
+CSR and COO are interop and PyTorch-fallback formats. BSR is the NKI
+compute format. `nki/dispatch.py` exposes `HAS_NKI`,
+`set_backend("auto"|"pytorch"|"nki")`, `get_backend()`, and the NKI
+entry points.
 
-1. **DMA engine**: gather non-zero column indices into dense SBUF tiles
-2. **Tensor Engine**: matmul the dense tile against B columns
-3. **DMA engine**: scatter results back to output rows
+### `spmm(csr, B)` — PyTorch fallback
 
-This is the same pattern used in sparse attention. The efficiency depends on the nnz distribution per row — uniform nnz maps cleanly to fixed-size tiles; highly variable nnz needs row-bucketing.
+Routes through `torch.sparse_csr_tensor` operations. Benchmarked within
+2× of scipy at typical shapes; the NKI per-op overhead doesn't pay off
+for CSR SpMM until the matrix is large enough that the v0.2.0 CSR kernel
+(densify-then-GEMM) would dominate anyway. SpMV also stays on this path.
+
+### `bsr_spmm(bsr, B)` — NKI, `_bsr_spmm_kernel`
+
+One `nisa.nc_matmul` per nonzero block. Host-side preamble pads each
+block-row to the same `K_max` so the kernel's `affine_range` bounds are
+fixed. `torch.autograd.Function`-wrapped (`_BSRSpMMFunction`); gradcheck
+passes at `atol=1e-4` on hardware.
+
+### `screened_spmm(A, diag, B, threshold)` — NKI, fused
+
+Fuses Schwarz bound (outer-product pair bound), threshold mask, and
+matmul into one dispatch. Saves ~30–50% vs the unfused
+`schwarz_bounds → screen_quartets → from_dense → spmm` flow on
+Fock-build-sized inputs.
+
+### Block-sparse attention
+
+`bsr_spmm` applied to the post-softmax attention weight matrix. No new
+kernel — a `BSRMatrix` with a local-window or dilated block pattern IS
+an attention mask. See [sparse_attention.md](sparse_attention.md).
 
 ## Formats
 
-- **CSR** (compressed sparse row): preferred for SpMV with many right-hand sides and for SpMM. Row pointer + column indices + values.
-- **COO** (coordinate): preferred for construction and permutation. Three parallel 1-D tensors.
+- **CSR**: row pointer + column indices + values. Preferred for construction,
+  interop with scipy/PyTorch, and SpMV.
+- **COO**: three parallel 1-D tensors. Preferred for construction and permutation.
+- **BSR** (`block_size=128`): stacked 128×128 blocks + block-level CSR pattern.
+  Every block maps to one `nc_matmul`; zero gather overhead.
 
-Conversions `csr_to_coo()` / `coo_to_csr()` are cheap (bucket sort).
+All three support `from_dense`, `to_dense`, and interconversion.
 
-## Dispatch
+## Autograd wrapping
 
-`nki/dispatch.py` exposes `HAS_NKI`, `set_backend("auto"|"pytorch"|"nki")`, `get_backend()`, and the NKI entry points. In v0.2.0, `spmm` routes through `_use_nki()` and calls `_spmm_dense_kernel` on the Tensor Engine. `spmv`, `spmv_symmetric`, and screening still run the PyTorch path (single-column NKI matmul doesn't pay off).
-
-### v0.2.0 CSR SpMM path
-
-Forward — `_SpMMFunction.forward`:
-
-1. Materialize the CSR into a dense `(M, K)` tile (host-side).
-2. Pad `M`, `K` up to 128-multiples and `N` up to a 512-multiple (only when `N > 512`).
-3. Move padded A and B to the XLA device; dispatch `_spmm_dense_kernel`.
-4. Slice the result back to the caller's `(M, N)`.
-
-The kernel is the trnblas GEMM pattern: stationary A-tile on the systolic array, streaming B tiles via `nisa.nc_matmul`, PSUM accumulation across K-tiles, one store per output tile.
-
-Backward — `_SpMMFunction.backward`, PyTorch-level:
-
-- `dL/dA_dense = dL/dC @ Bᵀ` (projects back through the `to_dense()` graph onto the original CSR values)
-- `dL/dB = A_denseᵀ @ dL/dC`
-
-This wrapping satisfies [`trnsci/trnsci#3`](https://github.com/trnsci/trnsci/issues/3) — the suite-wide requirement that every NKI kernel live inside a `torch.autograd.Function` so training-time `loss.backward()` works. `torch.autograd.gradcheck` on small inputs is part of the hardware test matrix.
+Every NKI kernel lives inside a `torch.autograd.Function` (satisfies
+[`trnsci/trnsci#3`](https://github.com/trnsci/trnsci/issues/3)).
+Backward passes run at the PyTorch level via block-gradient projection.
+Block-selection is non-differentiable by construction; `grad_out` is
+routed into exactly the stored blocks. `gradcheck` at `atol=1e-4` is
+part of the hardware test matrix for all three NKI kernels.
 
 ### Fused screened SpMM (v0.4.0)
 
@@ -103,7 +121,10 @@ Restricted to square A (`M == K`) with 1-D `diag_integrals` in v0.4.0
 — the common Fock-build case. Rectangular / asymmetric-bounds
 extension is a follow-up if asked for.
 
-### Known limits (v0.2.0)
+## Known limits
 
-- **No sparsity exploitation.** Materialize-then-GEMM pays the full `M × K` cost. Row-bucketing is the v0.3.0 ([#15](https://github.com/trnsci/trnsparse/issues/15)) Phase 3 story. See [Benchmarks](benchmarks.md) for where NKI sits today vs scipy / torch.sparse.
-- **SpMV stays PyTorch.** A single output column on the Tensor Engine doesn't justify the compile + dispatch overhead.
+- **Row-bucketing CSR** ([#15](https://github.com/trnsci/trnsparse/issues/15)) — parked. Requires NKI indirect-DMA gather (not exposed as of NKI 0.3.0). The CSR PyTorch fallback is within 2× of scipy; that's the current story.
+- **Fused tile-level attention scores** ([#25](https://github.com/trnsci/trnsparse/issues/25)) — parked on the same primitive. The current example materializes the full `(seq_len, seq_len)` score matrix before masking.
+- **Fused CG/power-iteration kernel** ([#22](https://github.com/trnsci/trnsparse/issues/22)) — parked on `nl.affine_range` lacking `break` and iteration-carried scalar state.
+- **Multi-chip sharded BSR** ([#16](https://github.com/trnsci/trnsparse/issues/16)) — gated on suite-level multi-chip collectives.
+- **SpMV stays PyTorch.** Single output column on the Tensor Engine doesn't amortize compile + dispatch overhead.
