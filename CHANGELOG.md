@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.2] — 2026-04-15
+
+### Added
+
+- **`examples/block_sparse_attention.py`** — block-sparse attention
+  reference using `BSRMatrix` + `bsr_spmm`. Three mask patterns
+  (local window, dilated, global tokens); verifies against a dense
+  reference; reports block density and timing for the `bsr_spmm` step.
+  Closes [#21](https://github.com/trnsci/trnsparse/issues/21).
+- **`docs/sparse_attention.md`** — writeup: how BSR-128 maps to
+  Longformer/BigBird-style attention masks, block density arithmetic,
+  pattern construction helpers, and the fused-tile follow-up.
+- **`docs/iterative_solvers.md`** now linked in `mkdocs.yml` nav
+  (was present but missing from navigation).
+- **`tests/test_attention.py`** — 8 CPU tests: mask shape/symmetry
+  checks + parity against dense reference at `atol=1e-4` for all three
+  patterns and the full-attention edge case.
+
+### Notes
+
+No API changes, no kernel changes. The claim in #21 is: `bsr_spmm` is
+the block-sparse attention primitive; `BSRMatrix` captures the mask.
+The example and docs make that explicit.
+
 ## [0.4.1] — 2026-04-14
 
 ### Added

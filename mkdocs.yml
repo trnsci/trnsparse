@@ -24,6 +24,8 @@ nav:
   - Architecture: architecture.md
   - Migration from scipy.sparse: migration_scipy.md
   - Benchmarks: benchmarks.md
+  - Iterative Solvers: iterative_solvers.md
+  - Sparse Attention: sparse_attention.md
   - Deployment:
       - AWS Setup for Neuron CI: aws_setup.md
 
