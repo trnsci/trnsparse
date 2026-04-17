@@ -21,7 +21,8 @@ trnsparse follows the [trnsci 5-phase roadmap](https://trnsci.dev/roadmap/). Act
 - **v0.3.2** ✅ `cg_bsr`, `power_iteration_bsr` — iterative solvers over BSR (Python loop; fused kernel gated on NKI capability).
 - **v0.4.0** ✅ `screened_spmm` — fused Schwarz-screened SpMM in one NKI dispatch.
 - **v0.4.2** ✅ Block-sparse attention — `BSRMatrix` + `bsr_spmm` as the primitive; `examples/block_sparse_attention.py` + [`docs/sparse_attention.md`](https://trnsci.dev/trnsparse/sparse_attention/).
-- **[Phase 3 — perf](https://github.com/trnsci/trnsparse/issues/15)**: nnz-bucketing, fused tile-level attention scores — parked on NKI indirect DMA gather.
+- **v0.4.3** ✅ Architecture-friendly alternatives: `chebyshev_bsr` / `richardson_bsr` (fixed-K solvers, no inner products); `block_sparse_attention_tiled` (two-pass, no O(seq²) intermediate).
+- **[Phase 3 — perf](https://github.com/trnsci/trnsparse/issues/15)**: nnz-bucketing, NKI attention kernel pair — parked on NKI indirect DMA gather / hardware validation.
 - **[Phase 4 — multi-chip](https://github.com/trnsci/trnsparse/issues/16)**: sharded BSR across NeuronCores.
 - **[Phase 5 — generation](https://github.com/trnsci/trnsparse/issues/17)**: trn2 DMA bandwidth exploitation.
 
@@ -71,9 +72,12 @@ stats = trnsparse.sparsity_stats(Q)
 | `sparse_scale` | B = αA |
 | `sparse_transpose` | Aᵀ |
 | `cg_bsr` | Conjugate Gradient on BSR matrix |
+| `chebyshev_bsr` | Fixed-K Chebyshev semi-iteration (no inner products) |
+| `richardson_bsr` | Fixed-K Richardson iteration |
 | `power_iteration_bsr` | Dominant eigenpair via power iteration |
 | `jacobi_preconditioner_bsr` | Diagonal preconditioner for `cg_bsr` |
 | `bsr_diagonal` | Extract main diagonal from BSR matrix |
+| `block_sparse_attention_tiled` | Two-pass sparse attention, no O(seq²) intermediate |
 | `schwarz_bounds` | Schwarz screening bounds |
 | `screen_quartets` | Shell quartet significance mask |
 | `density_screen` | Density-weighted screening |

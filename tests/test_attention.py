@@ -91,3 +91,45 @@ class TestAttentionParity:
         seq_len, head_dim, block_size = 256, 32, 128
         mask = torch.ones(seq_len, seq_len, dtype=torch.bool)
         self._run_parity(seq_len, head_dim, block_size, mask)
+
+
+class TestTiledAttentionParity:
+    """block_sparse_attention_tiled matches block_sparse_attention (naive).
+
+    The tiled two-pass implementation must produce numerically identical
+    output to the naive O(seq_len²) reference, within floating-point noise.
+    """
+
+    def _run_parity(self, seq_len, head_dim, block_size, mask):
+        torch.manual_seed(10)
+        Q = torch.randn(seq_len, head_dim)
+        K = torch.randn(seq_len, head_dim)
+        V = torch.randn(seq_len, head_dim)
+
+        mask_bsr = trnsparse.BSRMatrix.from_dense(mask.float(), block_size=block_size)
+        out_naive = demo.block_sparse_attention(Q, K, V, mask_bsr)
+        out_tiled = trnsparse.block_sparse_attention_tiled(Q, K, V, mask_bsr)
+
+        torch.testing.assert_close(out_naive, out_tiled, atol=1e-4, rtol=1e-4)
+        assert out_tiled.shape == (seq_len, head_dim)
+
+    def test_local_window_parity(self):
+        seq_len, head_dim, block_size = 256, 32, 128
+        mask = demo._local_window_mask(seq_len, block_size, window=1)
+        self._run_parity(seq_len, head_dim, block_size, mask)
+
+    def test_dilated_parity(self):
+        seq_len, head_dim, block_size = 256, 32, 128
+        mask = demo._dilated_mask(seq_len, block_size, stride=2)
+        self._run_parity(seq_len, head_dim, block_size, mask)
+
+    def test_global_token_parity(self):
+        seq_len, head_dim, block_size = 384, 32, 128
+        mask = demo._global_token_mask(seq_len, block_size, window=1, n_global=1)
+        self._run_parity(seq_len, head_dim, block_size, mask)
+
+    def test_full_mask_parity(self):
+        """Fully dense mask: tiled must match naive."""
+        seq_len, head_dim, block_size = 256, 32, 128
+        mask = torch.ones(seq_len, seq_len, dtype=torch.bool)
+        self._run_parity(seq_len, head_dim, block_size, mask)

@@ -275,3 +275,121 @@ def screened_spmm(
     pair_bound = Q.unsqueeze(-1) * Q.unsqueeze(0)  # (M, K)
     mask = pair_bound > threshold_sqrt
     return (A * mask.to(A.dtype)) @ B
+
+
+def block_sparse_attention_tiled(
+    Q: torch.Tensor,
+    K: torch.Tensor,
+    V: torch.Tensor,
+    mask_bsr: BSRMatrix,
+    scale: float | None = None,
+) -> torch.Tensor:
+    """Block-sparse attention without an O(seq_len²) score intermediate.
+
+    The naive implementation (`examples/block_sparse_attention.py`) builds
+    the full `(seq_len, seq_len)` score matrix before masking, which uses
+    O(seq_len²) memory and compute regardless of block density. This
+    two-pass implementation works only over the nonzero blocks:
+
+    **Pass 1** — per-block statistics: for each stored block (m, ki),
+    compute score_tile = Q[m] @ K[ki].T and extract its row-wise max
+    (tile_max, shape (block_size,)) and stable row-wise exp-sum
+    (tile_sumexp). Store to an O(n_stored_blocks × block_size) array.
+
+    **Host reduction** — row-level softmax denominators: combine tile
+    stats across all k-blocks in each block-row m into global row_max
+    and row_denom vectors of length seq_len. O(n_stored_blocks × b) work.
+
+    **Pass 2** — weighted accumulation: recompute score_tile for each
+    stored block, apply the stable softmax normalisation using row_max
+    and row_denom loaded from HBM, and accumulate weights @ V_block
+    into the output.
+
+    Memory: O(n_stored_blocks × block_size) for stats + O(seq_len × head_dim)
+    for output. No (seq_len, seq_len) tensor is ever allocated.
+
+    This is the PyTorch reference for the NKI `_attn_stats_kernel` +
+    `_attn_out_kernel` pair documented in
+    https://github.com/trnsci/trnsparse/issues/25.
+
+    Args:
+        Q: (seq_len, head_dim) query tensor.
+        K: (seq_len, head_dim) key tensor.
+        V: (seq_len, head_dim) value tensor.
+        mask_bsr: BSRMatrix encoding the nonzero attention block pattern.
+            Only the sparsity pattern is used (block_row_ptrs,
+            block_col_indices); block values are ignored.
+        scale: Optional QK scale (default: head_dim ** -0.5).
+
+    Returns:
+        (seq_len, head_dim) attention output.
+    """
+    seq_len, head_dim = Q.shape
+    b = mask_bsr.block_size
+    M_tiles = seq_len // b
+
+    if scale is None:
+        scale = head_dim**-0.5
+
+    n_blocks = mask_bsr.n_blocks
+
+    # --- Pass 1: per-block (tile_max, tile_sumexp) ---
+    # tile_max[idx, r]    = max over columns of score_tile[r, :]
+    # tile_sumexp[idx, r] = sum over columns of exp(score[r,:] - tile_max[idx, r])
+    tile_max = torch.full((n_blocks, b), float("-inf"), dtype=Q.dtype)
+    tile_sumexp = torch.zeros((n_blocks, b), dtype=Q.dtype)
+
+    for m in range(M_tiles):
+        start = mask_bsr.block_row_ptrs[m].item()
+        end = mask_bsr.block_row_ptrs[m + 1].item()
+        q_block = Q[m * b : (m + 1) * b]  # (b, head_dim)
+        for idx in range(start, end):
+            col = mask_bsr.block_col_indices[idx].item()
+            k_block = K[col * b : (col + 1) * b]  # (b, head_dim)
+            score = (q_block @ k_block.T) * scale  # (b, b)
+            tile_max[idx] = score.max(dim=1).values  # (b,)
+            tile_sumexp[idx] = torch.exp(score - tile_max[idx].unsqueeze(1)).sum(dim=1)
+
+    # --- Host reduction: row_max, row_denom (shape: seq_len each) ---
+    row_max = torch.full((seq_len,), float("-inf"), dtype=Q.dtype)
+    for m in range(M_tiles):
+        start = mask_bsr.block_row_ptrs[m].item()
+        end = mask_bsr.block_row_ptrs[m + 1].item()
+        if start == end:
+            row_max[m * b : (m + 1) * b] = 0.0
+            continue
+        row_max[m * b : (m + 1) * b] = tile_max[start:end].max(dim=0).values
+
+    row_denom = torch.zeros(seq_len, dtype=Q.dtype)
+    for m in range(M_tiles):
+        start = mask_bsr.block_row_ptrs[m].item()
+        end = mask_bsr.block_row_ptrs[m + 1].item()
+        if start == end:
+            continue
+        row_max_m = row_max[m * b : (m + 1) * b]  # (b,)
+        for idx in range(start, end):
+            correction = torch.exp(tile_max[idx] - row_max_m)  # (b,)
+            row_denom[m * b : (m + 1) * b] += tile_sumexp[idx] * correction
+
+    row_denom = row_denom.clamp(min=1e-12)
+
+    # --- Pass 2: recompute scores, normalise, accumulate V ---
+    out = torch.zeros(seq_len, head_dim, dtype=Q.dtype)
+    for m in range(M_tiles):
+        start = mask_bsr.block_row_ptrs[m].item()
+        end = mask_bsr.block_row_ptrs[m + 1].item()
+        if start == end:
+            continue
+        q_block = Q[m * b : (m + 1) * b]  # (b, head_dim)
+        row_max_m = row_max[m * b : (m + 1) * b]  # (b,)
+        row_denom_m = row_denom[m * b : (m + 1) * b]  # (b,)
+        for idx in range(start, end):
+            col = mask_bsr.block_col_indices[idx].item()
+            k_block = K[col * b : (col + 1) * b]
+            v_block = V[col * b : (col + 1) * b]
+            score = (q_block @ k_block.T) * scale  # (b, b)
+            # Stable per-row softmax weights
+            weights = torch.exp(score - row_max_m.unsqueeze(1)) / row_denom_m.unsqueeze(1)
+            out[m * b : (m + 1) * b] += weights @ v_block  # (b, head_dim)
+
+    return out

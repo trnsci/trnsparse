@@ -123,8 +123,23 @@ extension is a follow-up if asked for.
 
 ## Known limits
 
-- **Row-bucketing CSR** ([#15](https://github.com/trnsci/trnsparse/issues/15)) — parked. Requires NKI indirect-DMA gather (not exposed as of NKI 0.3.0). The CSR PyTorch fallback is within 2× of scipy; that's the current story.
-- **Fused tile-level attention scores** ([#25](https://github.com/trnsci/trnsparse/issues/25)) — parked on the same primitive. The current example materializes the full `(seq_len, seq_len)` score matrix before masking.
-- **Fused CG/power-iteration kernel** ([#22](https://github.com/trnsci/trnsparse/issues/22)) — parked on `nl.affine_range` lacking `break` and iteration-carried scalar state.
-- **Multi-chip sharded BSR** ([#16](https://github.com/trnsci/trnsparse/issues/16)) — gated on suite-level multi-chip collectives.
-- **SpMV stays PyTorch.** Single output column on the Tensor Engine doesn't amortize compile + dispatch overhead.
+- **Row-bucketing CSR** ([#15](https://github.com/trnsci/trnsparse/issues/15)) — parked.
+  Requires NKI indirect-DMA gather (not exposed as of NKI 0.3.0). The CSR PyTorch
+  fallback is within 2× of scipy; that's the current story.
+- **Fused tile-level attention scores** ([#25](https://github.com/trnsci/trnsparse/issues/25)) —
+  blocked on `nl.scan` / scalar-carry for online softmax. **v0.4.3 ships a
+  two-pass PyTorch reference** (`block_sparse_attention_tiled`) that avoids the
+  O(seq_len²) score intermediate without any new NKI primitives (pass 1 computes
+  per-block stats independently; host reduces; pass 2 accumulates). The NKI kernel
+  pair (`_attn_stats_kernel` + `_attn_out_kernel`) is the concrete follow-up
+  documented in #25.
+- **Fused iterative solvers** ([#22](https://github.com/trnsci/trnsparse/issues/22)) —
+  CG blocked on `nl.affine_range` iteration-carried scalar state. **v0.4.3 ships
+  `chebyshev_bsr` and `richardson_bsr`**: fixed-K solvers with pre-computed
+  coefficients (no inner products in the loop) that have the correct structure for
+  eventual NKI fusion. The "A SBUF-resident across all iterations" win remains gated
+  on `affine_range` vector-carry support.
+- **Multi-chip sharded BSR** ([#16](https://github.com/trnsci/trnsparse/issues/16)) —
+  gated on suite-level multi-chip collectives.
+- **SpMV stays PyTorch.** Single output column on the Tensor Engine doesn't amortize
+  compile + dispatch overhead.

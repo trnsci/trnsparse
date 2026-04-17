@@ -5,6 +5,42 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.3] — 2026-04-16
+
+### Added
+
+- **`chebyshev_bsr(A, b, lam_min, lam_max, K)`** — fixed-K Chebyshev
+  semi-iteration. Pre-computes all step coefficients from eigenvalue bounds
+  before the loop; no inner products during iteration. Same convergence rate
+  as CG without the adaptive coefficient computation that blocks NKI fusion.
+  Returns `(x, K, rel_residual)` matching the `cg_bsr` signature.
+- **`chebyshev_coeffs(lam_min, lam_max, K)`** — returns the `(alpha, beta)`
+  coefficient tensors for the momentum update `x_{k+1} = x_k + α_k r_k +
+  β_k (x_k - x_{k-1})`. Useful for inspecting or caching coefficients across
+  solves with the same matrix spectrum.
+- **`richardson_bsr(A, b, omega, K)`** — fixed-K Richardson iteration; the
+  simplest fixed-point iteration with no coefficient computation at all.
+  Optimal omega = `2 / (lam_min + lam_max)`. Baseline comparator for Chebyshev.
+- **`block_sparse_attention_tiled(Q, K, V, mask_bsr)`** — two-pass sparse
+  attention that avoids the O(seq_len²) score intermediate. Pass 1 computes
+  per-block `(tile_max, tile_sumexp)` statistics over nonzero blocks only
+  (O(n_blocks × block_size) stats array, e.g. 5 KB at seq_len=512 vs 1 MB
+  dense). Pass 2 recomputes scores, applies stable softmax using host-reduced
+  row statistics, and accumulates V. PyTorch reference for the NKI kernel pair
+  documented in [#25](https://github.com/trnsci/trnsparse/issues/25).
+- **`docs/sparse_attention.md`**: new "Tiled two-pass path" section explaining
+  the algorithm, memory trade-offs, and the NKI kernel follow-up path.
+- **`docs/architecture.md`**: "Known limits" updated — #22 and #25 now have
+  v0.4.3 PyTorch references with clear notes on remaining NKI gate conditions.
+
+### Notes
+
+Addresses the architecture-friendly workarounds identified in the analysis of
+parked NKI-capability-gated issues (#22, #25). Both solvers and the tiled
+attention path share the structural property of fixed-iteration loops with
+statically-determined coefficients — the pattern that maps to `nl.affine_range`
+without scalar carry.
+
 ## [0.4.2] — 2026-04-15
 
 ### Added

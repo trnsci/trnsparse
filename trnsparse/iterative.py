@@ -145,6 +145,156 @@ def jacobi_preconditioner_bsr(
     return precond
 
 
+def chebyshev_coeffs(
+    lam_min: float,
+    lam_max: float,
+    K: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Chebyshev semi-iteration step coefficients for K fixed iterations.
+
+    Returns (alpha, beta) each of shape (K,) such that the iteration
+
+        x_{k+1} = x_k + alpha[k] * r_k + beta[k] * (x_k - x_{k-1})
+
+    (with r_k = b - A @ x_k) minimises the Chebyshev residual polynomial
+    over [lam_min, lam_max] after K steps.
+
+    Algorithm: Templates for the Solution of Linear Systems (Barrett et
+    al. 1994), Algorithm 2.1 converted from direction-vector form to the
+    momentum / heavy-ball form. c = half-range, d = centre.
+
+    Args:
+        lam_min: Lower eigenvalue bound (must be > 0 for SPD A).
+        lam_max: Upper eigenvalue bound.
+        K: Number of iterations for which coefficients are needed.
+
+    Returns:
+        (alpha, beta): float32 tensors of length K.
+    """
+    c = (lam_max - lam_min) / 2.0  # half-range
+    d = (lam_max + lam_min) / 2.0  # centre
+
+    alpha = torch.zeros(K, dtype=torch.float64)
+    beta = torch.zeros(K, dtype=torch.float64)
+
+    # k=0: pure Richardson at the optimal single-step rate.
+    alpha_prev = 1.0 / d
+    alpha[0] = alpha_prev
+    beta[0] = 0.0
+
+    for k in range(1, K):
+        # Templates step: beta_t = (c * alpha_prev / 2)^2
+        #                  alpha_new = 1 / (d - beta_t / alpha_prev)
+        beta_t = (c * alpha_prev / 2.0) ** 2
+        alpha_new = 1.0 / (d - beta_t / alpha_prev)
+        # Convert to momentum form:
+        #   alpha_k^(momentum) = alpha_new
+        #   beta_k^(momentum)  = alpha_new * beta_t / alpha_prev
+        alpha[k] = alpha_new
+        beta[k] = alpha_new * beta_t / alpha_prev
+        alpha_prev = alpha_new
+
+    return alpha.float(), beta.float()
+
+
+def chebyshev_bsr(
+    A: BSRMatrix,
+    b: torch.Tensor,
+    lam_min: float,
+    lam_max: float,
+    K: int = 50,
+    x0: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, int, float]:
+    """Chebyshev semi-iteration for `A @ x = b` with A SPD and BSR-stored.
+
+    Runs exactly K iterations with pre-computed coefficients derived from
+    eigenvalue bounds [lam_min, lam_max]. No inner products are computed
+    during the iteration — all coefficients are determined before the
+    first step. This is the key structural difference from `cg_bsr`:
+    the loop body is purely matvec + elementwise ops, which maps directly
+    to the fixed-iteration NKI kernel pattern.
+
+    Obtain lam_max from `power_iteration_bsr`. A conservative lam_min
+    estimate (e.g. lam_max / condition_number_estimate) is sufficient;
+    over-estimating the spectral range only slows convergence slightly,
+    not correctness.
+
+    Args:
+        A: SPD BSR matrix (N, N).
+        b: Right-hand side, shape (N,).
+        lam_min: Lower eigenvalue bound (> 0).
+        lam_max: Upper eigenvalue bound.
+        K: Fixed iteration count.
+        x0: Initial guess (default: zeros).
+
+    Returns:
+        `(x, K, rel_residual)` — solution, iteration count (always K),
+        final relative residual ||b - A @ x|| / ||b||.
+    """
+    n = b.shape[0]
+    matvec = _bsr_matvec(A)
+
+    x = x0.clone() if x0 is not None else torch.zeros(n, dtype=b.dtype, device=b.device)
+    x_prev = x.clone()
+    b_norm = torch.linalg.norm(b).item()
+
+    alpha, beta = chebyshev_coeffs(lam_min, lam_max, K)
+
+    for k in range(K):
+        r = b - matvec(x)
+        x_new = x + alpha[k].item() * r
+        if k > 0:
+            x_new = x_new + beta[k].item() * (x - x_prev)
+        x_prev = x
+        x = x_new
+
+    r_final = b - matvec(x)
+    rel = torch.linalg.norm(r_final).item() / max(b_norm, 1e-15)
+    return x, K, rel
+
+
+def richardson_bsr(
+    A: BSRMatrix,
+    b: torch.Tensor,
+    omega: float,
+    K: int = 100,
+    x0: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, int, float]:
+    """Fixed-K Richardson iteration: x_{k+1} = x_k + omega * (b - A @ x_k).
+
+    The simplest fixed-point iteration with no adaptive coefficients.
+    Converges when 0 < omega < 2 / lam_max. The optimal static step is
+    omega = 2 / (lam_min + lam_max).
+
+    Like `chebyshev_bsr`, the loop runs for exactly K iterations with no
+    adaptive stopping — the right structure for eventual NKI fusion.
+
+    Args:
+        A: BSR matrix (N, N).
+        b: Right-hand side, shape (N,).
+        omega: Relaxation parameter. Use 2 / (lam_min + lam_max) for
+            optimal convergence on SPD systems.
+        K: Fixed iteration count.
+        x0: Initial guess (default: zeros).
+
+    Returns:
+        `(x, K, rel_residual)`.
+    """
+    n = b.shape[0]
+    matvec = _bsr_matvec(A)
+
+    x = x0.clone() if x0 is not None else torch.zeros(n, dtype=b.dtype, device=b.device)
+    b_norm = torch.linalg.norm(b).item()
+
+    for _ in range(K):
+        r = b - matvec(x)
+        x = x + omega * r
+
+    r_final = b - matvec(x)
+    rel = torch.linalg.norm(r_final).item() / max(b_norm, 1e-15)
+    return x, K, rel
+
+
 def power_iteration_bsr(
     A: BSRMatrix,
     v0: torch.Tensor | None = None,

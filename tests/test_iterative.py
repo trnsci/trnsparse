@@ -133,3 +133,94 @@ class TestBsrDiagonal:
         A_bsr = trnsparse.BSRMatrix.from_dense(A_dense, block_size=128)
         d = trnsparse.bsr_diagonal(A_bsr)
         torch.testing.assert_close(d, torch.zeros(256))
+
+
+class TestRichardsonBsr:
+    def test_identity_converges_one_step(self):
+        """A = I, omega = 1 → x = b after exactly one iteration."""
+        n = 128
+        I_bsr = trnsparse.BSRMatrix.from_dense(torch.eye(n), block_size=128)
+        b = torch.randn(n)
+        x, iters, rel = trnsparse.richardson_bsr(I_bsr, b, omega=1.0, K=1)
+        torch.testing.assert_close(x, b, atol=1e-5, rtol=1e-5)
+        assert iters == 1
+        assert rel < 1e-5
+
+    def test_spd_parity_vs_cg(self):
+        """Richardson (large K, optimal omega) matches cg_bsr solution."""
+        n = 128
+        A_dense, A_bsr = _random_spd_bsr(n, block_size=128, seed=6)
+        b = torch.randn(n)
+
+        lam = torch.linalg.eigvalsh(A_dense)
+        lam_min, lam_max = lam.min().item(), lam.max().item()
+        omega = 2.0 / (lam_min + lam_max)  # optimal static step
+
+        # Richardson needs more iterations than CG on ill-conditioned A.
+        # For this well-conditioned synthetic matrix K=500 is sufficient.
+        x_rich, _, rel_rich = trnsparse.richardson_bsr(A_bsr, b, omega=omega, K=500)
+        x_cg, _, _ = trnsparse.cg_bsr(A_bsr, b, tol=1e-8, max_iter=200)
+        torch.testing.assert_close(x_rich, x_cg, atol=1e-3, rtol=1e-3)
+        assert rel_rich < 1e-4
+
+    def test_omega_too_large_diverges(self):
+        """omega > 2 / lam_max → iteration diverges (residual grows)."""
+        n = 128
+        A_dense, A_bsr = _random_spd_bsr(n, block_size=128, seed=7)
+        b = torch.randn(n)
+        lam_max = torch.linalg.eigvalsh(A_dense).max().item()
+
+        omega_bad = 2.5 / lam_max  # exceeds stability bound
+        x0 = torch.zeros(n)
+        r0_norm = torch.linalg.norm(b - A_dense @ x0).item()
+
+        x_div, _, rel = trnsparse.richardson_bsr(A_bsr, b, omega=omega_bad, K=20, x0=x0)
+        r_norm = torch.linalg.norm(b - A_dense @ x_div).item()
+        assert r_norm > r0_norm, "Unstable omega should cause divergence"
+
+
+class TestChebyshevBsr:
+    def test_parity_vs_cg(self):
+        """chebyshev_bsr solution matches cg_bsr within atol=1e-3."""
+        n = 128
+        A_dense, A_bsr = _random_spd_bsr(n, block_size=128, seed=8)
+        b = torch.randn(n)
+
+        lam = torch.linalg.eigvalsh(A_dense)
+        lam_min, lam_max = lam.min().item(), lam.max().item()
+
+        x_cheb, _, rel = trnsparse.chebyshev_bsr(A_bsr, b, lam_min, lam_max, K=100)
+        x_cg, _, _ = trnsparse.cg_bsr(A_bsr, b, tol=1e-8, max_iter=200)
+        torch.testing.assert_close(x_cheb, x_cg, atol=1e-3, rtol=1e-3)
+        assert rel < 1e-4
+
+    def test_coeffs_shape(self):
+        """chebyshev_coeffs returns (K,) float32 tensors; alpha[0] = 1/d."""
+        K = 10
+        lam_min, lam_max = 1.0, 100.0
+        alpha, beta = trnsparse.chebyshev_coeffs(lam_min, lam_max, K)
+        assert alpha.shape == (K,)
+        assert beta.shape == (K,)
+        assert alpha.dtype == torch.float32
+        d = (lam_max + lam_min) / 2.0
+        assert abs(alpha[0].item() - 1.0 / d) < 1e-5
+        assert abs(beta[0].item()) < 1e-6  # first step has no momentum
+
+    def test_lower_residual_than_richardson_same_K(self):
+        """For well-conditioned SPD, Chebyshev beats Richardson at same K."""
+        n = 128
+        A_dense, A_bsr = _random_spd_bsr(n, block_size=128, seed=9)
+        b = torch.randn(n)
+
+        lam = torch.linalg.eigvalsh(A_dense)
+        lam_min, lam_max = lam.min().item(), lam.max().item()
+        omega = 2.0 / (lam_min + lam_max)
+
+        K = 30
+        _, _, rel_rich = trnsparse.richardson_bsr(A_bsr, b, omega=omega, K=K)
+        _, _, rel_cheb = trnsparse.chebyshev_bsr(A_bsr, b, lam_min, lam_max, K=K)
+
+        assert rel_cheb <= rel_rich, (
+            f"Chebyshev should converge at least as fast as Richardson "
+            f"(cheb={rel_cheb:.4f}, rich={rel_rich:.4f})"
+        )

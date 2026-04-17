@@ -279,6 +279,31 @@ def main() -> None:
     print("  large seq_len on Trainium, where dispatch overhead amortizes")
     print("  against the tile-level nc_matmul throughput advantage.")
 
+    # --- Tiled two-pass vs naive: memory and correctness ---
+    print()
+    print("  Tiled two-pass (block_sparse_attention_tiled):")
+    print(
+        f"    No O(seq_len²) intermediate — stats buffer: "
+        f"{mask_bsr.n_blocks} blocks × {args.block_size} = "
+        f"{mask_bsr.n_blocks * args.block_size * 4 / 1024:.1f} KB "
+        f"vs {seq_len * seq_len * 4 / 1024:.0f} KB for dense scores"
+    )
+
+    out_tiled = trnsparse.block_sparse_attention_tiled(Q, K, V, mask_bsr)
+    out_naive_full = block_sparse_attention(Q, K, V, mask_bsr)
+    max_err_tiled = (out_tiled - out_naive_full).abs().max().item()
+    print(f"    Numerical agreement with naive: max |Δ| = {max_err_tiled:.2e}")
+    assert max_err_tiled < 1e-3, f"Tiled and naive disagree: {max_err_tiled}"
+
+    t0 = time.perf_counter()
+    for _ in range(N_REPS):
+        _ = trnsparse.block_sparse_attention_tiled(Q, K, V, mask_bsr)
+    t_tiled = (time.perf_counter() - t0) / N_REPS
+    print(
+        f"    Timing ({N_REPS}-rep mean): {t_tiled * 1e6:8.1f} μs  "
+        f"(Python loops; NKI kernel path is the hardware target)"
+    )
+
 
 if __name__ == "__main__":
     main()

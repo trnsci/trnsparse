@@ -142,21 +142,57 @@ The win is at long sequences. At `seq_len=1024`, a window-2 mask still stores
 the per-block compute becomes the bottleneck, which is where the Tensor Engine
 thrives.
 
+## Tiled two-pass path (v0.4.3)
+
+`block_sparse_attention_tiled` eliminates the `O(seq_len²)` score intermediate
+without any new NKI primitives. The algorithm uses two passes over the nonzero
+blocks:
+
+**Pass 1 — per-block statistics**: For each stored block `(m, ki)`, compute
+the score tile `Q[m] @ K[ki].T` and extract its row-wise max (`tile_max`,
+shape `(block_size,)`) and stable row-wise exp-sum (`tile_sumexp`). Every
+`(m, ki)` pair is independent — no iteration-carried state.
+
+**Host reduction**: For each block-row m, take the max of `tile_max` across all
+its nonzero k-blocks (`row_max`) and compute the corrected denominator
+`row_denom`. This is O(n_stored_blocks × block_size) work — at seq_len=4096
+with window=2, about 160 block pairs × 128 = 20K operations, negligible.
+
+**Pass 2 — stable softmax + accumulation**: Recompute each score tile, apply
+`exp(score - row_max) / row_denom`, and accumulate `weights @ V_block` into
+the output via a PSUM-style loop.
+
+```python
+out = trnsparse.block_sparse_attention_tiled(Q, K, V, mask_bsr)
+```
+
+Memory: `n_stored_blocks × block_size × 4` bytes for stats (5 KB at seq_len=512,
+window=1) vs `seq_len² × 4` bytes for the naive dense score matrix (1 MB at
+seq_len=512, 64 MB at seq_len=4096).
+
+**On CPU**, the Python-level loops make this path slower than the vectorized
+naive implementation — that's expected. The value of `block_sparse_attention_tiled`
+is algorithmic: it validates the two-pass decomposition that the NKI kernel pair
+(`_attn_stats_kernel` + `_attn_out_kernel`) will implement on hardware, where
+per-block `nc_matmul` calls amortize the dispatch cost and the O(seq_len²)
+allocation is the binding constraint.
+
+The NKI implementation path is documented in
+[#25](https://github.com/trnsci/trnsparse/issues/25).
+
 ## What's next
 
-The current path materializes the full `(seq_len, seq_len)` score matrix to
-compute attention weights. A production path would:
+The NKI kernel pair for tiled attention ([#25](https://github.com/trnsci/trnsparse/issues/25)):
 
-1. Iterate over nonzero blocks in `mask_bsr`.
-2. For each block `(i, j)`, load `Q[i*b:(i+1)*b]` and `K[j*b:(j+1)*b]` into
-   SBUF, compute the score tile, and apply softmax over the block-row.
-3. Multiply the score tile by `V[j*b:(j+1)*b]` and accumulate into the output.
+- `_attn_stats_kernel(Q_blocks, K_blocks, bsr_pattern)` → `tile_max, tile_sumexp`
+  of shape `(n_blocks, block_size)`. Each `(m, ki)` iteration is independent;
+  standard `affine_range` + `nl.max` within-tile reduction.
+- `_attn_out_kernel(Q_blocks, K_blocks, V_blocks, row_max, row_denom, bsr_pattern)`
+  → output. Loads `row_max[m]` and `row_denom[m]` once per block-row
+  (static HBM offset by affine_range variable `m`); accumulates into PSUM.
 
-This fused tile-level kernel avoids the `O(seq_len²)` intermediate entirely.
-It's the same architectural opportunity as [on-chip iterative solvers](iterative_solvers.md):
-load A once, iterate on-chip. The NKI building block is available (the BSR
-kernel in `nki/kernels.py`); the row-wise softmax over variable numbers of
-tiles is the authoring challenge.
+No `nl.scan` or scalar carry needed — the two-kernel split pushes the row-level
+softmax reduction to the host.
 
-A runnable reference for the current (non-fused) path is in
+A runnable reference for both the naive and tiled paths is in
 [`examples/block_sparse_attention.py`](https://github.com/trnsci/trnsparse/blob/main/examples/block_sparse_attention.py).
