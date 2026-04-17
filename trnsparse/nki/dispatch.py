@@ -24,6 +24,8 @@ if HAS_NKI:
     import nki
 
     from .kernels import (  # noqa: F401 — NKI-only
+        _attn_out_kernel,
+        _attn_stats_kernel,
         _bsr_spmm_kernel,
         _screened_spmm_kernel,
         _spmm_dense_kernel,
@@ -485,3 +487,145 @@ def nki_screened_spmm(
 ) -> torch.Tensor:
     """Screened SpMM entry point — wraps `_ScreenedSpMMFunction.apply` for autograd."""
     return _ScreenedSpMMFunction.apply(A, diag_integrals, threshold, B)
+
+
+def _attn_gather(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, mask_bsr, scale: float):
+    """Host-side gather for the two-pass NKI attention kernels.
+
+    Mirrors `_bsr_pad_and_gather`: builds a (M_tiles, K_max) column grid,
+    fancy-indexes K and V blocks into padded (M_tiles, K_max, b, head_dim)
+    tensors, and scales Q into (M_tiles, b, head_dim).
+
+    Returns:
+        q_scaled_blocks: (M_tiles, b, head_dim)
+        k_gathered_pad:  (M_tiles, K_max, b, head_dim)
+        v_gathered_pad:  (M_tiles, K_max, b, head_dim)
+        K_max:           int — padded number of k-slots per block-row
+        M_tiles:         int
+    """
+    seq_len, head_dim = Q.shape
+    b = mask_bsr.block_size
+    M_tiles = seq_len // b
+
+    assert head_dim <= _TILE_K, (
+        f"head_dim {head_dim} > {_TILE_K}: v0.4.4 requires head_dim ≤ 128 "
+        f"(nc_matmul partition limit). head_dim=256+ is future work."
+    )
+
+    block_row_ptrs = mask_bsr.block_row_ptrs
+    blocks_per_row = (block_row_ptrs[1:] - block_row_ptrs[:-1]).tolist()
+    K_max = max(blocks_per_row) if blocks_per_row else 1
+
+    # Build (M_tiles, K_max) column grid; -1 for padding slots.
+    col_grid = torch.full((M_tiles, K_max), -1, dtype=torch.long)
+    for i in range(M_tiles):
+        start = block_row_ptrs[i].item()
+        end = block_row_ptrs[i + 1].item()
+        row_len = end - start
+        col_grid[i, :row_len] = mask_bsr.block_col_indices[start:end]
+
+    # Gather K and V: reshape (seq_len, head_dim) → (seq_len//b, b, head_dim)
+    # then fancy-index by col_grid (use col 0 as sentinel for padded slots).
+    nb_rows = seq_len // b
+    K_by_block = K.view(nb_rows, b, head_dim)  # (nb_rows, b, head_dim)
+    V_by_block = V.view(nb_rows, b, head_dim)
+
+    safe_col = torch.where(col_grid >= 0, col_grid, torch.tensor(0, dtype=torch.long))
+    k_gathered_pad = K_by_block[safe_col]  # (M_tiles, K_max, b, head_dim)
+    v_gathered_pad = V_by_block[safe_col]  # (M_tiles, K_max, b, head_dim)
+
+    q_scaled_blocks = (Q * scale).view(M_tiles, b, head_dim)
+
+    return q_scaled_blocks, k_gathered_pad, v_gathered_pad, K_max, M_tiles
+
+
+def _attn_host_reduction(tile_max: torch.Tensor, tile_sumexp: torch.Tensor) -> tuple:
+    """Reduce per-block stats to per-row softmax denominators.
+
+    Args:
+        tile_max:    (M_tiles, K_max, 128) — per-block row-wise max
+        tile_sumexp: (M_tiles, K_max, 128) — per-block stable exp-sum
+
+    Returns:
+        row_max:   (M_tiles, 128) — row-wise global max
+        row_denom: (M_tiles, 128) — softmax denominator
+    """
+    row_max = tile_max.max(dim=1).values  # (M_tiles, 128)
+    correction = torch.exp(tile_max - row_max.unsqueeze(1))  # (M_tiles, K_max, 128)
+    row_denom = (tile_sumexp * correction).sum(dim=1)  # (M_tiles, 128)
+    row_denom = row_denom.clamp(min=1e-12)
+    return row_max, row_denom
+
+
+def nki_bsr_attn_tiled(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, mask_bsr) -> torch.Tensor:
+    """Two-pass block-sparse attention via NKI kernel pair.
+
+    Orchestrates `_attn_stats_kernel` (pass 1) + host reduction +
+    `_attn_out_kernel` (pass 2) for the block-sparse attention forward pass.
+    No O(seq_len²) intermediate is allocated.
+
+    head_dim must be ≤ 128 (nc_matmul partition limit). head_dim=256+ is
+    future work requiring K-tiling.
+
+    Args:
+        Q, K, V:  (seq_len, head_dim) float tensors.
+        mask_bsr: BSRMatrix with block_size=128 encoding the attention pattern.
+
+    Returns:
+        (seq_len, head_dim) attention output.
+    """
+    if not HAS_NKI:
+        raise RuntimeError("NKI not available")
+
+    seq_len, head_dim = Q.shape
+    scale = head_dim**-0.5
+
+    q_scaled, k_gathered, v_gathered, K_max, M_tiles = _attn_gather(Q, K, V, mask_bsr, scale)
+
+    # Contiguous inputs for kernel dispatch.
+    qs = q_scaled.contiguous()
+    kg = k_gathered.contiguous()
+    vg = v_gathered.contiguous()
+
+    try:
+        if _use_simulator():
+            tile_max_np, tile_sumexp_np = nki.simulate(_attn_stats_kernel)(
+                qs.cpu().numpy(), kg.cpu().numpy()
+            )
+            tile_max = torch.from_numpy(np.asarray(tile_max_np)).to(Q.device)
+            tile_sumexp = torch.from_numpy(np.asarray(tile_sumexp_np)).to(Q.device)
+
+            row_max, row_denom = _attn_host_reduction(tile_max, tile_sumexp)
+            rm = row_max.contiguous()
+            rd = row_denom.contiguous()
+
+            out_np = nki.simulate(_attn_out_kernel)(
+                qs.cpu().numpy(),
+                kg.cpu().numpy(),
+                vg.cpu().numpy(),
+                rm.cpu().numpy(),
+                rd.cpu().numpy(),
+            )
+            result = torch.from_numpy(np.asarray(out_np)).to(Q.device)
+        else:
+            (qs_x, kg_x, vg_x), orig_device = _to_xla(qs, kg, vg)
+            tile_max_x, tile_sumexp_x = _attn_stats_kernel(qs_x, kg_x)
+            tile_max = tile_max_x.to(orig_device)
+            tile_sumexp = tile_sumexp_x.to(orig_device)
+
+            row_max, row_denom = _attn_host_reduction(tile_max, tile_sumexp)
+            rm = row_max.contiguous()
+            rd = row_denom.contiguous()
+
+            (rm_x, rd_x), _ = _to_xla(rm, rd)
+            result_x = _attn_out_kernel(qs_x, kg_x, vg_x, rm_x, rd_x)
+            result = result_x.to(orig_device)
+
+        return result[:seq_len, :head_dim].contiguous()
+    except Exception:
+        if _REQUIRE_NKI:
+            raise
+        # PyTorch fallback — import lazily to avoid circular dependency.
+        from ..ops import block_sparse_attention_tiled as _pt_attn
+
+        return _pt_attn(Q, K, V, mask_bsr, scale=scale)

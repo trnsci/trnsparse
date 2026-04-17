@@ -324,6 +324,13 @@ def block_sparse_attention_tiled(
     Returns:
         (seq_len, head_dim) attention output.
     """
+    from .nki.dispatch import _use_nki
+
+    if _use_nki():
+        from .nki.dispatch import nki_bsr_attn_tiled
+
+        return nki_bsr_attn_tiled(Q, K, V, mask_bsr)
+
     seq_len, head_dim = Q.shape
     b = mask_bsr.block_size
     M_tiles = seq_len // b

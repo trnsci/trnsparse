@@ -146,6 +146,106 @@ if HAS_NKI:
         return c
 
     @nki.jit
+    def _attn_stats_kernel(q_scaled_blocks, k_gathered_pad):
+        """Pass-1 attention kernel: per-block row-wise max and stable exp-sum.
+
+        Each (m, ki) pair is independent — no carry between iterations.
+        Q block is stationary per block-row: loaded once as a transposed
+        (head_dim, 128) tile, reused across all ki blocks in that row.
+
+        Shapes:
+            q_scaled_blocks:  (M_tiles, 128, head_dim)  — Q * scale
+            k_gathered_pad:   (M_tiles, K_max, 128, head_dim) — K at nonzero cols
+        Returns:
+            tile_max:         (M_tiles, K_max, 128) — per-block row-wise max
+            tile_sumexp:      (M_tiles, K_max, 128) — per-block stable exp-sum
+        """
+        M_tiles, K_max, _, _ = k_gathered_pad.shape
+        _, _, head_dim = q_scaled_blocks.shape
+
+        tile_max = nl.ndarray(
+            (M_tiles, K_max, _TILE_M), dtype=q_scaled_blocks.dtype, buffer=nl.shared_hbm
+        )
+        tile_sumexp = nl.ndarray(
+            (M_tiles, K_max, _TILE_M), dtype=q_scaled_blocks.dtype, buffer=nl.shared_hbm
+        )
+
+        for m in nl.affine_range(M_tiles):
+            q_t = nl.load_transpose2d(q_scaled_blocks[m, :, :])  # (head_dim, 128) stationary
+
+            for ki in nl.affine_range(K_max):
+                k_t = nl.load_transpose2d(k_gathered_pad[m, ki, :, :])  # (head_dim, 128)
+
+                score_psum = nl.zeros((_TILE_M, _TILE_M), dtype=nl.float32, buffer=nl.psum)
+                score_psum[...] += nisa.nc_matmul(q_t, k_t)  # Q @ K.T = (128, 128)
+                score = nl.copy(score_psum, dtype=q_scaled_blocks.dtype)
+
+                t_max = nl.max(score, axis=1)  # (128,)
+                stable = score - t_max.reshape((_TILE_M, 1))
+                t_sum = nl.sum(nl.exp(stable), axis=1)  # (128,)
+
+                nl.store(tile_max[m, ki, :], value=t_max)
+                nl.store(tile_sumexp[m, ki, :], value=t_sum)
+
+        return tile_max, tile_sumexp
+
+    @nki.jit
+    def _attn_out_kernel(q_scaled_blocks, k_gathered_pad, v_gathered_pad, row_max, row_denom):
+        """Pass-2 attention kernel: stable softmax weights × V accumulation.
+
+        Recomputes scores from Q and K (same as pass 1) to avoid storing the
+        full (M_tiles, K_max, 128, 128) score tensor. Uses row_max / row_denom
+        from the host reduction to apply stable normalisation.
+
+        Nested PSUM strategy:
+          - score_psum (128, 128): initialised per (m, ki) block, drained to SBUF.
+          - out_psum (128, head_dim): accumulates across all ki for block-row m.
+
+        Shapes:
+            q_scaled_blocks:  (M_tiles, 128, head_dim)
+            k_gathered_pad:   (M_tiles, K_max, 128, head_dim)
+            v_gathered_pad:   (M_tiles, K_max, 128, head_dim)
+            row_max:          (M_tiles, 128)
+            row_denom:        (M_tiles, 128)
+        Returns:
+            out:              (M_tiles * 128, head_dim)
+        """
+        M_tiles, K_max, _, head_dim = k_gathered_pad.shape
+
+        out = nl.ndarray(
+            (M_tiles * _TILE_M, head_dim), dtype=q_scaled_blocks.dtype, buffer=nl.shared_hbm
+        )
+
+        for m in nl.affine_range(M_tiles):
+            q_t = nl.load_transpose2d(q_scaled_blocks[m, :, :])  # (head_dim, 128) stationary
+            row_max_m = nl.load(row_max[m, :])  # (128,)
+            row_denom_m = nl.load(row_denom[m, :])  # (128,)
+
+            out_psum = nl.zeros((_TILE_M, head_dim), dtype=nl.float32, buffer=nl.psum)
+
+            for ki in nl.affine_range(K_max):
+                k_t = nl.load_transpose2d(k_gathered_pad[m, ki, :, :])  # (head_dim, 128)
+                v_tile = nl.load(v_gathered_pad[m, ki, :, :])  # (128, head_dim)
+
+                score_psum = nl.zeros((_TILE_M, _TILE_M), dtype=nl.float32, buffer=nl.psum)
+                score_psum[...] += nisa.nc_matmul(q_t, k_t)
+                score = nl.copy(score_psum, dtype=q_scaled_blocks.dtype)
+
+                # Stable softmax weights: exp(score - row_max) / row_denom
+                stable = score - row_max_m.reshape((_TILE_M, 1))
+                weights = nl.exp(stable) / row_denom_m.reshape((_TILE_M, 1))  # (128, 128)
+
+                # weights @ V: nc_matmul expects (K, M) stationary × (K, N) moving
+                # weights is (128, 128) in SBUF; transpose to (128, 128) for nc_matmul
+                weights_t = nl.transpose(weights)  # (128, 128), now (head_dim_k, seq) form
+                out_psum[...] += nisa.nc_matmul(weights_t, v_tile)
+
+            out_sbuf = nl.copy(out_psum, dtype=q_scaled_blocks.dtype)
+            nl.store(out[m * _TILE_M : (m + 1) * _TILE_M, :], value=out_sbuf)
+
+        return out
+
+    @nki.jit
     def _spmm_dense_kernel(a, b):
         """Densified SpMM: C = A @ B with stationary A-tile reuse.
 

@@ -180,19 +180,25 @@ allocation is the binding constraint.
 The NKI implementation path is documented in
 [#25](https://github.com/trnsci/trnsparse/issues/25).
 
-## What's next
+## NKI kernel pair (v0.4.4)
 
-The NKI kernel pair for tiled attention ([#25](https://github.com/trnsci/trnsparse/issues/25)):
+`block_sparse_attention_tiled` now routes through the NKI kernel pair on the
+`nki` backend. The `pytorch` backend retains the Python-loop reference path.
 
-- `_attn_stats_kernel(Q_blocks, K_blocks, bsr_pattern)` → `tile_max, tile_sumexp`
-  of shape `(n_blocks, block_size)`. Each `(m, ki)` iteration is independent;
-  standard `affine_range` + `nl.max` within-tile reduction.
-- `_attn_out_kernel(Q_blocks, K_blocks, V_blocks, row_max, row_denom, bsr_pattern)`
-  → output. Loads `row_max[m]` and `row_denom[m]` once per block-row
-  (static HBM offset by affine_range variable `m`); accumulates into PSUM.
+`_attn_stats_kernel` (pass 1) and `_attn_out_kernel` (pass 2) implement the
+two-pass decomposition in `trnsparse/nki/kernels.py`:
 
-No `nl.scan` or scalar carry needed — the two-kernel split pushes the row-level
-softmax reduction to the host.
+- **Pass 1** (`_attn_stats_kernel`): each `(m, ki)` block pair is independent;
+  no carry. Uses `nl.max` and `nl.sum` reductions within the 128×128 SBUF tile.
+  Q block is loaded once as a transposed tile (stationary) and reused across all
+  ki blocks in the row.
+- **Pass 2** (`_attn_out_kernel`): recomputes scores from Q and K to avoid
+  storing the full score tensor; uses `row_max` / `row_denom` from the host
+  reduction (loaded by static `affine_range` offset — legal). Accumulates
+  `weights @ V` into a PSUM tile that spans all ki blocks.
+
+**Constraint:** `head_dim ≤ 128` in v0.4.4 (`nc_matmul` partition limit).
+`head_dim=256` requires K-tiling and is a follow-up.
 
 A runnable reference for both the naive and tiled paths is in
 [`examples/block_sparse_attention.py`](https://github.com/trnsci/trnsparse/blob/main/examples/block_sparse_attention.py).

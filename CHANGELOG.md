@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.4] — 2026-04-16
+
+### Added
+
+- **NKI attention kernel pair** (`_attn_stats_kernel` + `_attn_out_kernel`,
+  closes [#25](https://github.com/trnsci/trnsparse/issues/25)). Two-pass
+  block-sparse attention now runs on the Tensor Engine via these kernels when
+  the `nki` backend is active. The `pytorch` backend retains the Python-loop
+  reference path from v0.4.3.
+  - Pass 1 (`_attn_stats_kernel`): each `(m, ki)` block pair computed
+    independently via `nc_matmul`; `nl.max` / `nl.sum` within-tile reductions
+    produce `(tile_max, tile_sumexp)` with no carry between iterations.
+  - Pass 2 (`_attn_out_kernel`): recomputes scores, applies stable softmax
+    using `row_max` / `row_denom` loaded per block-row (static HBM offset),
+    accumulates `weights @ V` into a PSUM tile spanning all ki blocks.
+  - **Constraint:** `head_dim ≤ 128` (`nc_matmul` partition limit). `head_dim=256`
+    requires K-tiling and is a follow-up.
+- `_attn_gather`, `_attn_host_reduction`, `nki_bsr_attn_tiled` in
+  `trnsparse/nki/dispatch.py` — host-side gather and orchestration for the kernel
+  pair, mirroring the `_bsr_pad_and_gather` pattern.
+- `tests/test_nki_sim.py`: `TestAttnTiledSimulator` — simulator correctness
+  tests (local window, dilated; seq_len=256, head_dim=32).
+- `tests/test_nki_attn.py`: hardware tests for local window, dilated, and
+  global-token patterns at seq_len=512, head_dim=64.
+
+### Notes
+
+No autograd wrapping in v0.4.4 — forward-only, matching the existing PyTorch
+path. Attention backward (block-sparse) is a follow-up.
+
 ## [0.4.3] — 2026-04-16
 
 ### Added

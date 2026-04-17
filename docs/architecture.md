@@ -127,12 +127,10 @@ extension is a follow-up if asked for.
   Requires NKI indirect-DMA gather (not exposed as of NKI 0.3.0). The CSR PyTorch
   fallback is within 2× of scipy; that's the current story.
 - **Fused tile-level attention scores** ([#25](https://github.com/trnsci/trnsparse/issues/25)) —
-  blocked on `nl.scan` / scalar-carry for online softmax. **v0.4.3 ships a
-  two-pass PyTorch reference** (`block_sparse_attention_tiled`) that avoids the
-  O(seq_len²) score intermediate without any new NKI primitives (pass 1 computes
-  per-block stats independently; host reduces; pass 2 accumulates). The NKI kernel
-  pair (`_attn_stats_kernel` + `_attn_out_kernel`) is the concrete follow-up
-  documented in #25.
+  **v0.4.4 ships the NKI kernel pair** (`_attn_stats_kernel` + `_attn_out_kernel`).
+  `block_sparse_attention_tiled` routes through NKI on the `nki` backend; the
+  PyTorch two-pass reference remains on the `pytorch` backend. `head_dim ≤ 128`
+  in v0.4.4 (nc_matmul partition limit); `head_dim=256` requires K-tiling.
 - **Fused iterative solvers** ([#22](https://github.com/trnsci/trnsparse/issues/22)) —
   CG blocked on `nl.affine_range` iteration-carried scalar state. **v0.4.3 ships
   `chebyshev_bsr` and `richardson_bsr`**: fixed-K solvers with pre-computed

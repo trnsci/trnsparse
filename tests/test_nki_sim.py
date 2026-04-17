@@ -113,6 +113,105 @@ class TestBsrSpmmSimulator:
         torch.testing.assert_close(got, A_dense @ B, atol=ATOL, rtol=RTOL)
 
 
+class TestAttnTiledSimulator:
+    """NKI two-pass attention kernels through the simulator (#25).
+
+    Shapes are intentionally tiny (seq_len=256, head_dim=32, 2×2 block grid)
+    so the CPU simulator completes in seconds rather than minutes.
+    """
+
+    def _local_mask(self, seq_len: int, block_size: int, window: int) -> torch.Tensor:
+        n_blocks = seq_len // block_size
+        bm = torch.zeros(n_blocks, n_blocks, dtype=torch.bool)
+        for i in range(n_blocks):
+            lo = max(0, i - window)
+            hi = min(n_blocks, i + window + 1)
+            bm[i, lo:hi] = True
+        return bm.repeat_interleave(block_size, dim=0).repeat_interleave(block_size, dim=1)
+
+    def _dilated_mask(self, seq_len: int, block_size: int, stride: int) -> torch.Tensor:
+        n_blocks = seq_len // block_size
+        bm = torch.zeros(n_blocks, n_blocks, dtype=torch.bool)
+        for i in range(n_blocks):
+            for j in range(n_blocks):
+                if (i - j) % stride == 0:
+                    bm[i, j] = True
+        return bm.repeat_interleave(block_size, dim=0).repeat_interleave(block_size, dim=1)
+
+    def test_stats_kernel_shapes(self, nki_backend):
+        """Pass-1 kernel output shapes are (M_tiles, K_max, 128)."""
+        import nki as _nki
+        import numpy as np
+
+        from trnsparse.nki.dispatch import _attn_gather, _attn_host_reduction
+        from trnsparse.nki.kernels import _attn_stats_kernel
+
+        torch.manual_seed(20)
+        seq_len, head_dim, block_size = 256, 32, 128
+        M_tiles = seq_len // block_size
+
+        Q = torch.randn(seq_len, head_dim)
+        K = torch.randn(seq_len, head_dim)
+        V = torch.randn(seq_len, head_dim)
+
+        mask = self._local_mask(seq_len, block_size, window=1)
+        mask_bsr = trnsparse.BSRMatrix.from_dense(mask.float(), block_size=block_size)
+
+        scale = head_dim**-0.5
+        qs, kg, vg, K_max, _ = _attn_gather(Q, K, V, mask_bsr, scale)
+
+        t_max_np, t_sum_np = _nki.simulate(_attn_stats_kernel)(
+            qs.contiguous().numpy(), kg.contiguous().numpy()
+        )
+        t_max = torch.from_numpy(np.asarray(t_max_np))
+        t_sum = torch.from_numpy(np.asarray(t_sum_np))
+
+        assert t_max.shape == (M_tiles, K_max, block_size), f"tile_max shape: {t_max.shape}"
+        assert t_sum.shape == (M_tiles, K_max, block_size), f"tile_sumexp shape: {t_sum.shape}"
+
+    def test_local_window_parity(self, nki_backend):
+        """NKI tiled attention matches PyTorch reference, local window."""
+        torch.manual_seed(21)
+        seq_len, head_dim, block_size = 256, 32, 128
+
+        Q = torch.randn(seq_len, head_dim)
+        K = torch.randn(seq_len, head_dim)
+        V = torch.randn(seq_len, head_dim)
+
+        mask = self._local_mask(seq_len, block_size, window=1)
+        mask_bsr = trnsparse.BSRMatrix.from_dense(mask.float(), block_size=block_size)
+
+        # PyTorch reference (pytorch backend)
+        trnsparse.set_backend("pytorch")
+        ref = trnsparse.block_sparse_attention_tiled(Q, K, V, mask_bsr)
+
+        # NKI simulator path
+        trnsparse.set_backend("nki")
+        got = trnsparse.block_sparse_attention_tiled(Q, K, V, mask_bsr)
+
+        torch.testing.assert_close(got, ref, atol=ATOL, rtol=RTOL)
+
+    def test_dilated_parity(self, nki_backend):
+        """NKI tiled attention matches PyTorch reference, dilated pattern."""
+        torch.manual_seed(22)
+        seq_len, head_dim, block_size = 256, 32, 128
+
+        Q = torch.randn(seq_len, head_dim)
+        K = torch.randn(seq_len, head_dim)
+        V = torch.randn(seq_len, head_dim)
+
+        mask = self._dilated_mask(seq_len, block_size, stride=2)
+        mask_bsr = trnsparse.BSRMatrix.from_dense(mask.float(), block_size=block_size)
+
+        trnsparse.set_backend("pytorch")
+        ref = trnsparse.block_sparse_attention_tiled(Q, K, V, mask_bsr)
+
+        trnsparse.set_backend("nki")
+        got = trnsparse.block_sparse_attention_tiled(Q, K, V, mask_bsr)
+
+        torch.testing.assert_close(got, ref, atol=ATOL, rtol=RTOL)
+
+
 class TestScreenedSpmmSimulator:
     """Fused screened SpMM through the simulator (#19).
 
