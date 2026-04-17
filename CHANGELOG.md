@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] — 2026-04-17
+
+### Added
+
+- **Block-sparse attention autograd** — `block_sparse_attention_tiled` is now
+  differentiable. When any of Q/K/V has `requires_grad=True`, the call routes
+  through `_AttnTiledFunction`, which provides a tiled backward using the Flash
+  Attention delta identity (`D_i = dO_i · O_i`).
+- **`_block_sparse_attn_backward(Q, K, V, O, dO, mask_bsr, scale)`** — internal
+  backward function. Single pass over nonzero BSR blocks; no O(seq_len²)
+  intermediate. Row stats (row_max/row_denom) are recomputed in backward.
+- `gradcheck` passes at `atol=1e-3` for local-window and dilated patterns
+  (float64, seq_len=256, head_dim=32). See `tests/test_attention.py::TestAttnTiledGrad`.
+
+### Notes
+
+- NKI backward kernel is a follow-up (v0.5.x). The current backward runs
+  on PyTorch even when the NKI forward path is active.
+- Row stats (row_max/row_denom) are recomputed in backward rather than saved
+  from forward — avoids O(n_blocks × b) storage in the autograd graph at the
+  cost of two extra BSR passes.
+
 ## [0.4.4] — 2026-04-16
 
 ### Added

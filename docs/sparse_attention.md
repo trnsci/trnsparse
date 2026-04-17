@@ -202,3 +202,28 @@ two-pass decomposition in `trnsparse/nki/kernels.py`:
 
 A runnable reference for both the naive and tiled paths is in
 [`examples/block_sparse_attention.py`](https://github.com/trnsci/trnsparse/blob/main/examples/block_sparse_attention.py).
+
+## Autograd (v0.5.0)
+
+`block_sparse_attention_tiled` is now differentiable. When any of Q, K, or V
+has `requires_grad=True`, the call is routed through `_AttnTiledFunction`,
+which provides a tiled backward using the Flash Attention delta identity.
+
+**Backward algorithm** (single pass over nonzero blocks, no O(seq_len²) intermediate):
+
+```
+D_i = dO_i · O_i                   # row-wise dot — Flash "delta"
+For each stored block (m, ki):
+    P   = stable_softmax(Q_m @ K_ki.T * scale)
+    dP  = dO_m @ V_ki.T
+    dS  = P * (dP - D_m)           # softmax backward
+    dQ_m  += dS @ K_ki * scale
+    dK_ki += dS.T @ Q_m * scale
+    dV_ki += P.T @ dO_m
+```
+
+`torch.autograd.gradcheck` passes at `atol=1e-3` for local-window and dilated
+patterns (float64, seq_len=256, head_dim=32).
+
+**NKI backward kernel** is a follow-up (v0.5.x). The current backward runs on
+CPU/PyTorch even when the forward used the NKI kernel pair.

@@ -133,3 +133,124 @@ class TestTiledAttentionParity:
         seq_len, head_dim, block_size = 256, 32, 128
         mask = torch.ones(seq_len, seq_len, dtype=torch.bool)
         self._run_parity(seq_len, head_dim, block_size, mask)
+
+
+class TestAttnTiledGrad:
+    """Backward-pass tests for block_sparse_attention_tiled (v0.5.0).
+
+    Uses float64 for gradcheck precision. pytorch backend is set explicitly
+    (NKI kernels don't support float64 on hardware).
+    """
+
+    def _local_mask(self, seq_len: int, block_size: int, window: int) -> torch.Tensor:
+        n_blocks = seq_len // block_size
+        bm = torch.zeros(n_blocks, n_blocks, dtype=torch.bool)
+        for i in range(n_blocks):
+            lo = max(0, i - window)
+            hi = min(n_blocks, i + window + 1)
+            bm[i, lo:hi] = True
+        return bm.repeat_interleave(block_size, dim=0).repeat_interleave(block_size, dim=1)
+
+    def _dilated_mask(self, seq_len: int, block_size: int, stride: int) -> torch.Tensor:
+        n_blocks = seq_len // block_size
+        bm = torch.zeros(n_blocks, n_blocks, dtype=torch.bool)
+        for i in range(n_blocks):
+            for j in range(n_blocks):
+                if (i - j) % stride == 0:
+                    bm[i, j] = True
+        return bm.repeat_interleave(block_size, dim=0).repeat_interleave(block_size, dim=1)
+
+    def _run_gradcheck(
+        self, mask: torch.Tensor, seq_len: int, head_dim: int, block_size: int, seed: int
+    ):
+        prev = trnsparse.get_backend()
+        trnsparse.set_backend("pytorch")
+        try:
+            torch.manual_seed(seed)
+            mask_bsr = trnsparse.BSRMatrix.from_dense(mask.float(), block_size=block_size)
+
+            # float64 for gradcheck precision
+            Q = torch.randn(seq_len, head_dim, dtype=torch.float64, requires_grad=True)
+            K = torch.randn(seq_len, head_dim, dtype=torch.float64, requires_grad=True)
+            V = torch.randn(seq_len, head_dim, dtype=torch.float64, requires_grad=True)
+
+            def fn(q, k, v):
+                return trnsparse.block_sparse_attention_tiled(q, k, v, mask_bsr)
+
+            torch.autograd.gradcheck(fn, (Q, K, V), eps=1e-4, atol=1e-3, rtol=1e-3)
+        finally:
+            trnsparse.set_backend(prev)
+
+    def test_gradcheck_local(self):
+        """gradcheck passes for local-window mask (w=1)."""
+        seq_len, head_dim, block_size = 256, 32, 128
+        mask = self._local_mask(seq_len, block_size, window=1)
+        self._run_gradcheck(mask, seq_len, head_dim, block_size, seed=40)
+
+    def test_gradcheck_dilated(self):
+        """gradcheck passes for dilated mask (stride=2)."""
+        seq_len, head_dim, block_size = 256, 32, 128
+        mask = self._dilated_mask(seq_len, block_size, stride=2)
+        self._run_gradcheck(mask, seq_len, head_dim, block_size, seed=41)
+
+    def test_backward_shapes(self):
+        """dQ, dK, dV have the same shape as Q, K, V."""
+        prev = trnsparse.get_backend()
+        trnsparse.set_backend("pytorch")
+        try:
+            torch.manual_seed(42)
+            seq_len, head_dim, block_size = 256, 32, 128
+            mask = self._local_mask(seq_len, block_size, window=1)
+            mask_bsr = trnsparse.BSRMatrix.from_dense(mask.float(), block_size=block_size)
+
+            Q = torch.randn(seq_len, head_dim, requires_grad=True)
+            K = torch.randn(seq_len, head_dim, requires_grad=True)
+            V = torch.randn(seq_len, head_dim, requires_grad=True)
+
+            out = trnsparse.block_sparse_attention_tiled(Q, K, V, mask_bsr)
+            out.sum().backward()
+
+            assert Q.grad is not None and Q.grad.shape == Q.shape
+            assert K.grad is not None and K.grad.shape == K.shape
+            assert V.grad is not None and V.grad.shape == V.shape
+        finally:
+            trnsparse.set_backend(prev)
+
+    def test_backward_parity_finite_diff(self):
+        """Analytical backward matches finite-difference at atol=1e-3."""
+        prev = trnsparse.get_backend()
+        trnsparse.set_backend("pytorch")
+        try:
+            torch.manual_seed(43)
+            seq_len, head_dim, block_size = 256, 32, 128
+            mask = self._local_mask(seq_len, block_size, window=1)
+            mask_bsr = trnsparse.BSRMatrix.from_dense(mask.float(), block_size=block_size)
+
+            Q = torch.randn(seq_len, head_dim, dtype=torch.float64)
+            K = torch.randn(seq_len, head_dim, dtype=torch.float64)
+            V = torch.randn(seq_len, head_dim, dtype=torch.float64)
+            dO = torch.randn(seq_len, head_dim, dtype=torch.float64)
+
+            # Analytical backward
+            Q_a = Q.clone().requires_grad_(True)
+            K_a = K.clone().requires_grad_(True)
+            V_a = V.clone().requires_grad_(True)
+            out = trnsparse.block_sparse_attention_tiled(Q_a, K_a, V_a, mask_bsr)
+            out.backward(dO)
+
+            # Finite-difference reference for dV (cheapest to check)
+            eps = 1e-4
+            dV_fd = torch.zeros_like(V)
+            for i in range(min(4, seq_len)):  # spot-check 4 rows
+                for j in range(head_dim):
+                    Vp = V.clone()
+                    Vp[i, j] += eps
+                    Vm = V.clone()
+                    Vm[i, j] -= eps
+                    fp = trnsparse.block_sparse_attention_tiled(Q, K, Vp, mask_bsr)
+                    fm = trnsparse.block_sparse_attention_tiled(Q, K, Vm, mask_bsr)
+                    dV_fd[i, j] = ((fp - fm) * dO).sum() / (2 * eps)
+
+            torch.testing.assert_close(V_a.grad[:4], dV_fd[:4], atol=1e-3, rtol=1e-3)
+        finally:
+            trnsparse.set_backend(prev)

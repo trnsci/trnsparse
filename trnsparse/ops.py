@@ -277,6 +277,235 @@ def screened_spmm(
     return (A * mask.to(A.dtype)) @ B
 
 
+def _block_sparse_attn_pytorch(
+    Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, mask_bsr, scale: float
+) -> torch.Tensor:
+    """Two-pass block-sparse attention — PyTorch reference (no autograd).
+
+    Called by `_AttnTiledFunction.forward` and the no-grad path of
+    `block_sparse_attention_tiled`. Not for direct use.
+    """
+    seq_len, head_dim = Q.shape
+    b = mask_bsr.block_size
+    M_tiles = seq_len // b
+    n_blocks = mask_bsr.n_blocks
+
+    tile_max = torch.full((n_blocks, b), float("-inf"), dtype=Q.dtype)
+    tile_sumexp = torch.zeros((n_blocks, b), dtype=Q.dtype)
+
+    for m in range(M_tiles):
+        start = mask_bsr.block_row_ptrs[m].item()
+        end = mask_bsr.block_row_ptrs[m + 1].item()
+        q_block = Q[m * b : (m + 1) * b]
+        for idx in range(start, end):
+            col = mask_bsr.block_col_indices[idx].item()
+            score = (q_block @ K[col * b : (col + 1) * b].T) * scale
+            tile_max[idx] = score.max(dim=1).values
+            tile_sumexp[idx] = torch.exp(score - tile_max[idx].unsqueeze(1)).sum(dim=1)
+
+    row_max = torch.full((seq_len,), float("-inf"), dtype=Q.dtype)
+    for m in range(M_tiles):
+        start = mask_bsr.block_row_ptrs[m].item()
+        end = mask_bsr.block_row_ptrs[m + 1].item()
+        if start == end:
+            row_max[m * b : (m + 1) * b] = 0.0
+            continue
+        row_max[m * b : (m + 1) * b] = tile_max[start:end].max(dim=0).values
+
+    row_denom = torch.zeros(seq_len, dtype=Q.dtype)
+    for m in range(M_tiles):
+        start = mask_bsr.block_row_ptrs[m].item()
+        end = mask_bsr.block_row_ptrs[m + 1].item()
+        if start == end:
+            continue
+        row_max_m = row_max[m * b : (m + 1) * b]
+        for idx in range(start, end):
+            row_denom[m * b : (m + 1) * b] += tile_sumexp[idx] * torch.exp(
+                tile_max[idx] - row_max_m
+            )
+
+    row_denom = row_denom.clamp(min=1e-12)
+
+    out = torch.zeros(seq_len, head_dim, dtype=Q.dtype)
+    for m in range(M_tiles):
+        start = mask_bsr.block_row_ptrs[m].item()
+        end = mask_bsr.block_row_ptrs[m + 1].item()
+        if start == end:
+            continue
+        q_block = Q[m * b : (m + 1) * b]
+        row_max_m = row_max[m * b : (m + 1) * b]
+        row_denom_m = row_denom[m * b : (m + 1) * b]
+        for idx in range(start, end):
+            col = mask_bsr.block_col_indices[idx].item()
+            score = (q_block @ K[col * b : (col + 1) * b].T) * scale
+            weights = torch.exp(score - row_max_m.unsqueeze(1)) / row_denom_m.unsqueeze(1)
+            out[m * b : (m + 1) * b] += weights @ V[col * b : (col + 1) * b]
+
+    return out
+
+
+def _block_sparse_attn_backward(
+    Q: torch.Tensor,
+    K: torch.Tensor,
+    V: torch.Tensor,
+    O: torch.Tensor,
+    dO: torch.Tensor,
+    mask_bsr,
+    scale: float,
+) -> tuple:
+    """Backward pass for block-sparse tiled attention.
+
+    Uses the Flash Attention delta identity: D_i = dO_i · O_i (row-wise
+    dot product). For each stored block (m, ki), recomputes P_block from
+    Q and K (same two-pass as forward), then applies the softmax backward:
+
+        dS = P * (dP - D_m)    where dP = dO_m @ V_ki.T
+
+    Accumulates dQ, dK, dV without materialising the full attention matrix.
+
+    Row stats (row_max, row_denom) are recomputed from Q and K — two extra
+    passes over BSR blocks. This avoids storing O(n_blocks × b) stats in
+    the autograd graph. v0.5.x will optimise by saving stats in forward ctx.
+
+    Returns:
+        (dQ, dK, dV) — same shape as (Q, K, V).
+    """
+    seq_len, head_dim = Q.shape
+    b = mask_bsr.block_size
+    M_tiles = seq_len // b
+
+    # Delta: D_i = dO_i · O_i (row-wise dot product of upstream grad with output)
+    D = (dO * O).sum(dim=-1)  # (seq_len,)
+
+    # --- Recompute row_max (one pass over blocks) ---
+    row_max = torch.full((seq_len,), float("-inf"), dtype=Q.dtype)
+    for m in range(M_tiles):
+        start = mask_bsr.block_row_ptrs[m].item()
+        end = mask_bsr.block_row_ptrs[m + 1].item()
+        if start == end:
+            row_max[m * b : (m + 1) * b] = 0.0
+            continue
+        q_block = Q[m * b : (m + 1) * b]
+        row_max_m = row_max[m * b : (m + 1) * b]
+        for idx in range(start, end):
+            col = mask_bsr.block_col_indices[idx].item()
+            score = (q_block @ K[col * b : (col + 1) * b].T) * scale
+            row_max_m = torch.maximum(row_max_m, score.max(dim=1).values)
+        row_max[m * b : (m + 1) * b] = row_max_m
+
+    # --- Recompute row_denom (second pass over blocks) ---
+    row_denom = torch.zeros(seq_len, dtype=Q.dtype)
+    for m in range(M_tiles):
+        start = mask_bsr.block_row_ptrs[m].item()
+        end = mask_bsr.block_row_ptrs[m + 1].item()
+        if start == end:
+            continue
+        q_block = Q[m * b : (m + 1) * b]
+        row_max_m = row_max[m * b : (m + 1) * b]
+        for idx in range(start, end):
+            col = mask_bsr.block_col_indices[idx].item()
+            score = (q_block @ K[col * b : (col + 1) * b].T) * scale
+            row_denom[m * b : (m + 1) * b] += torch.exp(score - row_max_m.unsqueeze(1)).sum(dim=1)
+
+    row_denom = row_denom.clamp(min=1e-12)
+
+    # --- Gradient accumulation (single pass over blocks) ---
+    dQ = torch.zeros_like(Q)
+    dK = torch.zeros_like(K)
+    dV = torch.zeros_like(V)
+
+    for m in range(M_tiles):
+        start = mask_bsr.block_row_ptrs[m].item()
+        end = mask_bsr.block_row_ptrs[m + 1].item()
+        if start == end:
+            continue
+        q_block = Q[m * b : (m + 1) * b]
+        do_block = dO[m * b : (m + 1) * b]
+        d_block = D[m * b : (m + 1) * b]  # (b,) — Flash delta for this block-row
+        row_max_m = row_max[m * b : (m + 1) * b]
+        row_denom_m = row_denom[m * b : (m + 1) * b]
+
+        for idx in range(start, end):
+            col = mask_bsr.block_col_indices[idx].item()
+            k_block = K[col * b : (col + 1) * b]
+            v_block = V[col * b : (col + 1) * b]
+
+            # Recompute stable softmax weights
+            score = (q_block @ k_block.T) * scale
+            P = torch.exp(score - row_max_m.unsqueeze(1)) / row_denom_m.unsqueeze(1)
+
+            # Softmax backward via delta identity: dS = P * (dP - D_m)
+            dP = do_block @ v_block.T
+            dS = P * (dP - d_block.unsqueeze(1))
+
+            dQ[m * b : (m + 1) * b] += dS @ k_block * scale
+            dK[col * b : (col + 1) * b] += dS.T @ q_block * scale
+            dV[col * b : (col + 1) * b] += P.T @ do_block
+
+    return dQ, dK, dV
+
+
+class _AttnTiledFunction(torch.autograd.Function):
+    """Autograd wrapper for block-sparse tiled attention (v0.5.0).
+
+    Forward: dispatched to NKI kernel pair or PyTorch two-pass reference.
+    Backward: tiled Flash-style gradient — no O(seq_len²) intermediate.
+
+    Saves Q, K, V, O plus the BSRMatrix sparsity pattern components
+    (not the block values — only the pattern is needed for backward).
+    """
+
+    @staticmethod
+    def forward(ctx, Q, K, V, mask_col_indices, mask_row_ptrs, mask_shape, mask_block_size, scale):
+        class _BSRHandle:
+            block_col_indices = mask_col_indices
+            block_row_ptrs = mask_row_ptrs
+            shape = mask_shape
+            block_size = mask_block_size
+
+            @property
+            def n_blocks(self):
+                return len(self.block_col_indices)
+
+        mask_bsr = _BSRHandle()
+
+        from .nki.dispatch import _use_nki
+
+        if _use_nki():
+            from .nki.dispatch import nki_bsr_attn_tiled
+
+            out = nki_bsr_attn_tiled(Q, K, V, mask_bsr)
+        else:
+            out = _block_sparse_attn_pytorch(Q, K, V, mask_bsr, scale)
+
+        ctx.save_for_backward(Q, K, V, out)
+        ctx.mask_col_indices = mask_col_indices
+        ctx.mask_row_ptrs = mask_row_ptrs
+        ctx.mask_shape = mask_shape
+        ctx.mask_block_size = mask_block_size
+        ctx.scale = scale
+        return out
+
+    @staticmethod
+    def backward(ctx, dO):
+        Q, K, V, O = ctx.saved_tensors
+
+        class _BSRHandle:
+            block_col_indices = ctx.mask_col_indices
+            block_row_ptrs = ctx.mask_row_ptrs
+            shape = ctx.mask_shape
+            block_size = ctx.mask_block_size
+
+            @property
+            def n_blocks(self):
+                return len(self.block_col_indices)
+
+        mask_bsr = _BSRHandle()
+        dQ, dK, dV = _block_sparse_attn_backward(Q, K, V, O, dO, mask_bsr, ctx.scale)
+        # 8 inputs: Q, K, V, col_indices, row_ptrs, shape, block_size, scale
+        return dQ, dK, dV, None, None, None, None, None
+
+
 def block_sparse_attention_tiled(
     Q: torch.Tensor,
     K: torch.Tensor,
@@ -308,9 +537,9 @@ def block_sparse_attention_tiled(
     Memory: O(n_stored_blocks × block_size) for stats + O(seq_len × head_dim)
     for output. No (seq_len, seq_len) tensor is ever allocated.
 
-    This is the PyTorch reference for the NKI `_attn_stats_kernel` +
-    `_attn_out_kernel` pair documented in
-    https://github.com/trnsci/trnsparse/issues/25.
+    Differentiable (v0.5.0): when any of Q/K/V requires grad, the call is
+    routed through `_AttnTiledFunction`, which wraps the tiled Flash-style
+    backward. Backward also avoids O(seq_len²) intermediates.
 
     Args:
         Q: (seq_len, head_dim) query tensor.
@@ -324,6 +553,23 @@ def block_sparse_attention_tiled(
     Returns:
         (seq_len, head_dim) attention output.
     """
+    seq_len, head_dim = Q.shape
+
+    if scale is None:
+        scale = head_dim**-0.5
+
+    if torch.is_grad_enabled() and (Q.requires_grad or K.requires_grad or V.requires_grad):
+        return _AttnTiledFunction.apply(
+            Q,
+            K,
+            V,
+            mask_bsr.block_col_indices,
+            mask_bsr.block_row_ptrs,
+            mask_bsr.shape,
+            mask_bsr.block_size,
+            scale,
+        )
+
     from .nki.dispatch import _use_nki
 
     if _use_nki():
@@ -331,72 +577,4 @@ def block_sparse_attention_tiled(
 
         return nki_bsr_attn_tiled(Q, K, V, mask_bsr)
 
-    seq_len, head_dim = Q.shape
-    b = mask_bsr.block_size
-    M_tiles = seq_len // b
-
-    if scale is None:
-        scale = head_dim**-0.5
-
-    n_blocks = mask_bsr.n_blocks
-
-    # --- Pass 1: per-block (tile_max, tile_sumexp) ---
-    # tile_max[idx, r]    = max over columns of score_tile[r, :]
-    # tile_sumexp[idx, r] = sum over columns of exp(score[r,:] - tile_max[idx, r])
-    tile_max = torch.full((n_blocks, b), float("-inf"), dtype=Q.dtype)
-    tile_sumexp = torch.zeros((n_blocks, b), dtype=Q.dtype)
-
-    for m in range(M_tiles):
-        start = mask_bsr.block_row_ptrs[m].item()
-        end = mask_bsr.block_row_ptrs[m + 1].item()
-        q_block = Q[m * b : (m + 1) * b]  # (b, head_dim)
-        for idx in range(start, end):
-            col = mask_bsr.block_col_indices[idx].item()
-            k_block = K[col * b : (col + 1) * b]  # (b, head_dim)
-            score = (q_block @ k_block.T) * scale  # (b, b)
-            tile_max[idx] = score.max(dim=1).values  # (b,)
-            tile_sumexp[idx] = torch.exp(score - tile_max[idx].unsqueeze(1)).sum(dim=1)
-
-    # --- Host reduction: row_max, row_denom (shape: seq_len each) ---
-    row_max = torch.full((seq_len,), float("-inf"), dtype=Q.dtype)
-    for m in range(M_tiles):
-        start = mask_bsr.block_row_ptrs[m].item()
-        end = mask_bsr.block_row_ptrs[m + 1].item()
-        if start == end:
-            row_max[m * b : (m + 1) * b] = 0.0
-            continue
-        row_max[m * b : (m + 1) * b] = tile_max[start:end].max(dim=0).values
-
-    row_denom = torch.zeros(seq_len, dtype=Q.dtype)
-    for m in range(M_tiles):
-        start = mask_bsr.block_row_ptrs[m].item()
-        end = mask_bsr.block_row_ptrs[m + 1].item()
-        if start == end:
-            continue
-        row_max_m = row_max[m * b : (m + 1) * b]  # (b,)
-        for idx in range(start, end):
-            correction = torch.exp(tile_max[idx] - row_max_m)  # (b,)
-            row_denom[m * b : (m + 1) * b] += tile_sumexp[idx] * correction
-
-    row_denom = row_denom.clamp(min=1e-12)
-
-    # --- Pass 2: recompute scores, normalise, accumulate V ---
-    out = torch.zeros(seq_len, head_dim, dtype=Q.dtype)
-    for m in range(M_tiles):
-        start = mask_bsr.block_row_ptrs[m].item()
-        end = mask_bsr.block_row_ptrs[m + 1].item()
-        if start == end:
-            continue
-        q_block = Q[m * b : (m + 1) * b]  # (b, head_dim)
-        row_max_m = row_max[m * b : (m + 1) * b]  # (b,)
-        row_denom_m = row_denom[m * b : (m + 1) * b]  # (b,)
-        for idx in range(start, end):
-            col = mask_bsr.block_col_indices[idx].item()
-            k_block = K[col * b : (col + 1) * b]
-            v_block = V[col * b : (col + 1) * b]
-            score = (q_block @ k_block.T) * scale  # (b, b)
-            # Stable per-row softmax weights
-            weights = torch.exp(score - row_max_m.unsqueeze(1)) / row_denom_m.unsqueeze(1)
-            out[m * b : (m + 1) * b] += weights @ v_block  # (b, head_dim)
-
-    return out
+    return _block_sparse_attn_pytorch(Q, K, V, mask_bsr, scale)
