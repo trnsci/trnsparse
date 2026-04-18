@@ -212,6 +212,114 @@ class TestAttnTiledSimulator:
         torch.testing.assert_close(got, ref, atol=ATOL, rtol=RTOL)
 
 
+class TestAttnBwdSimulator:
+    """NKI backward kernel pair through the simulator (v0.5.1).
+
+    Correctness-only: NKI dQ/dK/dV must match PyTorch backward at atol=1e-3.
+    Shapes are tiny (seq_len=256, head_dim=32) so the CPU simulator runs
+    in seconds.
+    """
+
+    def _local_mask(self, seq_len: int, block_size: int, window: int) -> torch.Tensor:
+        n_blocks = seq_len // block_size
+        bm = torch.zeros(n_blocks, n_blocks, dtype=torch.bool)
+        for i in range(n_blocks):
+            lo = max(0, i - window)
+            hi = min(n_blocks, i + window + 1)
+            bm[i, lo:hi] = True
+        return bm.repeat_interleave(block_size, dim=0).repeat_interleave(block_size, dim=1)
+
+    def _dilated_mask(self, seq_len: int, block_size: int, stride: int) -> torch.Tensor:
+        n_blocks = seq_len // block_size
+        bm = torch.zeros(n_blocks, n_blocks, dtype=torch.bool)
+        for i in range(n_blocks):
+            for j in range(n_blocks):
+                if (i - j) % stride == 0:
+                    bm[i, j] = True
+        return bm.repeat_interleave(block_size, dim=0).repeat_interleave(block_size, dim=1)
+
+    def _pytorch_grads(self, Q, K, V, mask_bsr):
+        """Compute reference dQ, dK, dV with the PyTorch backend."""
+        prev = trnsparse.get_backend()
+        trnsparse.set_backend("pytorch")
+        try:
+            Qr = Q.clone().requires_grad_(True)
+            Kr = K.clone().requires_grad_(True)
+            Vr = V.clone().requires_grad_(True)
+            out = trnsparse.block_sparse_attention_tiled(Qr, Kr, Vr, mask_bsr)
+            dO = torch.randn_like(out)
+            out.backward(dO)
+            return Qr.grad.detach(), Kr.grad.detach(), Vr.grad.detach(), dO
+        finally:
+            trnsparse.set_backend(prev)
+
+    def test_bwd_dq_shapes(self, nki_backend):
+        """dQ output from NKI backward kernel has shape (seq_len, head_dim)."""
+        torch.manual_seed(30)
+        seq_len, head_dim, block_size = 256, 32, 128
+
+        Q = torch.randn(seq_len, head_dim)
+        K = torch.randn(seq_len, head_dim)
+        V = torch.randn(seq_len, head_dim)
+        mask = self._local_mask(seq_len, block_size, window=1)
+        mask_bsr = trnsparse.BSRMatrix.from_dense(mask.float(), block_size=block_size)
+
+        Qr = Q.clone().requires_grad_(True)
+        Kr = K.clone().requires_grad_(True)
+        Vr = V.clone().requires_grad_(True)
+        out = trnsparse.block_sparse_attention_tiled(Qr, Kr, Vr, mask_bsr)
+        out.sum().backward()
+
+        assert Qr.grad is not None and Qr.grad.shape == Q.shape
+        assert Kr.grad is not None and Kr.grad.shape == K.shape
+        assert Vr.grad is not None and Vr.grad.shape == V.shape
+
+    def test_bwd_dq_parity(self, nki_backend):
+        """NKI dQ matches PyTorch dQ at atol=1e-3, local window mask."""
+        torch.manual_seed(31)
+        seq_len, head_dim, block_size = 256, 32, 128
+
+        Q = torch.randn(seq_len, head_dim)
+        K = torch.randn(seq_len, head_dim)
+        V = torch.randn(seq_len, head_dim)
+        mask = self._local_mask(seq_len, block_size, window=1)
+        mask_bsr = trnsparse.BSRMatrix.from_dense(mask.float(), block_size=block_size)
+
+        dQ_ref, dK_ref, dV_ref, dO = self._pytorch_grads(Q, K, V, mask_bsr)
+
+        trnsparse.set_backend("nki")
+        Qr = Q.clone().requires_grad_(True)
+        Kr = K.clone().requires_grad_(True)
+        Vr = V.clone().requires_grad_(True)
+        out = trnsparse.block_sparse_attention_tiled(Qr, Kr, Vr, mask_bsr)
+        out.backward(dO)
+
+        torch.testing.assert_close(Qr.grad, dQ_ref, atol=ATOL, rtol=RTOL)
+
+    def test_bwd_dkdv_parity(self, nki_backend):
+        """NKI dK+dV match PyTorch at atol=1e-3, dilated mask."""
+        torch.manual_seed(32)
+        seq_len, head_dim, block_size = 256, 32, 128
+
+        Q = torch.randn(seq_len, head_dim)
+        K = torch.randn(seq_len, head_dim)
+        V = torch.randn(seq_len, head_dim)
+        mask = self._dilated_mask(seq_len, block_size, stride=2)
+        mask_bsr = trnsparse.BSRMatrix.from_dense(mask.float(), block_size=block_size)
+
+        dQ_ref, dK_ref, dV_ref, dO = self._pytorch_grads(Q, K, V, mask_bsr)
+
+        trnsparse.set_backend("nki")
+        Qr = Q.clone().requires_grad_(True)
+        Kr = K.clone().requires_grad_(True)
+        Vr = V.clone().requires_grad_(True)
+        out = trnsparse.block_sparse_attention_tiled(Qr, Kr, Vr, mask_bsr)
+        out.backward(dO)
+
+        torch.testing.assert_close(Kr.grad, dK_ref, atol=ATOL, rtol=RTOL)
+        torch.testing.assert_close(Vr.grad, dV_ref, atol=ATOL, rtol=RTOL)
+
+
 class TestScreenedSpmmSimulator:
     """Fused screened SpMM through the simulator (#19).
 

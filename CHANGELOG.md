@@ -5,7 +5,41 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.5.0] — 2026-04-17
+## [0.5.1] — 2026-04-16
+
+### Added
+
+- **NKI backward kernel pair** (`_attn_bwd_dq_kernel` + `_attn_bwd_dkdv_kernel`)
+  in `trnsparse/nki/kernels.py`. When the `nki` backend is active,
+  `_AttnTiledFunction.backward` now dispatches to these kernels instead of
+  the Python-loop backward.
+  - `_attn_bwd_dq_kernel`: row-first traversal, mirrors `_attn_out_kernel`.
+    Accumulates `dQ_m += dS @ K_ki * scale` in a PSUM tile per block-row.
+  - `_attn_bwd_dkdv_kernel`: column-first traversal (BSC view built on host).
+    For each column block ki, iterates over all block-rows m that attend to ki,
+    accumulating `dK_ki += dS.T @ Q_m * scale` and `dV_ki += P.T @ dO_m`.
+  - No atomic scatter required — column-first gather on host eliminates NKI's
+    lack of cross-block accumulation primitives.
+- **Stats saving in forward** — `_AttnTiledFunction.forward` now saves
+  `(Q, K, V, O, row_max, row_denom)` in ctx (6 tensors vs 4). Backward
+  receives the pre-computed row stats and skips the two recomputation passes.
+  Applies to both PyTorch and NKI paths.
+- `_attn_bwd_gather` and `nki_bsr_attn_bwd` in `trnsparse/nki/dispatch.py`
+  — host-side BSC construction and NKI backward orchestration.
+- `tests/test_nki_sim.py`: `TestAttnBwdSimulator` — simulator correctness tests
+  for dQ/dK/dV against PyTorch backward (local window + dilated patterns).
+- `tests/test_nki_attn.py`: `TestAttnBwdHardware` — hardware parity tests
+  at seq_len=512, head_dim=64.
+
+### Changed
+
+- `nki_bsr_attn_tiled` accepts `return_stats=True` kwarg (default False) to
+  return `(out, row_max, row_denom)`.
+- `_block_sparse_attn_pytorch` accepts `return_stats=True` kwarg similarly.
+- `_block_sparse_attn_backward` accepts optional `row_max` / `row_denom`
+  kwargs; when provided, skips the two recomputation BSR passes.
+
+## [0.5.0] — 2026-04-16
 
 ### Added
 

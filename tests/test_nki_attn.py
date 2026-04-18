@@ -1,11 +1,13 @@
-"""Hardware tests for the NKI two-pass attention kernel pair (v0.4.4, #25).
+"""Hardware tests for the NKI attention kernels (v0.4.4 forward + v0.5.1 backward, #25).
 
 Run on a trn1 instance:
     AWS_PROFILE=aws pytest tests/test_nki_attn.py -m neuron -v
 
-These tests validate parity between the NKI kernel pair
-(`_attn_stats_kernel` + `_attn_out_kernel`) and the PyTorch reference
-(`block_sparse_attention_tiled` on pytorch backend) at realistic shapes.
+Forward tests validate parity between the NKI kernel pair
+(`_attn_stats_kernel` + `_attn_out_kernel`) and the PyTorch reference.
+Backward tests validate parity between the NKI backward kernel pair
+(`_attn_bwd_dq_kernel` + `_attn_bwd_dkdv_kernel`) and the PyTorch
+autograd backward.
 """
 
 from __future__ import annotations
@@ -95,3 +97,53 @@ class TestAttnTiledHardware:
     def test_global_token_parity(self):
         torch.manual_seed(32)
         self._run(_global_token_mask(SEQ_LEN, BLOCK_SIZE, window=2, n_global=2))
+
+
+class TestAttnBwdHardware:
+    """NKI backward kernel pair on trn1 hardware (v0.5.1).
+
+    Verifies that dQ, dK, dV from the NKI kernel pair match the PyTorch
+    backward at atol=1e-3. Uses seq_len=512, head_dim=64 (realistic shapes).
+    """
+
+    def _pytorch_grads(self, Q, K, V, mask_bsr, seed):
+        torch.manual_seed(seed)
+        prev = trnsparse.get_backend()
+        trnsparse.set_backend("pytorch")
+        try:
+            Qr = Q.clone().requires_grad_(True)
+            Kr = K.clone().requires_grad_(True)
+            Vr = V.clone().requires_grad_(True)
+            out = trnsparse.block_sparse_attention_tiled(Qr, Kr, Vr, mask_bsr)
+            dO = torch.randn_like(out)
+            out.backward(dO)
+            return Qr.grad.detach(), Kr.grad.detach(), Vr.grad.detach(), dO
+        finally:
+            trnsparse.set_backend(prev)
+
+    def _run_bwd(self, mask: torch.Tensor, seed: int):
+        Q = torch.randn(SEQ_LEN, HEAD_DIM)
+        K = torch.randn(SEQ_LEN, HEAD_DIM)
+        V = torch.randn(SEQ_LEN, HEAD_DIM)
+        mask_bsr = trnsparse.BSRMatrix.from_dense(mask.float(), block_size=BLOCK_SIZE)
+
+        dQ_ref, dK_ref, dV_ref, dO = self._pytorch_grads(Q, K, V, mask_bsr, seed)
+
+        trnsparse.set_backend("nki")
+        Qr = Q.clone().requires_grad_(True)
+        Kr = K.clone().requires_grad_(True)
+        Vr = V.clone().requires_grad_(True)
+        out = trnsparse.block_sparse_attention_tiled(Qr, Kr, Vr, mask_bsr)
+        out.backward(dO)
+
+        torch.testing.assert_close(Qr.grad, dQ_ref, atol=ATOL, rtol=RTOL)
+        torch.testing.assert_close(Kr.grad, dK_ref, atol=ATOL, rtol=RTOL)
+        torch.testing.assert_close(Vr.grad, dV_ref, atol=ATOL, rtol=RTOL)
+
+    def test_bwd_local_parity(self):
+        torch.manual_seed(40)
+        self._run_bwd(_local_mask(SEQ_LEN, BLOCK_SIZE, window=2), seed=40)
+
+    def test_bwd_dilated_parity(self):
+        torch.manual_seed(41)
+        self._run_bwd(_dilated_mask(SEQ_LEN, BLOCK_SIZE, stride=2), seed=41)

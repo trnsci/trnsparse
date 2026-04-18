@@ -24,6 +24,8 @@ if HAS_NKI:
     import nki
 
     from .kernels import (  # noqa: F401 — NKI-only
+        _attn_bwd_dkdv_kernel,
+        _attn_bwd_dq_kernel,
         _attn_out_kernel,
         _attn_stats_kernel,
         _bsr_spmm_kernel,
@@ -557,7 +559,13 @@ def _attn_host_reduction(tile_max: torch.Tensor, tile_sumexp: torch.Tensor) -> t
     return row_max, row_denom
 
 
-def nki_bsr_attn_tiled(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, mask_bsr) -> torch.Tensor:
+def nki_bsr_attn_tiled(
+    Q: torch.Tensor,
+    K: torch.Tensor,
+    V: torch.Tensor,
+    mask_bsr,
+    return_stats: bool = False,
+):
     """Two-pass block-sparse attention via NKI kernel pair.
 
     Orchestrates `_attn_stats_kernel` (pass 1) + host reduction +
@@ -568,16 +576,21 @@ def nki_bsr_attn_tiled(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, mask_b
     future work requiring K-tiling.
 
     Args:
-        Q, K, V:  (seq_len, head_dim) float tensors.
-        mask_bsr: BSRMatrix with block_size=128 encoding the attention pattern.
+        Q, K, V:      (seq_len, head_dim) float tensors.
+        mask_bsr:     BSRMatrix with block_size=128 encoding the attention pattern.
+        return_stats: If True, returns (out, row_max, row_denom) where row_max
+                      and row_denom have shape (M_tiles, block_size). Used by
+                      `_AttnTiledFunction.forward` to save stats for backward.
 
     Returns:
-        (seq_len, head_dim) attention output.
+        (seq_len, head_dim) attention output, or a 3-tuple when return_stats=True.
     """
     if not HAS_NKI:
         raise RuntimeError("NKI not available")
 
     seq_len, head_dim = Q.shape
+    b = mask_bsr.block_size
+    M_tiles = seq_len // b
     scale = head_dim**-0.5
 
     q_scaled, k_gathered, v_gathered, K_max, M_tiles = _attn_gather(Q, K, V, mask_bsr, scale)
@@ -621,11 +634,247 @@ def nki_bsr_attn_tiled(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, mask_b
             result_x = _attn_out_kernel(qs_x, kg_x, vg_x, rm_x, rd_x)
             result = result_x.to(orig_device)
 
-        return result[:seq_len, :head_dim].contiguous()
+        out = result[:seq_len, :head_dim].contiguous()
+        if return_stats:
+            # row_max/row_denom are already (M_tiles, b) from _attn_host_reduction.
+            return out, row_max[:M_tiles, :b].contiguous(), row_denom[:M_tiles, :b].contiguous()
+        return out
     except Exception:
         if _REQUIRE_NKI:
             raise
         # PyTorch fallback — import lazily to avoid circular dependency.
-        from ..ops import block_sparse_attention_tiled as _pt_attn
+        from ..ops import _block_sparse_attn_pytorch
 
-        return _pt_attn(Q, K, V, mask_bsr, scale=scale)
+        scale_val = head_dim**-0.5
+        if return_stats:
+            return _block_sparse_attn_pytorch(Q, K, V, mask_bsr, scale_val, return_stats=True)
+        return _block_sparse_attn_pytorch(Q, K, V, mask_bsr, scale_val)
+
+
+def _attn_bwd_gather(
+    Q: torch.Tensor,
+    K: torch.Tensor,
+    V: torch.Tensor,
+    dO: torch.Tensor,
+    O: torch.Tensor,
+    mask_bsr,
+    scale: float,
+    row_max: torch.Tensor,
+    row_denom: torch.Tensor,
+):
+    """Host-side gather for the NKI backward kernels.
+
+    Builds two sets of tensors:
+    1. Row-first (for `_attn_bwd_dq_kernel`): same column grid as forward gather.
+    2. Column-first (for `_attn_bwd_dkdv_kernel`): BSC transposed view — for each
+       column block ki, gather all block-rows m that attend to ki.
+
+    Args:
+        Q, K, V, dO, O: (seq_len, head_dim) tensors.
+        mask_bsr:        BSRMatrix encoding the attention pattern.
+        scale:           QK scale (baked into q_scaled for dQ kernel).
+        row_max:         (M_tiles, block_size) saved from forward.
+        row_denom:       (M_tiles, block_size) saved from forward.
+
+    Returns a dict with keys:
+        row_first: dict with keys q_scaled, k_gathered, v_gathered, do_gathered, D_blocks
+        col_first: dict with keys k_blocks, v_blocks, q_gathered, do_gathered, D_gathered,
+                                  row_max_gathered, row_denom_gathered
+    """
+    seq_len, head_dim = Q.shape
+    b = mask_bsr.block_size
+    M_tiles = seq_len // b
+    nb_rows = M_tiles  # alias
+    block_row_ptrs = mask_bsr.block_row_ptrs
+    block_col_indices = mask_bsr.block_col_indices
+
+    # ── Row-first tensors (for dQ kernel) ──────────────────────────────────────
+    blocks_per_row = (block_row_ptrs[1:] - block_row_ptrs[:-1]).tolist()
+    K_max = max(blocks_per_row) if blocks_per_row else 1
+
+    col_grid = torch.full((M_tiles, K_max), -1, dtype=torch.long)
+    for i in range(M_tiles):
+        start = block_row_ptrs[i].item()
+        end = block_row_ptrs[i + 1].item()
+        row_len = end - start
+        col_grid[i, :row_len] = block_col_indices[start:end]
+
+    safe_col = torch.where(col_grid >= 0, col_grid, torch.tensor(0, dtype=torch.long))
+
+    K_by_block = K.view(nb_rows, b, head_dim)
+    V_by_block = V.view(nb_rows, b, head_dim)
+    dO_by_block = dO.view(nb_rows, b, head_dim)
+
+    q_scaled = (Q * scale).view(M_tiles, b, head_dim)
+    k_gathered = K_by_block[safe_col]  # (M_tiles, K_max, b, head_dim)
+    v_gathered = V_by_block[safe_col]  # (M_tiles, K_max, b, head_dim)
+    do_gathered = dO_by_block[safe_col]  # (M_tiles, K_max, b, head_dim)
+
+    # D = dO · O row-wise; reshape to (M_tiles, b) for block indexing.
+    D_flat = (dO * O).sum(dim=-1)  # (seq_len,)
+    D_blocks = D_flat.view(M_tiles, b)  # (M_tiles, b)
+
+    row_first = {
+        "q_scaled": q_scaled,
+        "k_gathered": k_gathered,
+        "v_gathered": v_gathered,
+        "do_gathered": do_gathered,
+        "D_blocks": D_blocks,
+    }
+
+    # ── Column-first tensors (for dK/dV kernel) ────────────────────────────────
+    N_col = nb_rows  # number of column blocks = number of row blocks (square)
+
+    # Invert the BSR pattern: for each column block ki, collect all block-rows m.
+    col_to_rows: list[list[int]] = [[] for _ in range(N_col)]
+    for m in range(M_tiles):
+        start = block_row_ptrs[m].item()
+        end = block_row_ptrs[m + 1].item()
+        for idx in range(start, end):
+            ki = block_col_indices[idx].item()
+            col_to_rows[ki].append(m)
+
+    K_max_col = max((len(r) for r in col_to_rows), default=1)
+
+    # row_grid_col[ki, slot] = block-row index m, or -1 for padding.
+    row_grid_col = torch.full((N_col, K_max_col), -1, dtype=torch.long)
+    for ki, rows in enumerate(col_to_rows):
+        if rows:
+            row_grid_col[ki, : len(rows)] = torch.tensor(rows, dtype=torch.long)
+
+    safe_row = torch.where(row_grid_col >= 0, row_grid_col, torch.tensor(0, dtype=torch.long))
+
+    # K and V in column order: (N_col, b, head_dim) — already row == col block order.
+    k_blocks = K.view(N_col, b, head_dim)
+    v_blocks = V.view(N_col, b, head_dim)
+
+    # Q, dO, D, row_max, row_denom gathered by row index for each (ki, slot).
+    Q_scaled_by_block = (Q * scale).view(M_tiles, b, head_dim)
+    dO_by_block_col = dO.view(M_tiles, b, head_dim)
+    D_by_block = D_flat.view(M_tiles, b)
+
+    q_gathered_col = Q_scaled_by_block[safe_row]  # (N_col, K_max_col, b, head_dim)
+    do_gathered_col = dO_by_block_col[safe_row]  # (N_col, K_max_col, b, head_dim)
+    D_gathered_col = D_by_block[safe_row]  # (N_col, K_max_col, b)
+    row_max_gathered_col = row_max[safe_row]  # (N_col, K_max_col, b)
+    row_denom_gathered_col = row_denom[safe_row]  # (N_col, K_max_col, b)
+
+    col_first = {
+        "k_blocks": k_blocks,
+        "v_blocks": v_blocks,
+        "q_gathered": q_gathered_col,
+        "do_gathered": do_gathered_col,
+        "D_gathered": D_gathered_col,
+        "row_max_gathered": row_max_gathered_col,
+        "row_denom_gathered": row_denom_gathered_col,
+    }
+
+    return row_first, col_first
+
+
+def nki_bsr_attn_bwd(
+    Q: torch.Tensor,
+    K: torch.Tensor,
+    V: torch.Tensor,
+    dO: torch.Tensor,
+    O: torch.Tensor,
+    mask_bsr,
+    row_max: torch.Tensor,
+    row_denom: torch.Tensor,
+) -> tuple:
+    """NKI backward pass for block-sparse tiled attention.
+
+    Runs two NKI kernels:
+      1. `_attn_bwd_dq_kernel`   — row-first, computes dQ.
+      2. `_attn_bwd_dkdv_kernel` — column-first, computes dK and dV.
+
+    Returns:
+        (dQ, dK, dV) — same shape as (Q, K, V).
+    """
+    if not HAS_NKI:
+        raise RuntimeError("NKI not available")
+
+    seq_len, head_dim = Q.shape
+    b = mask_bsr.block_size
+    scale = head_dim**-0.5
+
+    row_first, col_first = _attn_bwd_gather(Q, K, V, dO, O, mask_bsr, scale, row_max, row_denom)
+
+    # Pack contiguous inputs.
+    rf = {k: v.contiguous() for k, v in row_first.items()}
+    cf = {k: v.contiguous() for k, v in col_first.items()}
+
+    try:
+        if _use_simulator():
+            dQ_np = nki.simulate(_attn_bwd_dq_kernel)(
+                rf["q_scaled"].cpu().numpy(),
+                rf["k_gathered"].cpu().numpy(),
+                rf["v_gathered"].cpu().numpy(),
+                rf["do_gathered"].cpu().numpy(),
+                rf["D_blocks"].cpu().numpy(),
+                row_max.contiguous().cpu().numpy(),
+                row_denom.contiguous().cpu().numpy(),
+            )
+            dQ_raw = torch.from_numpy(np.asarray(dQ_np)).to(Q.device)
+
+            dK_np, dV_np = nki.simulate(_attn_bwd_dkdv_kernel)(
+                cf["k_blocks"].cpu().numpy(),
+                cf["v_blocks"].cpu().numpy(),
+                cf["q_gathered"].cpu().numpy(),
+                cf["do_gathered"].cpu().numpy(),
+                cf["D_gathered"].cpu().numpy(),
+                cf["row_max_gathered"].cpu().numpy(),
+                cf["row_denom_gathered"].cpu().numpy(),
+            )
+            dK_raw = torch.from_numpy(np.asarray(dK_np)).to(Q.device)
+            dV_raw = torch.from_numpy(np.asarray(dV_np)).to(Q.device)
+        else:
+            (
+                (
+                    qs_x,
+                    kg_x,
+                    vg_x,
+                    dog_x,
+                    db_x,
+                    rm_x,
+                    rd_x,
+                ),
+                orig_device,
+            ) = _to_xla(
+                rf["q_scaled"],
+                rf["k_gathered"],
+                rf["v_gathered"],
+                rf["do_gathered"],
+                rf["D_blocks"],
+                row_max.contiguous(),
+                row_denom.contiguous(),
+            )
+            dQ_x = _attn_bwd_dq_kernel(qs_x, kg_x, vg_x, dog_x, db_x, rm_x, rd_x)
+            dQ_raw = dQ_x.to(orig_device)
+
+            (kb_x, vb_x, qgc_x, dogc_x, dgc_x, rmgc_x, rdgc_x), _ = _to_xla(
+                cf["k_blocks"],
+                cf["v_blocks"],
+                cf["q_gathered"],
+                cf["do_gathered"],
+                cf["D_gathered"],
+                cf["row_max_gathered"],
+                cf["row_denom_gathered"],
+            )
+            dK_x, dV_x = _attn_bwd_dkdv_kernel(kb_x, vb_x, qgc_x, dogc_x, dgc_x, rmgc_x, rdgc_x)
+            dK_raw = dK_x.to(orig_device)
+            dV_raw = dV_x.to(orig_device)
+
+        return (
+            dQ_raw[:seq_len, :head_dim].contiguous(),
+            dK_raw[:seq_len, :head_dim].contiguous(),
+            dV_raw[:seq_len, :head_dim].contiguous(),
+        )
+    except Exception:
+        if _REQUIRE_NKI:
+            raise
+        from ..ops import _block_sparse_attn_backward
+
+        return _block_sparse_attn_backward(
+            Q, K, V, O, dO, mask_bsr, scale, row_max=row_max, row_denom=row_denom
+        )
