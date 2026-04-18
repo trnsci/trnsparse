@@ -589,11 +589,10 @@ def nki_bsr_attn_tiled(
         raise RuntimeError("NKI not available")
 
     seq_len, head_dim = Q.shape
-    b = mask_bsr.block_size
-    M_tiles = seq_len // b
     scale = head_dim**-0.5
 
     q_scaled, k_gathered, v_gathered, K_max, M_tiles = _attn_gather(Q, K, V, mask_bsr, scale)
+    b = mask_bsr.block_size
 
     # Contiguous inputs for kernel dispatch.
     qs = q_scaled.contiguous()
@@ -748,14 +747,10 @@ def _attn_bwd_gather(
     k_blocks = K.view(N_col, b, head_dim)
     v_blocks = V.view(N_col, b, head_dim)
 
-    # Q, dO, D, row_max, row_denom gathered by row index for each (ki, slot).
-    Q_scaled_by_block = (Q * scale).view(M_tiles, b, head_dim)
-    dO_by_block_col = dO.view(M_tiles, b, head_dim)
-    D_by_block = D_flat.view(M_tiles, b)
-
-    q_gathered_col = Q_scaled_by_block[safe_row]  # (N_col, K_max_col, b, head_dim)
-    do_gathered_col = dO_by_block_col[safe_row]  # (N_col, K_max_col, b, head_dim)
-    D_gathered_col = D_by_block[safe_row]  # (N_col, K_max_col, b)
+    # Gather Q_scaled, dO, D by row index; reuse views computed in row-first section.
+    q_gathered_col = q_scaled[safe_row]  # (N_col, K_max_col, b, head_dim)
+    do_gathered_col = dO_by_block[safe_row]  # (N_col, K_max_col, b, head_dim)
+    D_gathered_col = D_blocks[safe_row]  # (N_col, K_max_col, b)
     row_max_gathered_col = row_max[safe_row]  # (N_col, K_max_col, b)
     row_denom_gathered_col = row_denom[safe_row]  # (N_col, K_max_col, b)
 
