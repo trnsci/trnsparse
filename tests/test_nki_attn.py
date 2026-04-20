@@ -147,3 +147,55 @@ class TestAttnBwdHardware:
     def test_bwd_dilated_parity(self):
         torch.manual_seed(41)
         self._run_bwd(_dilated_mask(SEQ_LEN, BLOCK_SIZE, stride=2), seed=41)
+
+
+class TestAttnHardwareLargeDim:
+    """NKI K-tiling (head_dim=256) on trn1 hardware (v0.6.0).
+
+    Verifies forward and backward parity at head_dim=256, seq_len=512.
+    """
+
+    HD = 256
+
+    def _pytorch_ref(self, Q, K, V, mask_bsr):
+        prev = trnsparse.get_backend()
+        trnsparse.set_backend("pytorch")
+        try:
+            Qr = Q.clone().requires_grad_(True)
+            Kr = K.clone().requires_grad_(True)
+            Vr = V.clone().requires_grad_(True)
+            out = trnsparse.block_sparse_attention_tiled(Qr, Kr, Vr, mask_bsr)
+            dO = torch.randn_like(out)
+            out.backward(dO)
+            return out.detach(), Qr.grad.detach(), Kr.grad.detach(), Vr.grad.detach(), dO
+        finally:
+            trnsparse.set_backend(prev)
+
+    def _run(self, mask: torch.Tensor, seed: int):
+        torch.manual_seed(seed)
+        Q = torch.randn(SEQ_LEN, self.HD)
+        K = torch.randn(SEQ_LEN, self.HD)
+        V = torch.randn(SEQ_LEN, self.HD)
+        mask_bsr = trnsparse.BSRMatrix.from_dense(mask.float(), block_size=BLOCK_SIZE)
+
+        ref_out, dQ_ref, dK_ref, dV_ref, dO = self._pytorch_ref(Q, K, V, mask_bsr)
+
+        trnsparse.set_backend("nki")
+        Qr = Q.clone().requires_grad_(True)
+        Kr = K.clone().requires_grad_(True)
+        Vr = V.clone().requires_grad_(True)
+        got = trnsparse.block_sparse_attention_tiled(Qr, Kr, Vr, mask_bsr)
+        got.backward(dO)
+
+        torch.testing.assert_close(got.detach(), ref_out, atol=ATOL, rtol=RTOL)
+        torch.testing.assert_close(Qr.grad, dQ_ref, atol=ATOL, rtol=RTOL)
+        torch.testing.assert_close(Kr.grad, dK_ref, atol=ATOL, rtol=RTOL)
+        torch.testing.assert_close(Vr.grad, dV_ref, atol=ATOL, rtol=RTOL)
+
+    def test_forward_head_dim_256(self):
+        torch.manual_seed(50)
+        self._run(_local_mask(SEQ_LEN, BLOCK_SIZE, window=2), seed=50)
+
+    def test_backward_head_dim_256(self):
+        torch.manual_seed(51)
+        self._run(_dilated_mask(SEQ_LEN, BLOCK_SIZE, stride=2), seed=51)

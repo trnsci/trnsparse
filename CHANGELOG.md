@@ -5,6 +5,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] — 2026-04-17
+
+### Added
+
+- **K-tiling for head_dim > 128** — NKI attention kernels now support
+  `head_dim=256` and `head_dim=512` via an inner K-tile loop that splits
+  the `Q @ K.T` score computation across `TILE_K=128`-sized chunks of
+  `head_dim`, accumulating each into the existing PSUM.
+  - All 4 NKI kernels updated: `_attn_stats_kernel`, `_attn_out_kernel`,
+    `_attn_bwd_dq_kernel`, `_attn_bwd_dkdv_kernel`.
+  - For `head_dim ≤ 128`: single-tile path preserved unchanged — Q is
+    loaded once per block-row as a stationary tile (no regression).
+  - For `head_dim > 128`: K-tile inner loop (`affine_range(head_dim //
+    128)`). `head_dim` must be a multiple of 128 (covers 256, 512).
+  - `weights @ V` and all dK/dV accumulation matmuls are unchanged (K=128
+    block dimension, unaffected by head_dim growth).
+- `tests/test_attention.py`: `test_head_dim_256_parity`,
+  `test_head_dim_256_dilated_parity`, `test_gradcheck_head_dim_256`,
+  `test_backward_shapes_head_dim_256` in PyTorch path.
+- `tests/test_nki_sim.py`: `TestAttnKTilingSimulator` — simulator parity
+  tests for forward and backward at head_dim=256.
+- `tests/test_nki_attn.py`: `TestAttnHardwareLargeDim` — hardware parity
+  tests at seq_len=512, head_dim=256.
+
+### Changed
+
+- `_attn_gather` assertion relaxed from `head_dim ≤ 128` to `head_dim ≤ 128
+  or head_dim % 128 == 0`.
+- `block_sparse_attention_tiled` and `nki_bsr_attn_tiled` docstrings updated
+  to document K-tiling support.
+
 ## [0.5.1] — 2026-04-16
 
 ### Added

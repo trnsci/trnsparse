@@ -509,9 +509,9 @@ def _attn_gather(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, mask_bsr, sc
     b = mask_bsr.block_size
     M_tiles = seq_len // b
 
-    assert head_dim <= _TILE_K, (
-        f"head_dim {head_dim} > {_TILE_K}: v0.4.4 requires head_dim ≤ 128 "
-        f"(nc_matmul partition limit). head_dim=256+ is future work."
+    assert head_dim <= _TILE_K or head_dim % _TILE_K == 0, (
+        f"head_dim {head_dim}: must be ≤ {_TILE_K} or a multiple of {_TILE_K}. "
+        f"Supported: 32, 64, 128 (single tile) and 256, 512 (K-tiled)."
     )
 
     block_row_ptrs = mask_bsr.block_row_ptrs
@@ -572,8 +572,9 @@ def nki_bsr_attn_tiled(
     `_attn_out_kernel` (pass 2) for the block-sparse attention forward pass.
     No O(seq_len²) intermediate is allocated.
 
-    head_dim must be ≤ 128 (nc_matmul partition limit). head_dim=256+ is
-    future work requiring K-tiling.
+    head_dim must be ≤ 128 (single tile) or a multiple of 128 (K-tiling:
+    256, 512). K-tiling accumulates the score Q @ K.T across TILE_K=128
+    chunks, reusing PSUM across nc_matmul calls.
 
     Args:
         Q, K, V:      (seq_len, head_dim) float tensors.

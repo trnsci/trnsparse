@@ -590,6 +590,11 @@ def block_sparse_attention_tiled(
             block_col_indices); block values are ignored.
         scale: Optional QK scale (default: head_dim ** -0.5).
 
+    Note:
+        On the NKI backend, head_dim must be ≤ 128 (single tile) or a
+        multiple of 128 (K-tiling, e.g., 256 or 512). The PyTorch backend
+        accepts any head_dim.
+
     Returns:
         (seq_len, head_dim) attention output.
     """

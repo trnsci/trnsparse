@@ -305,6 +305,77 @@ class TestAttnBwdSimulator:
         torch.testing.assert_close(Vr.grad, dV_ref, atol=ATOL, rtol=RTOL)
 
 
+class TestAttnKTilingSimulator:
+    """NKI K-tiling (head_dim=256) through the simulator (v0.6.0).
+
+    Verifies that the K-tile loop path produces identical output to the
+    PyTorch reference at head_dim=256. Both forward and backward are checked.
+    """
+
+    def test_forward_head_dim_256(self, nki_backend):
+        """NKI forward at head_dim=256 matches PyTorch reference."""
+        torch.manual_seed(60)
+        seq_len, head_dim, block_size = 256, 256, 128
+
+        Q = torch.randn(seq_len, head_dim)
+        K = torch.randn(seq_len, head_dim)
+        V = torch.randn(seq_len, head_dim)
+        mask = _local_mask(seq_len, block_size, window=1)
+        mask_bsr = trnsparse.BSRMatrix.from_dense(mask.float(), block_size=block_size)
+
+        trnsparse.set_backend("pytorch")
+        ref = trnsparse.block_sparse_attention_tiled(Q, K, V, mask_bsr)
+
+        trnsparse.set_backend("nki")
+        got = trnsparse.block_sparse_attention_tiled(Q, K, V, mask_bsr)
+
+        torch.testing.assert_close(got, ref, atol=ATOL, rtol=RTOL)
+        assert got.shape == (seq_len, head_dim)
+
+    def test_backward_head_dim_256(self, nki_backend):
+        """NKI dQ/dK/dV match PyTorch at head_dim=256."""
+        torch.manual_seed(61)
+        seq_len, head_dim, block_size = 256, 256, 128
+
+        Q = torch.randn(seq_len, head_dim)
+        K = torch.randn(seq_len, head_dim)
+        V = torch.randn(seq_len, head_dim)
+        mask = _local_mask(seq_len, block_size, window=1)
+        mask_bsr = trnsparse.BSRMatrix.from_dense(mask.float(), block_size=block_size)
+
+        dQ_ref, dK_ref, dV_ref, dO = _pytorch_grads(Q, K, V, mask_bsr)
+
+        trnsparse.set_backend("nki")
+        Qr = Q.clone().requires_grad_(True)
+        Kr = K.clone().requires_grad_(True)
+        Vr = V.clone().requires_grad_(True)
+        out = trnsparse.block_sparse_attention_tiled(Qr, Kr, Vr, mask_bsr)
+        out.backward(dO)
+
+        torch.testing.assert_close(Qr.grad, dQ_ref, atol=ATOL, rtol=RTOL)
+        torch.testing.assert_close(Kr.grad, dK_ref, atol=ATOL, rtol=RTOL)
+        torch.testing.assert_close(Vr.grad, dV_ref, atol=ATOL, rtol=RTOL)
+
+    def test_forward_dilated_head_dim_256(self, nki_backend):
+        """K-tiling forward with dilated pattern matches PyTorch."""
+        torch.manual_seed(62)
+        seq_len, head_dim, block_size = 256, 256, 128
+
+        Q = torch.randn(seq_len, head_dim)
+        K = torch.randn(seq_len, head_dim)
+        V = torch.randn(seq_len, head_dim)
+        mask = _dilated_mask(seq_len, block_size, stride=2)
+        mask_bsr = trnsparse.BSRMatrix.from_dense(mask.float(), block_size=block_size)
+
+        trnsparse.set_backend("pytorch")
+        ref = trnsparse.block_sparse_attention_tiled(Q, K, V, mask_bsr)
+
+        trnsparse.set_backend("nki")
+        got = trnsparse.block_sparse_attention_tiled(Q, K, V, mask_bsr)
+
+        torch.testing.assert_close(got, ref, atol=ATOL, rtol=RTOL)
+
+
 class TestScreenedSpmmSimulator:
     """Fused screened SpMM through the simulator (#19).
 
