@@ -172,12 +172,13 @@ if HAS_NKI:
         )
 
         for m in nl.affine_range(M_tiles):
-            if head_dim <= _TILE_K:
-                q_t = nl.load_transpose2d(q_scaled_blocks[m, :, :])  # (head_dim, 128) stationary
-
             for ki in nl.affine_range(K_max):
                 score_psum = nl.zeros((_TILE_M, _TILE_M), dtype=nl.float32, buffer=nl.psum)
                 if head_dim <= _TILE_K:
+                    # Both q_t and k_t are local to this (m, ki) iteration.
+                    # NKI 0.3.0 simulator requires nc_matmul args to be local to the
+                    # innermost affine_range loop — outer-loop tiles can't be reused.
+                    q_t = nl.load_transpose2d(q_scaled_blocks[m, :, :])
                     k_t = nl.load_transpose2d(k_gathered_pad[m, ki, :, :])
                     score_psum[...] += nisa.nc_matmul(q_t, k_t)
                 else:
@@ -232,8 +233,6 @@ if HAS_NKI:
         )
 
         for m in nl.affine_range(M_tiles):
-            if head_dim <= _TILE_K:
-                q_t = nl.load_transpose2d(q_scaled_blocks[m, :, :])  # (head_dim, 128) stationary
             row_max_m = nl.load(row_max[m, :])
             row_denom_m = nl.load(row_denom[m, :])
 
@@ -244,6 +243,8 @@ if HAS_NKI:
 
                 score_psum = nl.zeros((_TILE_M, _TILE_M), dtype=nl.float32, buffer=nl.psum)
                 if head_dim <= _TILE_K:
+                    # q_t and k_t local to this (m, ki) iteration — required by NKI simulator.
+                    q_t = nl.load_transpose2d(q_scaled_blocks[m, :, :])
                     k_t = nl.load_transpose2d(k_gathered_pad[m, ki, :, :])
                     score_psum[...] += nisa.nc_matmul(q_t, k_t)
                 else:
@@ -306,8 +307,6 @@ if HAS_NKI:
         )
 
         for m in nl.affine_range(M_tiles):
-            if head_dim <= _TILE_K:
-                q_t = nl.load_transpose2d(q_scaled_blocks[m, :, :])  # (head_dim, 128) stationary
             row_max_m = nl.load(row_max[m, :])
             row_denom_m = nl.load(row_denom[m, :])
             d_m = nl.load(D_blocks[m, :])
@@ -325,6 +324,9 @@ if HAS_NKI:
                 # score = Q_m @ K_ki.T
                 score_psum = nl.zeros((_TILE_M, _TILE_M), dtype=nl.float32, buffer=nl.psum)
                 if head_dim <= _TILE_K:
+                    # q_t local to this (m, ki) iteration — NKI simulator requires nc_matmul
+                    # args to be local to the innermost affine_range loop.
+                    q_t = nl.load_transpose2d(q_scaled_blocks[m, :, :])
                     score_psum[...] += nisa.nc_matmul(q_t, k_t)
                 else:
                     for hd in nl.affine_range(head_dim // _TILE_K):
@@ -403,20 +405,19 @@ if HAS_NKI:
         dV = nl.ndarray((N_col * _TILE_M, head_dim), dtype=k_blocks.dtype, buffer=nl.shared_hbm)
 
         for ki in nl.affine_range(N_col):
-            if head_dim <= _TILE_K:
-                k_t = nl.load_transpose2d(k_blocks[ki, :, :])  # (head_dim, 128) stationary
-                v_t = nl.load_transpose2d(v_blocks[ki, :, :])  # (head_dim, 128) stationary
-
             dk_psum = nl.zeros((_TILE_M, head_dim), dtype=nl.float32, buffer=nl.psum)
             dv_psum = nl.zeros((_TILE_M, head_dim), dtype=nl.float32, buffer=nl.psum)
 
             for mi in nl.affine_range(K_max_col):
-                # q_sbuf/do_sbuf: (128, head_dim) for nc_matmul(dS, q_sbuf) and nc_matmul(P, do_sbuf)
+                # All tile loads local to this (ki, mi) iteration — NKI simulator requires
+                # nc_matmul args to be local to the innermost affine_range loop.
                 if head_dim <= _TILE_K:
                     q_t_mi = nl.load_transpose2d(q_gathered_col[ki, mi, :, :])
                     q_sbuf = nl.transpose(q_t_mi)  # avoids extra HBM load
                     do_t_mi = nl.load_transpose2d(do_gathered_col[ki, mi, :, :])
                     do_sbuf = nl.transpose(do_t_mi)
+                    k_t = nl.load_transpose2d(k_blocks[ki, :, :])
+                    v_t = nl.load_transpose2d(v_blocks[ki, :, :])
                 else:
                     q_sbuf = nl.load(q_gathered_col[ki, mi, :, :])  # (128, head_dim)
                     do_sbuf = nl.load(do_gathered_col[ki, mi, :, :])  # (128, head_dim)
