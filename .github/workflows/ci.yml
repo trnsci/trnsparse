@@ -54,6 +54,7 @@ jobs:
           pip install -e ".[dev]"
           pip install --extra-index-url https://pip.repos.neuron.amazonaws.com \
             "nki>=0.3.0"
+          python -c "import nki, nki.isa as nisa; import inspect; print('nki version:', nki.__version__); print('nc_matmul sig:', inspect.signature(nisa.nc_matmul))"
       - name: Run simulator-backed kernel tests
         env:
           TRNSPARSE_USE_SIMULATOR: "1"
