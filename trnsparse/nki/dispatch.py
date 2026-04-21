@@ -514,6 +514,11 @@ def _attn_gather(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, mask_bsr, sc
         f"Supported: 32, 64, 128 (single tile) and 256, 512 (K-tiled)."
     )
 
+    # NKI 0.3.0 simulator: nc_matmul requires K = TILE_K exactly. Pad head_dim to
+    # TILE_K when running in the simulator with head_dim < TILE_K. The forward
+    # output is sliced to [:seq_len, :head_dim] so the padding is transparent.
+    head_dim_k = _TILE_K if (_use_simulator() and head_dim < _TILE_K) else head_dim
+
     block_row_ptrs = mask_bsr.block_row_ptrs
     blocks_per_row = (block_row_ptrs[1:] - block_row_ptrs[:-1]).tolist()
     K_max = max(blocks_per_row) if blocks_per_row else 1
@@ -537,6 +542,16 @@ def _attn_gather(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, mask_bsr, sc
     v_gathered_pad = V_by_block[safe_col]  # (M_tiles, K_max, b, head_dim)
 
     q_scaled_blocks = (Q * scale).view(M_tiles, b, head_dim)
+
+    if head_dim_k != head_dim:
+        extra = head_dim_k - head_dim
+
+        def _pad_hd(t: torch.Tensor, ndim_extra: int) -> torch.Tensor:
+            return torch.cat([t, t.new_zeros(*t.shape[:-1], ndim_extra)], dim=-1)
+
+        q_scaled_blocks = _pad_hd(q_scaled_blocks, extra)
+        k_gathered_pad = _pad_hd(k_gathered_pad, extra)
+        v_gathered_pad = _pad_hd(v_gathered_pad, extra)
 
     return q_scaled_blocks, k_gathered_pad, v_gathered_pad, K_max, M_tiles
 
@@ -687,6 +702,22 @@ def _attn_bwd_gather(
     nb_rows = M_tiles  # alias
     block_row_ptrs = mask_bsr.block_row_ptrs
     block_col_indices = mask_bsr.block_col_indices
+
+    # NKI 0.3.0 simulator: pad head_dim to TILE_K so nc_matmul gets K=TILE_K.
+    # Padding with zeros is correct: [dO|0]·[O|0] = dO·O for D, and the kernel
+    # outputs are sliced to [:seq_len, :head_dim] in nki_bsr_attn_bwd.
+    if _use_simulator() and head_dim < _TILE_K:
+        extra = _TILE_K - head_dim
+
+        def _pad_hd(t: torch.Tensor) -> torch.Tensor:
+            return torch.cat([t, t.new_zeros(*t.shape[:-1], extra)], dim=-1)
+
+        Q = _pad_hd(Q)
+        K = _pad_hd(K)
+        V = _pad_hd(V)
+        dO = _pad_hd(dO)
+        O = _pad_hd(O)
+        head_dim = _TILE_K  # update local for views below
 
     # ── Row-first tensors (for dQ kernel) ──────────────────────────────────────
     blocks_per_row = (block_row_ptrs[1:] - block_row_ptrs[:-1]).tolist()

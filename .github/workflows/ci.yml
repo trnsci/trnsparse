@@ -41,6 +41,8 @@ jobs:
     # Catches Python-trace-level errors (bad kwargs, dropped ops, shape
     # mismatches) pre-merge without AWS round-trips. MLIR verifier
     # errors remain hardware-only (simulator explicitly skips compile).
+    # TRNSPARSE_REQUIRE_NKI=1 disables the PyTorch fallback so kernel
+    # failures propagate — the simulator tests actually validate NKI kernels.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -55,4 +57,5 @@ jobs:
       - name: Run simulator-backed kernel tests
         env:
           TRNSPARSE_USE_SIMULATOR: "1"
+          TRNSPARSE_REQUIRE_NKI: "1"
         run: pytest tests/ -v -m nki_simulator --tb=short

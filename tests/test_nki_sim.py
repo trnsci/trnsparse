@@ -149,10 +149,7 @@ class TestAttnTiledSimulator:
         from trnsparse.nki.kernels import _attn_stats_kernel
 
         torch.manual_seed(20)
-        # head_dim=128 so nc_matmul partition K=TILE_K=128 — NKI 0.3.0 simulator
-        # requires K == TILE_K for nc_matmul; smaller K (e.g. 32) works on hardware
-        # but not in the CPU simulator.
-        seq_len, head_dim, block_size = 256, 128, 128
+        seq_len, head_dim, block_size = 256, 32, 128
         M_tiles = seq_len // block_size
 
         Q = torch.randn(seq_len, head_dim)
