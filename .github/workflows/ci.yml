@@ -54,7 +54,6 @@ jobs:
           pip install -e ".[dev]"
           pip install --extra-index-url https://pip.repos.neuron.amazonaws.com \
             "nki>=0.3.0"
-          python -c "import nki.language as nl; print('nl funcs:', [x for x in dir(nl) if x in ('relu','sigmoid','tanh','gelu','silu','identity','linear','exp','abs','relu6','leaky_relu')]); import nki.isa as nisa,inspect; src=inspect.getsource(nisa.activation); print(src[2000:4000])"
       - name: Run simulator-backed kernel tests
         env:
           TRNSPARSE_USE_SIMULATOR: "1"
