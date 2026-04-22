@@ -54,7 +54,7 @@ jobs:
           pip install -e ".[dev]"
           pip install --extra-index-url https://pip.repos.neuron.amazonaws.com \
             "nki>=0.3.0"
-          python -c "import nki.language as nl; print('nl ops:', [x for x in dir(nl) if not x.startswith('_')][:40])"
+          python -c "import nki.language as nl; ops=sorted([x for x in dir(nl) if not x.startswith('_')]); print('all:', ops[40:])"
       - name: Run simulator-backed kernel tests
         env:
           TRNSPARSE_USE_SIMULATOR: "1"
