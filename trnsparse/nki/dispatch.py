@@ -416,6 +416,8 @@ def _nki_screened_spmm_impl(
             A_feed, Q_feed, B_feed = A_p.contiguous(), Q_p.contiguous(), B_p.contiguous()
         else:
             A_feed, Q_feed, B_feed = A.contiguous(), Q.contiguous(), B.contiguous()
+        # NKI 0.3.0: nl.load requires 2D tensors; unsqueeze Q from (M,) to (M,1)
+        Q_feed = Q_feed.unsqueeze(-1).contiguous()
 
         if _use_simulator():
             out_np = nki.simulate(_screened_spmm_kernel)(

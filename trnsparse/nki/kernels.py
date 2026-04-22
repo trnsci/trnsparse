@@ -115,18 +115,18 @@ if HAS_NKI:
 
                 psum = nl.zeros((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
 
-                # Row Q slice used for every k-tile in this (m, n) output tile.
-                q_m = nl.load(q[m_off : m_off + TILE_M])  # (TILE_M,)
+                # q is (M, 1) 2D — load as (TILE_M, 1) to satisfy NKI 2D constraint.
+                q_m = nl.load(q[m_off : m_off + TILE_M, :])  # (TILE_M, 1)
 
                 for k in nl.affine_range(K // TILE_K):
                     k_off = k * TILE_K
 
                     a_tile = nl.load(a[m_off : m_off + TILE_M, k_off : k_off + TILE_K])
-                    q_k = nl.load(q[k_off : k_off + TILE_K])  # (TILE_K,)
+                    # load_transpose2d on (TILE_K, 1) → (1, TILE_K) for the outer product
+                    q_k = nl.load_transpose2d(q[k_off : k_off + TILE_K, :])  # (1, TILE_K)
 
-                    # Outer-product pair bound (TILE_M, TILE_K). nl broadcasting
-                    # via explicit reshape — partition-dim-safe.
-                    pair_bound = nl.multiply(q_m.reshape((TILE_M, 1)), q_k.reshape((1, TILE_K)))
+                    # Outer-product pair bound (TILE_M, TILE_K) via (TILE_M,1)*(1,TILE_K) broadcast.
+                    pair_bound = nl.multiply(q_m, q_k)
                     mask = nl.greater(pair_bound, threshold_sqrt)
                     a_masked = nl.multiply(a_tile, mask.astype(a.dtype))
 
