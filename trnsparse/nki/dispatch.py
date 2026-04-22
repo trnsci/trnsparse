@@ -859,8 +859,8 @@ def nki_bsr_attn_bwd(
                 rf["v_gathered"].cpu().numpy(),
                 rf["do_gathered"].cpu().numpy(),
                 rf["D_blocks"].cpu().numpy(),
-                row_max.contiguous().cpu().numpy(),
-                row_denom.contiguous().cpu().numpy(),
+                row_max.unsqueeze(-1).contiguous().cpu().numpy(),
+                row_denom.unsqueeze(-1).contiguous().cpu().numpy(),
             )
             dQ_raw = torch.from_numpy(np.asarray(dQ_np)).to(Q.device)
 
@@ -893,8 +893,8 @@ def nki_bsr_attn_bwd(
                 rf["v_gathered"],
                 rf["do_gathered"],
                 rf["D_blocks"],
-                row_max.contiguous(),
-                row_denom.contiguous(),
+                row_max.unsqueeze(-1).contiguous(),
+                row_denom.unsqueeze(-1).contiguous(),
             )
             dQ_x = _attn_bwd_dq_kernel(qs_x, kg_x, vg_x, dog_x, db_x, rm_x, rd_x)
             dQ_raw = dQ_x.to(orig_device)
