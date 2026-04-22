@@ -173,10 +173,10 @@ if HAS_NKI:
         _, _, head_dim = q_scaled_blocks.shape
 
         tile_max = nl.ndarray(
-            (M_tiles, K_max, _TILE_M), dtype=q_scaled_blocks.dtype, buffer=nl.shared_hbm
+            (M_tiles, K_max, _TILE_M, 1), dtype=q_scaled_blocks.dtype, buffer=nl.shared_hbm
         )
         tile_sumexp = nl.ndarray(
-            (M_tiles, K_max, _TILE_M), dtype=q_scaled_blocks.dtype, buffer=nl.shared_hbm
+            (M_tiles, K_max, _TILE_M, 1), dtype=q_scaled_blocks.dtype, buffer=nl.shared_hbm
         )
 
         for m in nl.affine_range(M_tiles):
@@ -203,12 +203,12 @@ if HAS_NKI:
                 nisa.activation(_ssp, nl.relu, score_psum)
                 nisa.activation(_ssn, nl.relu, score_psum, scale=-1.0)
                 score = nl.subtract(_ssp, _ssn)
-                t_max = nl.max(score, axis=1)
-                stable = nl.subtract(score, t_max.reshape((_TILE_M, 1)))
-                t_sum = nl.sum(nl.exp(stable), axis=1)
+                t_max = nl.max(score, axis=1, keepdims=True)
+                stable = nl.subtract(score, t_max)
+                t_sum = nl.sum(nl.exp(stable), axis=1, keepdims=True)
 
-                nl.store(tile_max[m, ki, :], value=t_max)
-                nl.store(tile_sumexp[m, ki, :], value=t_sum)
+                nl.store(tile_max[m, ki, :, :], value=t_max)
+                nl.store(tile_sumexp[m, ki, :, :], value=t_sum)
 
         return tile_max, tile_sumexp
 

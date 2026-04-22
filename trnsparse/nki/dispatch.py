@@ -622,6 +622,10 @@ def nki_bsr_attn_tiled(
             )
             tile_max = torch.from_numpy(np.asarray(tile_max_np)).to(Q.device)
             tile_sumexp = torch.from_numpy(np.asarray(tile_sumexp_np)).to(Q.device)
+            # NKI 0.3.0 keepdims: tile_max/tile_sumexp are (M_tiles, K_max, 128, 1)
+            if tile_max.dim() == 4:
+                tile_max = tile_max.squeeze(-1)
+                tile_sumexp = tile_sumexp.squeeze(-1)
 
             row_max, row_denom = _attn_host_reduction(tile_max, tile_sumexp)
             rm = row_max.contiguous()
@@ -640,6 +644,9 @@ def nki_bsr_attn_tiled(
             tile_max_x, tile_sumexp_x = _attn_stats_kernel(qs_x, kg_x)
             tile_max = tile_max_x.to(orig_device)
             tile_sumexp = tile_sumexp_x.to(orig_device)
+            if tile_max.dim() == 4:
+                tile_max = tile_max.squeeze(-1)
+                tile_sumexp = tile_sumexp.squeeze(-1)
 
             row_max, row_denom = _attn_host_reduction(tile_max, tile_sumexp)
             rm = row_max.contiguous()
