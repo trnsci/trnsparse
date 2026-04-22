@@ -130,13 +130,11 @@ if HAS_NKI:
                     mask = nl.greater(pair_bound, threshold_sqrt)
                     a_masked = nl.multiply(a_tile, mask.astype(a.dtype))
 
-                    # Transpose for stationary-A nc_matmul via a staging buffer.
-                    # nl.load_transpose2d loads+transposes from HBM, but a_masked
-                    # is already in SBUF, so we need to store-and-reload or use
-                    # an in-SBUF transpose primitive. nl.transpose is available
-                    # in NKI 0.3.0; if the simulator rejects, fall back to
-                    # storing to an HBM staging tile and load_transpose2d-ing.
-                    a_t = nl.transpose(a_masked)
+                    # nl.transpose gives PSUM in NKI 0.3.0 which nc_matmul rejects as
+                    # stationary. Store a_masked to HBM and reload transposed.
+                    _ah = nl.ndarray((TILE_M, TILE_K), dtype=a.dtype, buffer=nl.shared_hbm)
+                    nl.store(_ah, value=a_masked)
+                    a_t = nl.load_transpose2d(_ah)  # SBUF (transposed)
                     b_tile = nl.load(b[k_off : k_off + TILE_K, n_off : n_off + TILE_N])
 
                     nisa.nc_matmul(psum, a_t, b_tile, accumulate=True)
@@ -275,8 +273,11 @@ if HAS_NKI:
                 stable = nl.subtract(score, row_max_m)
                 weights = nl.divide(nl.exp(stable), row_denom_m)
 
-                # nc_matmul(weights_t, v_tile) = weights @ V — K=128 block dim, unchanged
-                weights_t = nl.transpose(weights)
+                # NKI 0.3.0: nl.transpose gives PSUM which nc_matmul rejects as stationary.
+                # Round-trip weights through HBM so load_transpose2d produces SBUF.
+                _wh = nl.ndarray((_TILE_M, _TILE_M), dtype=weights.dtype, buffer=nl.shared_hbm)
+                nl.store(_wh, value=weights)
+                weights_t = nl.load_transpose2d(_wh)  # (128,128) SBUF — stationary for nc_matmul
                 nisa.nc_matmul(out_psum, weights_t, v_tile, accumulate=True)
 
             _op = nl.ndarray((_TILE_M, head_dim), dtype=nl.float32)
@@ -382,8 +383,11 @@ if HAS_NKI:
                 dP = nl.subtract(_dpp, _dpn)
                 dS = nl.multiply(P, nl.subtract(dP, d_m))
 
-                # nc_matmul(nl.transpose(dS), k_sbuf) = dS @ K_ki (scale baked into q_scaled_blocks)
-                nisa.nc_matmul(dq_psum, nl.transpose(dS), k_sbuf, accumulate=True)
+                # Round-trip dS through HBM so load_transpose2d gives SBUF stationary.
+                _dsh = nl.ndarray((_TILE_M, _TILE_M), dtype=dS.dtype, buffer=nl.shared_hbm)
+                nl.store(_dsh, value=dS)
+                dS_t = nl.load_transpose2d(_dsh)  # SBUF (transposed) — stationary
+                nisa.nc_matmul(dq_psum, dS_t, k_sbuf, accumulate=True)
 
             _dqp = nl.ndarray((_TILE_M, head_dim), dtype=nl.float32)
             _dqn = nl.ndarray((_TILE_M, head_dim), dtype=nl.float32)
