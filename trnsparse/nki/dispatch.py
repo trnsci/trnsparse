@@ -403,7 +403,8 @@ def _nki_screened_spmm_impl(
     N_pad = N if N <= _TILE_N else _round_up(N, _TILE_N)
     needs_pad = (M_pad != M) or (N_pad != N)
 
-    threshold_sqrt_t = torch.tensor(threshold_sqrt, dtype=A.dtype)
+    # NKI 0.3.0: all tensors must be ≥2D; reshape scalar to (1,1).
+    threshold_sqrt_t = torch.tensor([[threshold_sqrt]], dtype=A.dtype)
 
     try:
         if needs_pad:
@@ -837,10 +838,15 @@ def nki_bsr_attn_bwd(
 
     row_first, col_first = _attn_bwd_gather(Q, K, V, dO, O, mask_bsr, scale, row_max, row_denom)
 
-    # Pack contiguous inputs. NKI 0.3.0: all row vectors (trailing dim=b)
-    # must be 2D (partition, free) — unsqueeze (..., b) → (..., b, 1).
+    # Pack contiguous inputs. NKI 0.3.0: row vectors (2D/3D tensors with
+    # trailing dim=b like D_blocks, row_max, row_denom) must be ≥2D in the
+    # kernel — unsqueeze (..., b) → (..., b, 1). Skip 4D tensors (gathered
+    # Q/K/V/dO which have shape (..., b, head_dim)) to avoid false positives
+    # when head_dim == b.
     def _u(t: torch.Tensor) -> torch.Tensor:
-        return t.unsqueeze(-1).contiguous() if t.shape[-1] == b else t.contiguous()
+        if t.ndim <= 3 and t.shape[-1] == b:
+            return t.unsqueeze(-1).contiguous()
+        return t.contiguous()
 
     rf = {k: _u(v) for k, v in row_first.items()}
     cf = {k: _u(v) for k, v in col_first.items()}
