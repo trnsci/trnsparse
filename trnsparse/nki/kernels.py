@@ -71,7 +71,7 @@ if HAS_NKI:
                     b_tile = nl.load(b_gathered[m, k, :, n * TILE_N : (n + 1) * TILE_N])
                     nisa.nc_matmul(psum, a_t, b_tile, accumulate=True)
 
-                c_sbuf = nisa.activation(psum, dtype=blocks_pad.dtype)
+                c_sbuf = nl.copy(nisa.activation(psum), dtype=blocks_pad.dtype)
                 nl.store(
                     out[m * TILE_M : (m + 1) * TILE_M, n * TILE_N : (n + 1) * TILE_N],
                     value=c_sbuf,
@@ -137,7 +137,7 @@ if HAS_NKI:
 
                     nisa.nc_matmul(psum, a_t, b_tile, accumulate=True)
 
-                c_sbuf = nisa.activation(psum, dtype=a.dtype)
+                c_sbuf = nl.copy(nisa.activation(psum), dtype=a.dtype)
                 nl.store(
                     c[m_off : m_off + TILE_M, n_off : n_off + TILE_N],
                     value=c_sbuf,
@@ -190,7 +190,7 @@ if HAS_NKI:
                         )
                         nisa.nc_matmul(score_psum, q_c, k_c, accumulate=True)
 
-                score = nisa.activation(score_psum, dtype=q_scaled_blocks.dtype)
+                score = nisa.activation(score_psum)
                 t_max = nl.max(score, axis=1)
                 stable = score - t_max.reshape((_TILE_M, 1))
                 t_sum = nl.sum(nl.exp(stable), axis=1)
@@ -255,7 +255,7 @@ if HAS_NKI:
                         )
                         nisa.nc_matmul(score_psum, q_c, k_c, accumulate=True)
 
-                score = nisa.activation(score_psum, dtype=q_scaled_blocks.dtype)
+                score = nisa.activation(score_psum)
                 stable = score - row_max_m.reshape((_TILE_M, 1))
                 weights = nl.exp(stable) / row_denom_m.reshape((_TILE_M, 1))
 
@@ -263,7 +263,7 @@ if HAS_NKI:
                 weights_t = nl.transpose(weights)
                 nisa.nc_matmul(out_psum, weights_t, v_tile, accumulate=True)
 
-            out_sbuf = nisa.activation(out_psum, dtype=q_scaled_blocks.dtype)
+            out_sbuf = nl.copy(nisa.activation(out_psum), dtype=q_scaled_blocks.dtype)
             nl.store(out[m * _TILE_M : (m + 1) * _TILE_M, :], value=out_sbuf)
 
         return out
@@ -331,7 +331,7 @@ if HAS_NKI:
                         )
                         nisa.nc_matmul(score_psum, q_c, k_c, accumulate=True)
 
-                score = nisa.activation(score_psum, dtype=q_scaled_blocks.dtype)
+                score = nisa.activation(score_psum)
                 stable = score - row_max_m.reshape((_TILE_M, 1))
                 P = nl.exp(stable) / row_denom_m.reshape((_TILE_M, 1))
 
@@ -351,13 +351,13 @@ if HAS_NKI:
                         )
                         nisa.nc_matmul(dp_psum, do_c, v_c, accumulate=True)
 
-                dP = nisa.activation(dp_psum, dtype=q_scaled_blocks.dtype)
+                dP = nisa.activation(dp_psum)
                 dS = P * (dP - d_m.reshape((_TILE_M, 1)))
 
                 # nc_matmul(nl.transpose(dS), k_sbuf) = dS @ K_ki (scale baked into q_scaled_blocks)
                 nisa.nc_matmul(dq_psum, nl.transpose(dS), k_sbuf, accumulate=True)
 
-            dq_sbuf = nisa.activation(dq_psum, dtype=q_scaled_blocks.dtype)
+            dq_sbuf = nl.copy(nisa.activation(dq_psum), dtype=q_scaled_blocks.dtype)
             nl.store(dQ[m * _TILE_M : (m + 1) * _TILE_M, :], value=dq_sbuf)
 
         return dQ
@@ -433,7 +433,7 @@ if HAS_NKI:
                         )
                         nisa.nc_matmul(score_psum, q_c, k_c, accumulate=True)
 
-                score = nisa.activation(score_psum, dtype=k_blocks.dtype)
+                score = nisa.activation(score_psum)
                 P = nl.exp(score - row_max_mi.reshape((_TILE_M, 1))) / row_denom_mi.reshape(
                     (_TILE_M, 1)
                 )
@@ -452,7 +452,7 @@ if HAS_NKI:
                         )
                         nisa.nc_matmul(dp_psum, do_c, v_c, accumulate=True)
 
-                dP = nisa.activation(dp_psum, dtype=k_blocks.dtype)
+                dP = nisa.activation(dp_psum)
                 dS = P * (dP - d_mi.reshape((_TILE_M, 1)))
 
                 # nc_matmul(dS, q_sbuf) = dS.T @ Q_m (scale baked into q_gathered_col)
@@ -461,10 +461,10 @@ if HAS_NKI:
                 # nc_matmul(P, do_sbuf) = P.T @ dO_m
                 nisa.nc_matmul(dv_psum, P, do_sbuf, accumulate=True)
 
-            dk_sbuf = nisa.activation(dk_psum, dtype=k_blocks.dtype)
+            dk_sbuf = nl.copy(nisa.activation(dk_psum), dtype=k_blocks.dtype)
             nl.store(dK[ki * _TILE_M : (ki + 1) * _TILE_M, :], value=dk_sbuf)
 
-            dv_sbuf = nisa.activation(dv_psum, dtype=k_blocks.dtype)
+            dv_sbuf = nl.copy(nisa.activation(dv_psum), dtype=k_blocks.dtype)
             nl.store(dV[ki * _TILE_M : (ki + 1) * _TILE_M, :], value=dv_sbuf)
 
         return dK, dV
@@ -507,7 +507,7 @@ if HAS_NKI:
 
                     nisa.nc_matmul(psum, a_t, b_tile, accumulate=True)
 
-                c_sbuf = nisa.activation(psum, dtype=a.dtype)
+                c_sbuf = nl.copy(nisa.activation(psum), dtype=a.dtype)
                 nl.store(
                     c[m_off : m_off + TILE_M, n_off : n_off + TILE_N],
                     value=c_sbuf,
