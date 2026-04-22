@@ -71,9 +71,11 @@ if HAS_NKI:
                     b_tile = nl.load(b_gathered[m, k, :, n * TILE_N : (n + 1) * TILE_N])
                     nisa.nc_matmul(psum, a_t, b_tile, accumulate=True)
 
-                _psum_fp32 = nl.ndarray((TILE_M, TILE_N), dtype=nl.float32)
-                nisa.activation(_psum_fp32, nl.identity, psum)
-                c_sbuf = nl.copy(_psum_fp32, dtype=blocks_pad.dtype)
+                _pp = nl.ndarray((TILE_M, TILE_N), dtype=nl.float32)
+                _pn = nl.ndarray((TILE_M, TILE_N), dtype=nl.float32)
+                nisa.activation(_pp, nl.relu, psum)
+                nisa.activation(_pn, nl.relu, psum, scale=-1.0)
+                c_sbuf = nl.copy(_pp - _pn, dtype=blocks_pad.dtype)
                 nl.store(
                     out[m * TILE_M : (m + 1) * TILE_M, n * TILE_N : (n + 1) * TILE_N],
                     value=c_sbuf,
@@ -139,9 +141,11 @@ if HAS_NKI:
 
                     nisa.nc_matmul(psum, a_t, b_tile, accumulate=True)
 
-                _psum_fp32 = nl.ndarray((TILE_M, TILE_N), dtype=nl.float32)
-                nisa.activation(_psum_fp32, nl.identity, psum)
-                c_sbuf = nl.copy(_psum_fp32, dtype=a.dtype)
+                _pp = nl.ndarray((TILE_M, TILE_N), dtype=nl.float32)
+                _pn = nl.ndarray((TILE_M, TILE_N), dtype=nl.float32)
+                nisa.activation(_pp, nl.relu, psum)
+                nisa.activation(_pn, nl.relu, psum, scale=-1.0)
+                c_sbuf = nl.copy(_pp - _pn, dtype=a.dtype)
                 nl.store(
                     c[m_off : m_off + TILE_M, n_off : n_off + TILE_N],
                     value=c_sbuf,
@@ -194,10 +198,8 @@ if HAS_NKI:
                         )
                         nisa.nc_matmul(score_psum, q_c, k_c, accumulate=True)
 
-                score = nl.ndarray((_TILE_M, _TILE_M), dtype=nl.float32)
-                nisa.activation(score, nl.identity, score_psum)
-                t_max = nl.max(score, axis=1)
-                stable = score - t_max.reshape((_TILE_M, 1))
+                t_max = nl.max(score_psum, axis=1)
+                stable = score_psum - t_max.reshape((_TILE_M, 1))
                 t_sum = nl.sum(nl.exp(stable), axis=1)
 
                 nl.store(tile_max[m, ki, :], value=t_max)
@@ -260,18 +262,18 @@ if HAS_NKI:
                         )
                         nisa.nc_matmul(score_psum, q_c, k_c, accumulate=True)
 
-                score = nl.ndarray((_TILE_M, _TILE_M), dtype=nl.float32)
-                nisa.activation(score, nl.identity, score_psum)
-                stable = score - row_max_m.reshape((_TILE_M, 1))
+                stable = score_psum - row_max_m.reshape((_TILE_M, 1))
                 weights = nl.exp(stable) / row_denom_m.reshape((_TILE_M, 1))
 
                 # nc_matmul(weights_t, v_tile) = weights @ V — K=128 block dim, unchanged
                 weights_t = nl.transpose(weights)
                 nisa.nc_matmul(out_psum, weights_t, v_tile, accumulate=True)
 
-            _out_fp32 = nl.ndarray((_TILE_M, head_dim), dtype=nl.float32)
-            nisa.activation(_out_fp32, nl.identity, out_psum)
-            out_sbuf = nl.copy(_out_fp32, dtype=q_scaled_blocks.dtype)
+            _op = nl.ndarray((_TILE_M, head_dim), dtype=nl.float32)
+            _on = nl.ndarray((_TILE_M, head_dim), dtype=nl.float32)
+            nisa.activation(_op, nl.relu, out_psum)
+            nisa.activation(_on, nl.relu, out_psum, scale=-1.0)
+            out_sbuf = nl.copy(_op - _on, dtype=q_scaled_blocks.dtype)
             nl.store(out[m * _TILE_M : (m + 1) * _TILE_M, :], value=out_sbuf)
 
         return out
@@ -339,9 +341,7 @@ if HAS_NKI:
                         )
                         nisa.nc_matmul(score_psum, q_c, k_c, accumulate=True)
 
-                score = nl.ndarray((_TILE_M, _TILE_M), dtype=nl.float32)
-                nisa.activation(score, nl.identity, score_psum)
-                stable = score - row_max_m.reshape((_TILE_M, 1))
+                stable = score_psum - row_max_m.reshape((_TILE_M, 1))
                 P = nl.exp(stable) / row_denom_m.reshape((_TILE_M, 1))
 
                 # dP = dO_m @ V_ki.T
@@ -360,16 +360,16 @@ if HAS_NKI:
                         )
                         nisa.nc_matmul(dp_psum, do_c, v_c, accumulate=True)
 
-                dP = nl.ndarray((_TILE_M, _TILE_M), dtype=nl.float32)
-                nisa.activation(dP, nl.identity, dp_psum)
-                dS = P * (dP - d_m.reshape((_TILE_M, 1)))
+                dS = P * (dp_psum - d_m.reshape((_TILE_M, 1)))
 
                 # nc_matmul(nl.transpose(dS), k_sbuf) = dS @ K_ki (scale baked into q_scaled_blocks)
                 nisa.nc_matmul(dq_psum, nl.transpose(dS), k_sbuf, accumulate=True)
 
-            _dq_fp32 = nl.ndarray((_TILE_M, head_dim), dtype=nl.float32)
-            nisa.activation(_dq_fp32, nl.identity, dq_psum)
-            dq_sbuf = nl.copy(_dq_fp32, dtype=q_scaled_blocks.dtype)
+            _dqp = nl.ndarray((_TILE_M, head_dim), dtype=nl.float32)
+            _dqn = nl.ndarray((_TILE_M, head_dim), dtype=nl.float32)
+            nisa.activation(_dqp, nl.relu, dq_psum)
+            nisa.activation(_dqn, nl.relu, dq_psum, scale=-1.0)
+            dq_sbuf = nl.copy(_dqp - _dqn, dtype=q_scaled_blocks.dtype)
             nl.store(dQ[m * _TILE_M : (m + 1) * _TILE_M, :], value=dq_sbuf)
 
         return dQ
@@ -445,9 +445,7 @@ if HAS_NKI:
                         )
                         nisa.nc_matmul(score_psum, q_c, k_c, accumulate=True)
 
-                score = nl.ndarray((_TILE_M, _TILE_M), dtype=nl.float32)
-                nisa.activation(score, nl.identity, score_psum)
-                P = nl.exp(score - row_max_mi.reshape((_TILE_M, 1))) / row_denom_mi.reshape(
+                P = nl.exp(score_psum - row_max_mi.reshape((_TILE_M, 1))) / row_denom_mi.reshape(
                     (_TILE_M, 1)
                 )
 
@@ -465,9 +463,7 @@ if HAS_NKI:
                         )
                         nisa.nc_matmul(dp_psum, do_c, v_c, accumulate=True)
 
-                dP = nl.ndarray((_TILE_M, _TILE_M), dtype=nl.float32)
-                nisa.activation(dP, nl.identity, dp_psum)
-                dS = P * (dP - d_mi.reshape((_TILE_M, 1)))
+                dS = P * (dp_psum - d_mi.reshape((_TILE_M, 1)))
 
                 # nc_matmul(dS, q_sbuf) = dS.T @ Q_m (scale baked into q_gathered_col)
                 nisa.nc_matmul(dk_psum, dS, q_sbuf, accumulate=True)
@@ -475,14 +471,18 @@ if HAS_NKI:
                 # nc_matmul(P, do_sbuf) = P.T @ dO_m
                 nisa.nc_matmul(dv_psum, P, do_sbuf, accumulate=True)
 
-            _dk_fp32 = nl.ndarray((_TILE_M, head_dim), dtype=nl.float32)
-            nisa.activation(_dk_fp32, nl.identity, dk_psum)
-            dk_sbuf = nl.copy(_dk_fp32, dtype=k_blocks.dtype)
+            _dkp = nl.ndarray((_TILE_M, head_dim), dtype=nl.float32)
+            _dkn = nl.ndarray((_TILE_M, head_dim), dtype=nl.float32)
+            nisa.activation(_dkp, nl.relu, dk_psum)
+            nisa.activation(_dkn, nl.relu, dk_psum, scale=-1.0)
+            dk_sbuf = nl.copy(_dkp - _dkn, dtype=k_blocks.dtype)
             nl.store(dK[ki * _TILE_M : (ki + 1) * _TILE_M, :], value=dk_sbuf)
 
-            _dv_fp32 = nl.ndarray((_TILE_M, head_dim), dtype=nl.float32)
-            nisa.activation(_dv_fp32, nl.identity, dv_psum)
-            dv_sbuf = nl.copy(_dv_fp32, dtype=k_blocks.dtype)
+            _dvp = nl.ndarray((_TILE_M, head_dim), dtype=nl.float32)
+            _dvn = nl.ndarray((_TILE_M, head_dim), dtype=nl.float32)
+            nisa.activation(_dvp, nl.relu, dv_psum)
+            nisa.activation(_dvn, nl.relu, dv_psum, scale=-1.0)
+            dv_sbuf = nl.copy(_dvp - _dvn, dtype=k_blocks.dtype)
             nl.store(dV[ki * _TILE_M : (ki + 1) * _TILE_M, :], value=dv_sbuf)
 
         return dK, dV
@@ -525,9 +525,11 @@ if HAS_NKI:
 
                     nisa.nc_matmul(psum, a_t, b_tile, accumulate=True)
 
-                _psum_fp32 = nl.ndarray((TILE_M, TILE_N), dtype=nl.float32)
-                nisa.activation(_psum_fp32, nl.identity, psum)
-                c_sbuf = nl.copy(_psum_fp32, dtype=a.dtype)
+                _pp = nl.ndarray((TILE_M, TILE_N), dtype=nl.float32)
+                _pn = nl.ndarray((TILE_M, TILE_N), dtype=nl.float32)
+                nisa.activation(_pp, nl.relu, psum)
+                nisa.activation(_pn, nl.relu, psum, scale=-1.0)
+                c_sbuf = nl.copy(_pp - _pn, dtype=a.dtype)
                 nl.store(
                     c[m_off : m_off + TILE_M, n_off : n_off + TILE_N],
                     value=c_sbuf,
