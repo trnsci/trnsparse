@@ -126,7 +126,7 @@ if HAS_NKI:
 
                     # Outer-product pair bound (TILE_M, TILE_K). nl broadcasting
                     # via explicit reshape — partition-dim-safe.
-                    pair_bound = q_m.reshape((TILE_M, 1)) * q_k.reshape((1, TILE_K))
+                    pair_bound = nl.multiply(q_m.reshape((TILE_M, 1)), q_k.reshape((1, TILE_K)))
                     mask = nl.greater(pair_bound, threshold_sqrt)
                     a_masked = nl.multiply(a_tile, mask.astype(a.dtype))
 
@@ -198,8 +198,13 @@ if HAS_NKI:
                         )
                         nisa.nc_matmul(score_psum, q_c, k_c, accumulate=True)
 
-                t_max = nl.max(score_psum, axis=1)
-                stable = score_psum - t_max.reshape((_TILE_M, 1))
+                _ssp = nl.ndarray((_TILE_M, _TILE_M), dtype=nl.float32)
+                _ssn = nl.ndarray((_TILE_M, _TILE_M), dtype=nl.float32)
+                nisa.activation(_ssp, nl.relu, score_psum)
+                nisa.activation(_ssn, nl.relu, score_psum, scale=-1.0)
+                score = nl.subtract(_ssp, _ssn)
+                t_max = nl.max(score, axis=1)
+                stable = nl.subtract(score, t_max.reshape((_TILE_M, 1)))
                 t_sum = nl.sum(nl.exp(stable), axis=1)
 
                 nl.store(tile_max[m, ki, :], value=t_max)
@@ -262,8 +267,13 @@ if HAS_NKI:
                         )
                         nisa.nc_matmul(score_psum, q_c, k_c, accumulate=True)
 
-                stable = score_psum - row_max_m.reshape((_TILE_M, 1))
-                weights = nl.exp(stable) / row_denom_m.reshape((_TILE_M, 1))
+                _ssp = nl.ndarray((_TILE_M, _TILE_M), dtype=nl.float32)
+                _ssn = nl.ndarray((_TILE_M, _TILE_M), dtype=nl.float32)
+                nisa.activation(_ssp, nl.relu, score_psum)
+                nisa.activation(_ssn, nl.relu, score_psum, scale=-1.0)
+                score = nl.subtract(_ssp, _ssn)
+                stable = nl.subtract(score, row_max_m.reshape((_TILE_M, 1)))
+                weights = nl.divide(nl.exp(stable), row_denom_m.reshape((_TILE_M, 1)))
 
                 # nc_matmul(weights_t, v_tile) = weights @ V — K=128 block dim, unchanged
                 weights_t = nl.transpose(weights)
@@ -341,8 +351,13 @@ if HAS_NKI:
                         )
                         nisa.nc_matmul(score_psum, q_c, k_c, accumulate=True)
 
-                stable = score_psum - row_max_m.reshape((_TILE_M, 1))
-                P = nl.exp(stable) / row_denom_m.reshape((_TILE_M, 1))
+                _ssp = nl.ndarray((_TILE_M, _TILE_M), dtype=nl.float32)
+                _ssn = nl.ndarray((_TILE_M, _TILE_M), dtype=nl.float32)
+                nisa.activation(_ssp, nl.relu, score_psum)
+                nisa.activation(_ssn, nl.relu, score_psum, scale=-1.0)
+                score = nl.subtract(_ssp, _ssn)
+                stable = nl.subtract(score, row_max_m.reshape((_TILE_M, 1)))
+                P = nl.divide(nl.exp(stable), row_denom_m.reshape((_TILE_M, 1)))
 
                 # dP = dO_m @ V_ki.T
                 dp_psum = nl.zeros((_TILE_M, _TILE_M), dtype=nl.float32, buffer=nl.psum)
@@ -360,7 +375,12 @@ if HAS_NKI:
                         )
                         nisa.nc_matmul(dp_psum, do_c, v_c, accumulate=True)
 
-                dS = P * (dp_psum - d_m.reshape((_TILE_M, 1)))
+                _dpp = nl.ndarray((_TILE_M, _TILE_M), dtype=nl.float32)
+                _dpn = nl.ndarray((_TILE_M, _TILE_M), dtype=nl.float32)
+                nisa.activation(_dpp, nl.relu, dp_psum)
+                nisa.activation(_dpn, nl.relu, dp_psum, scale=-1.0)
+                dP = nl.subtract(_dpp, _dpn)
+                dS = nl.multiply(P, nl.subtract(dP, d_m.reshape((_TILE_M, 1))))
 
                 # nc_matmul(nl.transpose(dS), k_sbuf) = dS @ K_ki (scale baked into q_scaled_blocks)
                 nisa.nc_matmul(dq_psum, nl.transpose(dS), k_sbuf, accumulate=True)
@@ -445,9 +465,13 @@ if HAS_NKI:
                         )
                         nisa.nc_matmul(score_psum, q_c, k_c, accumulate=True)
 
-                P = nl.exp(score_psum - row_max_mi.reshape((_TILE_M, 1))) / row_denom_mi.reshape(
-                    (_TILE_M, 1)
-                )
+                _ssp = nl.ndarray((_TILE_M, _TILE_M), dtype=nl.float32)
+                _ssn = nl.ndarray((_TILE_M, _TILE_M), dtype=nl.float32)
+                nisa.activation(_ssp, nl.relu, score_psum)
+                nisa.activation(_ssn, nl.relu, score_psum, scale=-1.0)
+                score = nl.subtract(_ssp, _ssn)
+                stable_s = nl.subtract(score, row_max_mi.reshape((_TILE_M, 1)))
+                P = nl.divide(nl.exp(stable_s), row_denom_mi.reshape((_TILE_M, 1)))
 
                 # dP = dO_m @ V_ki.T
                 dp_psum = nl.zeros((_TILE_M, _TILE_M), dtype=nl.float32, buffer=nl.psum)
@@ -463,7 +487,12 @@ if HAS_NKI:
                         )
                         nisa.nc_matmul(dp_psum, do_c, v_c, accumulate=True)
 
-                dS = P * (dp_psum - d_mi.reshape((_TILE_M, 1)))
+                _dpp = nl.ndarray((_TILE_M, _TILE_M), dtype=nl.float32)
+                _dpn = nl.ndarray((_TILE_M, _TILE_M), dtype=nl.float32)
+                nisa.activation(_dpp, nl.relu, dp_psum)
+                nisa.activation(_dpn, nl.relu, dp_psum, scale=-1.0)
+                dP = nl.subtract(_dpp, _dpn)
+                dS = nl.multiply(P, nl.subtract(dP, d_mi.reshape((_TILE_M, 1))))
 
                 # nc_matmul(dS, q_sbuf) = dS.T @ Q_m (scale baked into q_gathered_col)
                 nisa.nc_matmul(dk_psum, dS, q_sbuf, accumulate=True)
