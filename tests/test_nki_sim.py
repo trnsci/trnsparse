@@ -168,6 +168,9 @@ class TestAttnTiledSimulator:
         t_max = torch.from_numpy(np.asarray(t_max_np))
         t_sum = torch.from_numpy(np.asarray(t_sum_np))
 
+        # NKI 0.3.0 keepdims: output may be (M_tiles, K_max, block_size, 1)
+        t_max = t_max.squeeze(-1) if t_max.dim() == 4 else t_max
+        t_sum = t_sum.squeeze(-1) if t_sum.dim() == 4 else t_sum
         assert t_max.shape == (M_tiles, K_max, block_size), f"tile_max shape: {t_max.shape}"
         assert t_sum.shape == (M_tiles, K_max, block_size), f"tile_sumexp shape: {t_sum.shape}"
 

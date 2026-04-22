@@ -244,8 +244,8 @@ if HAS_NKI:
         )
 
         for m in nl.affine_range(M_tiles):
-            row_max_m = nl.load(row_max[m, :])
-            row_denom_m = nl.load(row_denom[m, :])
+            row_max_m = nl.load(row_max[m, :, :])  # (128, 1)
+            row_denom_m = nl.load(row_denom[m, :, :])
 
             out_psum = nl.zeros((_TILE_M, head_dim), dtype=nl.float32, buffer=nl.psum)
 
@@ -272,8 +272,8 @@ if HAS_NKI:
                 nisa.activation(_ssp, nl.relu, score_psum)
                 nisa.activation(_ssn, nl.relu, score_psum, scale=-1.0)
                 score = nl.subtract(_ssp, _ssn)
-                stable = nl.subtract(score, row_max_m.reshape((_TILE_M, 1)))
-                weights = nl.divide(nl.exp(stable), row_denom_m.reshape((_TILE_M, 1)))
+                stable = nl.subtract(score, row_max_m)
+                weights = nl.divide(nl.exp(stable), row_denom_m)
 
                 # nc_matmul(weights_t, v_tile) = weights @ V — K=128 block dim, unchanged
                 weights_t = nl.transpose(weights)
@@ -325,9 +325,9 @@ if HAS_NKI:
         )
 
         for m in nl.affine_range(M_tiles):
-            row_max_m = nl.load(row_max[m, :])
-            row_denom_m = nl.load(row_denom[m, :])
-            d_m = nl.load(D_blocks[m, :])
+            row_max_m = nl.load(row_max[m, :, :])  # (128, 1)
+            row_denom_m = nl.load(row_denom[m, :, :])
+            d_m = nl.load(D_blocks[m, :, :])  # (128, 1)
 
             dq_psum = nl.zeros((_TILE_M, head_dim), dtype=nl.float32, buffer=nl.psum)
 
@@ -356,8 +356,8 @@ if HAS_NKI:
                 nisa.activation(_ssp, nl.relu, score_psum)
                 nisa.activation(_ssn, nl.relu, score_psum, scale=-1.0)
                 score = nl.subtract(_ssp, _ssn)
-                stable = nl.subtract(score, row_max_m.reshape((_TILE_M, 1)))
-                P = nl.divide(nl.exp(stable), row_denom_m.reshape((_TILE_M, 1)))
+                stable = nl.subtract(score, row_max_m)
+                P = nl.divide(nl.exp(stable), row_denom_m)
 
                 # dP = dO_m @ V_ki.T
                 dp_psum = nl.zeros((_TILE_M, _TILE_M), dtype=nl.float32, buffer=nl.psum)
@@ -380,7 +380,7 @@ if HAS_NKI:
                 nisa.activation(_dpp, nl.relu, dp_psum)
                 nisa.activation(_dpn, nl.relu, dp_psum, scale=-1.0)
                 dP = nl.subtract(_dpp, _dpn)
-                dS = nl.multiply(P, nl.subtract(dP, d_m.reshape((_TILE_M, 1))))
+                dS = nl.multiply(P, nl.subtract(dP, d_m))
 
                 # nc_matmul(nl.transpose(dS), k_sbuf) = dS @ K_ki (scale baked into q_scaled_blocks)
                 nisa.nc_matmul(dq_psum, nl.transpose(dS), k_sbuf, accumulate=True)
@@ -447,9 +447,9 @@ if HAS_NKI:
                     q_sbuf = nl.load(q_gathered_col[ki, mi, :, :])  # (128, head_dim)
                     do_sbuf = nl.load(do_gathered_col[ki, mi, :, :])  # (128, head_dim)
 
-                d_mi = nl.load(D_gathered_col[ki, mi, :])
-                row_max_mi = nl.load(row_max_gathered_col[ki, mi, :])
-                row_denom_mi = nl.load(row_denom_gathered_col[ki, mi, :])
+                d_mi = nl.load(D_gathered_col[ki, mi, :, :])  # (128, 1)
+                row_max_mi = nl.load(row_max_gathered_col[ki, mi, :, :])
+                row_denom_mi = nl.load(row_denom_gathered_col[ki, mi, :, :])
 
                 # score = Q_m @ K_ki.T
                 score_psum = nl.zeros((_TILE_M, _TILE_M), dtype=nl.float32, buffer=nl.psum)
@@ -470,8 +470,8 @@ if HAS_NKI:
                 nisa.activation(_ssp, nl.relu, score_psum)
                 nisa.activation(_ssn, nl.relu, score_psum, scale=-1.0)
                 score = nl.subtract(_ssp, _ssn)
-                stable_s = nl.subtract(score, row_max_mi.reshape((_TILE_M, 1)))
-                P = nl.divide(nl.exp(stable_s), row_denom_mi.reshape((_TILE_M, 1)))
+                stable_s = nl.subtract(score, row_max_mi)
+                P = nl.divide(nl.exp(stable_s), row_denom_mi)
 
                 # dP = dO_m @ V_ki.T
                 dp_psum = nl.zeros((_TILE_M, _TILE_M), dtype=nl.float32, buffer=nl.psum)
@@ -492,7 +492,7 @@ if HAS_NKI:
                 nisa.activation(_dpp, nl.relu, dp_psum)
                 nisa.activation(_dpn, nl.relu, dp_psum, scale=-1.0)
                 dP = nl.subtract(_dpp, _dpn)
-                dS = nl.multiply(P, nl.subtract(dP, d_mi.reshape((_TILE_M, 1))))
+                dS = nl.multiply(P, nl.subtract(dP, d_mi))
 
                 # nc_matmul(dS, q_sbuf) = dS.T @ Q_m (scale baked into q_gathered_col)
                 nisa.nc_matmul(dk_psum, dS, q_sbuf, accumulate=True)

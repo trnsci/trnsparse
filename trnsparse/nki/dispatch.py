@@ -628,8 +628,9 @@ def nki_bsr_attn_tiled(
                 tile_sumexp = tile_sumexp.squeeze(-1)
 
             row_max, row_denom = _attn_host_reduction(tile_max, tile_sumexp)
-            rm = row_max.contiguous()
-            rd = row_denom.contiguous()
+            # NKI 0.3.0: row vectors must be 2D for nl.load; unsqueeze (M,128) → (M,128,1)
+            rm = row_max.unsqueeze(-1).contiguous()
+            rd = row_denom.unsqueeze(-1).contiguous()
 
             out_np = nki.simulate(_attn_out_kernel)(
                 qs.cpu().numpy(),
@@ -649,8 +650,8 @@ def nki_bsr_attn_tiled(
                 tile_sumexp = tile_sumexp.squeeze(-1)
 
             row_max, row_denom = _attn_host_reduction(tile_max, tile_sumexp)
-            rm = row_max.contiguous()
-            rd = row_denom.contiguous()
+            rm = row_max.unsqueeze(-1).contiguous()
+            rd = row_denom.unsqueeze(-1).contiguous()
 
             (rm_x, rd_x), _ = _to_xla(rm, rd)
             result_x = _attn_out_kernel(qs_x, kg_x, vg_x, rm_x, rd_x)
@@ -834,9 +835,13 @@ def nki_bsr_attn_bwd(
 
     row_first, col_first = _attn_bwd_gather(Q, K, V, dO, O, mask_bsr, scale, row_max, row_denom)
 
-    # Pack contiguous inputs.
-    rf = {k: v.contiguous() for k, v in row_first.items()}
-    cf = {k: v.contiguous() for k, v in col_first.items()}
+    # Pack contiguous inputs. NKI 0.3.0: all row vectors (trailing dim=b)
+    # must be 2D (partition, free) — unsqueeze (..., b) → (..., b, 1).
+    def _u(t: torch.Tensor) -> torch.Tensor:
+        return t.unsqueeze(-1).contiguous() if t.shape[-1] == b else t.contiguous()
+
+    rf = {k: _u(v) for k, v in row_first.items()}
+    cf = {k: _u(v) for k, v in col_first.items()}
 
     try:
         if _use_simulator():
