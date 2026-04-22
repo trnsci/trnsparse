@@ -75,7 +75,7 @@ if HAS_NKI:
                 _pn = nl.ndarray((TILE_M, TILE_N), dtype=nl.float32)
                 nisa.activation(_pp, nl.relu, psum)
                 nisa.activation(_pn, nl.relu, psum, scale=-1.0)
-                c_sbuf = nl.copy(_pp - _pn, dtype=blocks_pad.dtype)
+                c_sbuf = nl.copy(nl.subtract(_pp, _pn), dtype=blocks_pad.dtype)
                 nl.store(
                     out[m * TILE_M : (m + 1) * TILE_M, n * TILE_N : (n + 1) * TILE_N],
                     value=c_sbuf,
@@ -145,7 +145,7 @@ if HAS_NKI:
                 _pn = nl.ndarray((TILE_M, TILE_N), dtype=nl.float32)
                 nisa.activation(_pp, nl.relu, psum)
                 nisa.activation(_pn, nl.relu, psum, scale=-1.0)
-                c_sbuf = nl.copy(_pp - _pn, dtype=a.dtype)
+                c_sbuf = nl.copy(nl.subtract(_pp, _pn), dtype=a.dtype)
                 nl.store(
                     c[m_off : m_off + TILE_M, n_off : n_off + TILE_N],
                     value=c_sbuf,
@@ -273,7 +273,7 @@ if HAS_NKI:
             _on = nl.ndarray((_TILE_M, head_dim), dtype=nl.float32)
             nisa.activation(_op, nl.relu, out_psum)
             nisa.activation(_on, nl.relu, out_psum, scale=-1.0)
-            out_sbuf = nl.copy(_op - _on, dtype=q_scaled_blocks.dtype)
+            out_sbuf = nl.copy(nl.subtract(_op, _on), dtype=q_scaled_blocks.dtype)
             nl.store(out[m * _TILE_M : (m + 1) * _TILE_M, :], value=out_sbuf)
 
         return out
@@ -369,7 +369,7 @@ if HAS_NKI:
             _dqn = nl.ndarray((_TILE_M, head_dim), dtype=nl.float32)
             nisa.activation(_dqp, nl.relu, dq_psum)
             nisa.activation(_dqn, nl.relu, dq_psum, scale=-1.0)
-            dq_sbuf = nl.copy(_dqp - _dqn, dtype=q_scaled_blocks.dtype)
+            dq_sbuf = nl.copy(nl.subtract(_dqp, _dqn), dtype=q_scaled_blocks.dtype)
             nl.store(dQ[m * _TILE_M : (m + 1) * _TILE_M, :], value=dq_sbuf)
 
         return dQ
@@ -475,14 +475,14 @@ if HAS_NKI:
             _dkn = nl.ndarray((_TILE_M, head_dim), dtype=nl.float32)
             nisa.activation(_dkp, nl.relu, dk_psum)
             nisa.activation(_dkn, nl.relu, dk_psum, scale=-1.0)
-            dk_sbuf = nl.copy(_dkp - _dkn, dtype=k_blocks.dtype)
+            dk_sbuf = nl.copy(nl.subtract(_dkp, _dkn), dtype=k_blocks.dtype)
             nl.store(dK[ki * _TILE_M : (ki + 1) * _TILE_M, :], value=dk_sbuf)
 
             _dvp = nl.ndarray((_TILE_M, head_dim), dtype=nl.float32)
             _dvn = nl.ndarray((_TILE_M, head_dim), dtype=nl.float32)
             nisa.activation(_dvp, nl.relu, dv_psum)
             nisa.activation(_dvn, nl.relu, dv_psum, scale=-1.0)
-            dv_sbuf = nl.copy(_dvp - _dvn, dtype=k_blocks.dtype)
+            dv_sbuf = nl.copy(nl.subtract(_dvp, _dvn), dtype=k_blocks.dtype)
             nl.store(dV[ki * _TILE_M : (ki + 1) * _TILE_M, :], value=dv_sbuf)
 
         return dK, dV
@@ -529,7 +529,7 @@ if HAS_NKI:
                 _pn = nl.ndarray((TILE_M, TILE_N), dtype=nl.float32)
                 nisa.activation(_pp, nl.relu, psum)
                 nisa.activation(_pn, nl.relu, psum, scale=-1.0)
-                c_sbuf = nl.copy(_pp - _pn, dtype=a.dtype)
+                c_sbuf = nl.copy(nl.subtract(_pp, _pn), dtype=a.dtype)
                 nl.store(
                     c[m_off : m_off + TILE_M, n_off : n_off + TILE_N],
                     value=c_sbuf,
