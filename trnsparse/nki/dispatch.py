@@ -912,11 +912,11 @@ def nki_bsr_attn_bwd(
             dK_raw = dK_x.to(orig_device)
             dV_raw = dV_x.to(orig_device)
 
-        # dQ and dK need the scale factor: the kernel computes dS@K and dS.T@Q
-        # (gradient w.r.t. Q_scaled = Q*scale), but dL/dQ = dL/d(Q_scaled) * scale.
+        # dQ needs scale: kernel gives dS@K (gradient w.r.t. Q_scaled=Q*scale),
+        # but dL/dQ = dL/d(Q_scaled)*scale. dK already has scale via q_sbuf=Q*scale.
         return (
             dQ_raw[:seq_len, :head_dim].contiguous() * scale,
-            dK_raw[:seq_len, :head_dim].contiguous() * scale,
+            dK_raw[:seq_len, :head_dim].contiguous(),
             dV_raw[:seq_len, :head_dim].contiguous(),
         )
     except Exception:
