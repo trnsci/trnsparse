@@ -128,8 +128,9 @@ if HAS_NKI:
                     # Outer-product pair bound (TILE_M, TILE_K) via (TILE_M,1)*(1,TILE_K) broadcast.
                     pair_bound = nl.multiply(q_m, q_k)
                     mask = nl.greater(pair_bound, threshold_sqrt)
-                    # NkiTensor has no .astype() — nl.multiply handles bool mask directly
-                    a_masked = nl.multiply(a_tile, mask)
+                    # Convert bool mask to float (True→1.0, False→0.0) via add 0.0
+                    mask_f = nl.add(mask, 0.0)
+                    a_masked = nl.multiply(a_tile, mask_f)
 
                     # nl.transpose gives PSUM in NKI 0.3.0 which nc_matmul rejects as
                     # stationary. Store a_masked to HBM and reload transposed.
