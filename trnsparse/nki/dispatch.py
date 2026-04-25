@@ -403,7 +403,8 @@ def _nki_screened_spmm_impl(
     N_pad = N if N <= _TILE_N else _round_up(N, _TILE_N)
     needs_pad = (M_pad != M) or (N_pad != N)
 
-    threshold_sqrt_t = torch.tensor(threshold_sqrt, dtype=A.dtype)
+    # NKI 0.3.0: all tensors must be ≥2D; reshape scalar to (1,1).
+    threshold_sqrt_t = torch.tensor([[threshold_sqrt]], dtype=A.dtype)
 
     try:
         if needs_pad:
@@ -416,6 +417,8 @@ def _nki_screened_spmm_impl(
             A_feed, Q_feed, B_feed = A_p.contiguous(), Q_p.contiguous(), B_p.contiguous()
         else:
             A_feed, Q_feed, B_feed = A.contiguous(), Q.contiguous(), B.contiguous()
+        # NKI 0.3.0: nl.load requires 2D tensors; unsqueeze Q from (M,) to (M,1)
+        Q_feed = Q_feed.unsqueeze(-1).contiguous()
 
         if _use_simulator():
             out_np = nki.simulate(_screened_spmm_kernel)(
@@ -622,10 +625,15 @@ def nki_bsr_attn_tiled(
             )
             tile_max = torch.from_numpy(np.asarray(tile_max_np)).to(Q.device)
             tile_sumexp = torch.from_numpy(np.asarray(tile_sumexp_np)).to(Q.device)
+            # NKI 0.3.0 keepdims: tile_max/tile_sumexp are (M_tiles, K_max, 128, 1)
+            if tile_max.dim() == 4:
+                tile_max = tile_max.squeeze(-1)
+                tile_sumexp = tile_sumexp.squeeze(-1)
 
             row_max, row_denom = _attn_host_reduction(tile_max, tile_sumexp)
-            rm = row_max.contiguous()
-            rd = row_denom.contiguous()
+            # NKI 0.3.0: row vectors must be 2D for nl.load; unsqueeze (M,128) → (M,128,1)
+            rm = row_max.unsqueeze(-1).contiguous()
+            rd = row_denom.unsqueeze(-1).contiguous()
 
             out_np = nki.simulate(_attn_out_kernel)(
                 qs.cpu().numpy(),
@@ -640,10 +648,13 @@ def nki_bsr_attn_tiled(
             tile_max_x, tile_sumexp_x = _attn_stats_kernel(qs_x, kg_x)
             tile_max = tile_max_x.to(orig_device)
             tile_sumexp = tile_sumexp_x.to(orig_device)
+            if tile_max.dim() == 4:
+                tile_max = tile_max.squeeze(-1)
+                tile_sumexp = tile_sumexp.squeeze(-1)
 
             row_max, row_denom = _attn_host_reduction(tile_max, tile_sumexp)
-            rm = row_max.contiguous()
-            rd = row_denom.contiguous()
+            rm = row_max.unsqueeze(-1).contiguous()
+            rd = row_denom.unsqueeze(-1).contiguous()
 
             (rm_x, rd_x), _ = _to_xla(rm, rd)
             result_x = _attn_out_kernel(qs_x, kg_x, vg_x, rm_x, rd_x)
@@ -827,9 +838,18 @@ def nki_bsr_attn_bwd(
 
     row_first, col_first = _attn_bwd_gather(Q, K, V, dO, O, mask_bsr, scale, row_max, row_denom)
 
-    # Pack contiguous inputs.
-    rf = {k: v.contiguous() for k, v in row_first.items()}
-    cf = {k: v.contiguous() for k, v in col_first.items()}
+    # Pack contiguous inputs. NKI 0.3.0: row vectors (2D/3D tensors with
+    # trailing dim=b like D_blocks, row_max, row_denom) must be ≥2D in the
+    # kernel — unsqueeze (..., b) → (..., b, 1). Skip 4D tensors (gathered
+    # Q/K/V/dO which have shape (..., b, head_dim)) to avoid false positives
+    # when head_dim == b.
+    def _u(t: torch.Tensor) -> torch.Tensor:
+        if t.ndim <= 3 and t.shape[-1] == b:
+            return t.unsqueeze(-1).contiguous()
+        return t.contiguous()
+
+    rf = {k: _u(v) for k, v in row_first.items()}
+    cf = {k: _u(v) for k, v in col_first.items()}
 
     try:
         if _use_simulator():
@@ -839,8 +859,8 @@ def nki_bsr_attn_bwd(
                 rf["v_gathered"].cpu().numpy(),
                 rf["do_gathered"].cpu().numpy(),
                 rf["D_blocks"].cpu().numpy(),
-                row_max.contiguous().cpu().numpy(),
-                row_denom.contiguous().cpu().numpy(),
+                row_max.unsqueeze(-1).contiguous().cpu().numpy(),
+                row_denom.unsqueeze(-1).contiguous().cpu().numpy(),
             )
             dQ_raw = torch.from_numpy(np.asarray(dQ_np)).to(Q.device)
 
@@ -873,8 +893,8 @@ def nki_bsr_attn_bwd(
                 rf["v_gathered"],
                 rf["do_gathered"],
                 rf["D_blocks"],
-                row_max.contiguous(),
-                row_denom.contiguous(),
+                row_max.unsqueeze(-1).contiguous(),
+                row_denom.unsqueeze(-1).contiguous(),
             )
             dQ_x = _attn_bwd_dq_kernel(qs_x, kg_x, vg_x, dog_x, db_x, rm_x, rd_x)
             dQ_raw = dQ_x.to(orig_device)
@@ -892,8 +912,10 @@ def nki_bsr_attn_bwd(
             dK_raw = dK_x.to(orig_device)
             dV_raw = dV_x.to(orig_device)
 
+        # dQ needs scale: kernel gives dS@K (gradient w.r.t. Q_scaled=Q*scale),
+        # but dL/dQ = dL/d(Q_scaled)*scale. dK already has scale via q_sbuf=Q*scale.
         return (
-            dQ_raw[:seq_len, :head_dim].contiguous(),
+            dQ_raw[:seq_len, :head_dim].contiguous() * scale,
             dK_raw[:seq_len, :head_dim].contiguous(),
             dV_raw[:seq_len, :head_dim].contiguous(),
         )

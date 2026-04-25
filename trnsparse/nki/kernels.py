@@ -69,9 +69,13 @@ if HAS_NKI:
                 for k in nl.affine_range(K_max):
                     a_t = nl.load_transpose2d(blocks_pad[m, k, :, :])
                     b_tile = nl.load(b_gathered[m, k, :, n * TILE_N : (n + 1) * TILE_N])
-                    psum[...] += nisa.nc_matmul(a_t, b_tile)
+                    nisa.nc_matmul(psum, a_t, b_tile, accumulate=True)
 
-                c_sbuf = nl.copy(psum, dtype=blocks_pad.dtype)
+                _pp = nl.ndarray((TILE_M, TILE_N), dtype=nl.float32)
+                _pn = nl.ndarray((TILE_M, TILE_N), dtype=nl.float32)
+                nisa.activation(_pp, nl.relu, psum)
+                nisa.activation(_pn, nl.relu, psum, scale=-1.0)
+                c_sbuf = nl.copy(nl.subtract(_pp, _pn), dtype=blocks_pad.dtype)
                 nl.store(
                     out[m * TILE_M : (m + 1) * TILE_M, n * TILE_N : (n + 1) * TILE_N],
                     value=c_sbuf,
@@ -111,33 +115,37 @@ if HAS_NKI:
 
                 psum = nl.zeros((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
 
-                # Row Q slice used for every k-tile in this (m, n) output tile.
-                q_m = nl.load(q[m_off : m_off + TILE_M])  # (TILE_M,)
+                # q is (M, 1) 2D — load as (TILE_M, 1) to satisfy NKI 2D constraint.
+                q_m = nl.load(q[m_off : m_off + TILE_M, :])  # (TILE_M, 1)
 
                 for k in nl.affine_range(K // TILE_K):
                     k_off = k * TILE_K
 
                     a_tile = nl.load(a[m_off : m_off + TILE_M, k_off : k_off + TILE_K])
-                    q_k = nl.load(q[k_off : k_off + TILE_K])  # (TILE_K,)
+                    # load_transpose2d on (TILE_K, 1) → (1, TILE_K) for the outer product
+                    q_k = nl.load_transpose2d(q[k_off : k_off + TILE_K, :])  # (1, TILE_K)
 
-                    # Outer-product pair bound (TILE_M, TILE_K). nl broadcasting
-                    # via explicit reshape — partition-dim-safe.
-                    pair_bound = q_m.reshape((TILE_M, 1)) * q_k.reshape((1, TILE_K))
+                    # Outer-product pair bound (TILE_M, TILE_K) via (TILE_M,1)*(1,TILE_K) broadcast.
+                    pair_bound = nl.multiply(q_m, q_k)
                     mask = nl.greater(pair_bound, threshold_sqrt)
-                    a_masked = nl.multiply(a_tile, mask.astype(a.dtype))
+                    # Convert bool mask to float (True→1.0, False→0.0) via add 0.0
+                    mask_f = nl.add(mask, 0.0)
+                    a_masked = nl.multiply(a_tile, mask_f)
 
-                    # Transpose for stationary-A nc_matmul via a staging buffer.
-                    # nl.load_transpose2d loads+transposes from HBM, but a_masked
-                    # is already in SBUF, so we need to store-and-reload or use
-                    # an in-SBUF transpose primitive. nl.transpose is available
-                    # in NKI 0.3.0; if the simulator rejects, fall back to
-                    # storing to an HBM staging tile and load_transpose2d-ing.
-                    a_t = nl.transpose(a_masked)
+                    # nl.transpose gives PSUM in NKI 0.3.0 which nc_matmul rejects as
+                    # stationary. Store a_masked to HBM and reload transposed.
+                    _ah = nl.ndarray((TILE_M, TILE_K), dtype=a.dtype, buffer=nl.shared_hbm)
+                    nl.store(_ah, value=a_masked)
+                    a_t = nl.load_transpose2d(_ah)  # SBUF (transposed)
                     b_tile = nl.load(b[k_off : k_off + TILE_K, n_off : n_off + TILE_N])
 
-                    psum[...] += nisa.nc_matmul(a_t, b_tile)
+                    nisa.nc_matmul(psum, a_t, b_tile, accumulate=True)
 
-                c_sbuf = nl.copy(psum, dtype=a.dtype)
+                _pp = nl.ndarray((TILE_M, TILE_N), dtype=nl.float32)
+                _pn = nl.ndarray((TILE_M, TILE_N), dtype=nl.float32)
+                nisa.activation(_pp, nl.relu, psum)
+                nisa.activation(_pn, nl.relu, psum, scale=-1.0)
+                c_sbuf = nl.copy(nl.subtract(_pp, _pn), dtype=a.dtype)
                 nl.store(
                     c[m_off : m_off + TILE_M, n_off : n_off + TILE_N],
                     value=c_sbuf,
@@ -165,10 +173,10 @@ if HAS_NKI:
         _, _, head_dim = q_scaled_blocks.shape
 
         tile_max = nl.ndarray(
-            (M_tiles, K_max, _TILE_M), dtype=q_scaled_blocks.dtype, buffer=nl.shared_hbm
+            (M_tiles, K_max, _TILE_M, 1), dtype=q_scaled_blocks.dtype, buffer=nl.shared_hbm
         )
         tile_sumexp = nl.ndarray(
-            (M_tiles, K_max, _TILE_M), dtype=q_scaled_blocks.dtype, buffer=nl.shared_hbm
+            (M_tiles, K_max, _TILE_M, 1), dtype=q_scaled_blocks.dtype, buffer=nl.shared_hbm
         )
 
         for m in nl.affine_range(M_tiles):
@@ -178,25 +186,29 @@ if HAS_NKI:
                     # NKI 0.3.0 simulator: nc_matmul's moving arg cannot be loaded with
                     # load_transpose2d — use nl.load + nl.transpose for K (moving tile).
                     q_t = nl.load_transpose2d(q_scaled_blocks[m, :, :])  # stationary
-                    k_t = nl.transpose(nl.load(k_gathered_pad[m, ki, :, :]))  # moving
-                    score_psum[...] += nisa.nc_matmul(q_t, k_t)
+                    k_t = nl.load_transpose2d(k_gathered_pad[m, ki, :, :])  # moving
+                    nisa.nc_matmul(score_psum, q_t, k_t, accumulate=True)
                 else:
                     for hd in nl.affine_range(head_dim // _TILE_K):
                         q_c = nl.load_transpose2d(
                             q_scaled_blocks[m, :, hd * _TILE_K : (hd + 1) * _TILE_K]
                         )
-                        k_c = nl.transpose(
-                            nl.load(k_gathered_pad[m, ki, :, hd * _TILE_K : (hd + 1) * _TILE_K])
+                        k_c = nl.load_transpose2d(
+                            k_gathered_pad[m, ki, :, hd * _TILE_K : (hd + 1) * _TILE_K]
                         )
-                        score_psum[...] += nisa.nc_matmul(q_c, k_c)
+                        nisa.nc_matmul(score_psum, q_c, k_c, accumulate=True)
 
-                score = nl.copy(score_psum, dtype=q_scaled_blocks.dtype)
-                t_max = nl.max(score, axis=1)
-                stable = score - t_max.reshape((_TILE_M, 1))
-                t_sum = nl.sum(nl.exp(stable), axis=1)
+                _ssp = nl.ndarray((_TILE_M, _TILE_M), dtype=nl.float32)
+                _ssn = nl.ndarray((_TILE_M, _TILE_M), dtype=nl.float32)
+                nisa.activation(_ssp, nl.relu, score_psum)
+                nisa.activation(_ssn, nl.relu, score_psum, scale=-1.0)
+                score = nl.subtract(_ssp, _ssn)
+                t_max = nl.max(score, axis=1, keepdims=True)
+                stable = nl.subtract(score, t_max)
+                t_sum = nl.sum(nl.exp(stable), axis=1, keepdims=True)
 
-                nl.store(tile_max[m, ki, :], value=t_max)
-                nl.store(tile_sumexp[m, ki, :], value=t_sum)
+                nl.store(tile_max[m, ki, :, :], value=t_max)
+                nl.store(tile_sumexp[m, ki, :, :], value=t_sum)
 
         return tile_max, tile_sumexp
 
@@ -232,8 +244,8 @@ if HAS_NKI:
         )
 
         for m in nl.affine_range(M_tiles):
-            row_max_m = nl.load(row_max[m, :])
-            row_denom_m = nl.load(row_denom[m, :])
+            row_max_m = nl.load(row_max[m, :, :])  # (128, 1)
+            row_denom_m = nl.load(row_denom[m, :, :])
 
             out_psum = nl.zeros((_TILE_M, head_dim), dtype=nl.float32, buffer=nl.psum)
 
@@ -243,27 +255,38 @@ if HAS_NKI:
                 score_psum = nl.zeros((_TILE_M, _TILE_M), dtype=nl.float32, buffer=nl.psum)
                 if head_dim <= _TILE_K:
                     q_t = nl.load_transpose2d(q_scaled_blocks[m, :, :])  # stationary
-                    k_t = nl.transpose(nl.load(k_gathered_pad[m, ki, :, :]))  # moving
-                    score_psum[...] += nisa.nc_matmul(q_t, k_t)
+                    k_t = nl.load_transpose2d(k_gathered_pad[m, ki, :, :])  # moving
+                    nisa.nc_matmul(score_psum, q_t, k_t, accumulate=True)
                 else:
                     for hd in nl.affine_range(head_dim // _TILE_K):
                         q_c = nl.load_transpose2d(
                             q_scaled_blocks[m, :, hd * _TILE_K : (hd + 1) * _TILE_K]
                         )
-                        k_c = nl.transpose(
-                            nl.load(k_gathered_pad[m, ki, :, hd * _TILE_K : (hd + 1) * _TILE_K])
+                        k_c = nl.load_transpose2d(
+                            k_gathered_pad[m, ki, :, hd * _TILE_K : (hd + 1) * _TILE_K]
                         )
-                        score_psum[...] += nisa.nc_matmul(q_c, k_c)
+                        nisa.nc_matmul(score_psum, q_c, k_c, accumulate=True)
 
-                score = nl.copy(score_psum, dtype=q_scaled_blocks.dtype)
-                stable = score - row_max_m.reshape((_TILE_M, 1))
-                weights = nl.exp(stable) / row_denom_m.reshape((_TILE_M, 1))
+                _ssp = nl.ndarray((_TILE_M, _TILE_M), dtype=nl.float32)
+                _ssn = nl.ndarray((_TILE_M, _TILE_M), dtype=nl.float32)
+                nisa.activation(_ssp, nl.relu, score_psum)
+                nisa.activation(_ssn, nl.relu, score_psum, scale=-1.0)
+                score = nl.subtract(_ssp, _ssn)
+                stable = nl.subtract(score, row_max_m)
+                weights = nl.divide(nl.exp(stable), row_denom_m)
 
-                # nc_matmul(weights_t, v_tile) = weights @ V — K=128 block dim, unchanged
-                weights_t = nl.transpose(weights)
-                out_psum[...] += nisa.nc_matmul(weights_t, v_tile)
+                # NKI 0.3.0: nl.transpose gives PSUM which nc_matmul rejects as stationary.
+                # Round-trip weights through HBM so load_transpose2d produces SBUF.
+                _wh = nl.ndarray((_TILE_M, _TILE_M), dtype=weights.dtype, buffer=nl.shared_hbm)
+                nl.store(_wh, value=weights)
+                weights_t = nl.load_transpose2d(_wh)  # (128,128) SBUF — stationary for nc_matmul
+                nisa.nc_matmul(out_psum, weights_t, v_tile, accumulate=True)
 
-            out_sbuf = nl.copy(out_psum, dtype=q_scaled_blocks.dtype)
+            _op = nl.ndarray((_TILE_M, head_dim), dtype=nl.float32)
+            _on = nl.ndarray((_TILE_M, head_dim), dtype=nl.float32)
+            nisa.activation(_op, nl.relu, out_psum)
+            nisa.activation(_on, nl.relu, out_psum, scale=-1.0)
+            out_sbuf = nl.copy(nl.subtract(_op, _on), dtype=q_scaled_blocks.dtype)
             nl.store(out[m * _TILE_M : (m + 1) * _TILE_M, :], value=out_sbuf)
 
         return out
@@ -305,59 +328,74 @@ if HAS_NKI:
         )
 
         for m in nl.affine_range(M_tiles):
-            row_max_m = nl.load(row_max[m, :])
-            row_denom_m = nl.load(row_denom[m, :])
-            d_m = nl.load(D_blocks[m, :])
+            row_max_m = nl.load(row_max[m, :, :])  # (128, 1)
+            row_denom_m = nl.load(row_denom[m, :, :])
+            d_m = nl.load(D_blocks[m, :, :])  # (128, 1)
 
             dq_psum = nl.zeros((_TILE_M, head_dim), dtype=nl.float32, buffer=nl.psum)
 
             for ki in nl.affine_range(K_max):
                 # k_sbuf = K_ki as (128, head_dim) for nc_matmul(nl.transpose(dS), k_sbuf) = dS @ K
-                k_sbuf = nl.load(k_gathered_pad[m, ki, :, :])  # (128, head_dim) for both paths
+                k_sbuf = nl.load(k_gathered_pad[m, ki, :, :])  # (128, head_dim) moving for dQ
 
                 # score = Q_m @ K_ki.T
                 score_psum = nl.zeros((_TILE_M, _TILE_M), dtype=nl.float32, buffer=nl.psum)
                 if head_dim <= _TILE_K:
                     q_t = nl.load_transpose2d(q_scaled_blocks[m, :, :])  # stationary
-                    k_t = nl.transpose(k_sbuf)  # moving — nl.transpose avoids load_transpose2d
-                    score_psum[...] += nisa.nc_matmul(q_t, k_t)
+                    k_t = nl.load_transpose2d(k_gathered_pad[m, ki, :, :])  # moving
+                    nisa.nc_matmul(score_psum, q_t, k_t, accumulate=True)
                 else:
                     for hd in nl.affine_range(head_dim // _TILE_K):
                         q_c = nl.load_transpose2d(
                             q_scaled_blocks[m, :, hd * _TILE_K : (hd + 1) * _TILE_K]
                         )
-                        k_c = nl.transpose(
-                            nl.load(k_gathered_pad[m, ki, :, hd * _TILE_K : (hd + 1) * _TILE_K])
+                        k_c = nl.load_transpose2d(
+                            k_gathered_pad[m, ki, :, hd * _TILE_K : (hd + 1) * _TILE_K]
                         )
-                        score_psum[...] += nisa.nc_matmul(q_c, k_c)
+                        nisa.nc_matmul(score_psum, q_c, k_c, accumulate=True)
 
-                score = nl.copy(score_psum, dtype=q_scaled_blocks.dtype)
-                stable = score - row_max_m.reshape((_TILE_M, 1))
-                P = nl.exp(stable) / row_denom_m.reshape((_TILE_M, 1))
+                _ssp = nl.ndarray((_TILE_M, _TILE_M), dtype=nl.float32)
+                _ssn = nl.ndarray((_TILE_M, _TILE_M), dtype=nl.float32)
+                nisa.activation(_ssp, nl.relu, score_psum)
+                nisa.activation(_ssn, nl.relu, score_psum, scale=-1.0)
+                score = nl.subtract(_ssp, _ssn)
+                stable = nl.subtract(score, row_max_m)
+                P = nl.divide(nl.exp(stable), row_denom_m)
 
                 # dP = dO_m @ V_ki.T
                 dp_psum = nl.zeros((_TILE_M, _TILE_M), dtype=nl.float32, buffer=nl.psum)
                 if head_dim <= _TILE_K:
                     do_t = nl.load_transpose2d(do_gathered_pad[m, ki, :, :])  # stationary
-                    v_t = nl.transpose(nl.load(v_gathered_pad[m, ki, :, :]))  # moving
-                    dp_psum[...] += nisa.nc_matmul(do_t, v_t)
+                    v_t = nl.load_transpose2d(v_gathered_pad[m, ki, :, :])  # moving
+                    nisa.nc_matmul(dp_psum, do_t, v_t, accumulate=True)
                 else:
                     for hd in nl.affine_range(head_dim // _TILE_K):
                         do_c = nl.load_transpose2d(
                             do_gathered_pad[m, ki, :, hd * _TILE_K : (hd + 1) * _TILE_K]
                         )
-                        v_c = nl.transpose(
-                            nl.load(v_gathered_pad[m, ki, :, hd * _TILE_K : (hd + 1) * _TILE_K])
+                        v_c = nl.load_transpose2d(
+                            v_gathered_pad[m, ki, :, hd * _TILE_K : (hd + 1) * _TILE_K]
                         )
-                        dp_psum[...] += nisa.nc_matmul(do_c, v_c)
+                        nisa.nc_matmul(dp_psum, do_c, v_c, accumulate=True)
 
-                dP = nl.copy(dp_psum, dtype=q_scaled_blocks.dtype)
-                dS = P * (dP - d_m.reshape((_TILE_M, 1)))
+                _dpp = nl.ndarray((_TILE_M, _TILE_M), dtype=nl.float32)
+                _dpn = nl.ndarray((_TILE_M, _TILE_M), dtype=nl.float32)
+                nisa.activation(_dpp, nl.relu, dp_psum)
+                nisa.activation(_dpn, nl.relu, dp_psum, scale=-1.0)
+                dP = nl.subtract(_dpp, _dpn)
+                dS = nl.multiply(P, nl.subtract(dP, d_m))
 
-                # nc_matmul(nl.transpose(dS), k_sbuf) = dS @ K_ki (scale baked into q_scaled_blocks)
-                dq_psum[...] += nisa.nc_matmul(nl.transpose(dS), k_sbuf)
+                # Round-trip dS through HBM so load_transpose2d gives SBUF stationary.
+                _dsh = nl.ndarray((_TILE_M, _TILE_M), dtype=dS.dtype, buffer=nl.shared_hbm)
+                nl.store(_dsh, value=dS)
+                dS_t = nl.load_transpose2d(_dsh)  # SBUF (transposed) — stationary
+                nisa.nc_matmul(dq_psum, dS_t, k_sbuf, accumulate=True)
 
-            dq_sbuf = nl.copy(dq_psum, dtype=q_scaled_blocks.dtype)
+            _dqp = nl.ndarray((_TILE_M, head_dim), dtype=nl.float32)
+            _dqn = nl.ndarray((_TILE_M, head_dim), dtype=nl.float32)
+            nisa.activation(_dqp, nl.relu, dq_psum)
+            nisa.activation(_dqn, nl.relu, dq_psum, scale=-1.0)
+            dq_sbuf = nl.copy(nl.subtract(_dqp, _dqn), dtype=q_scaled_blocks.dtype)
             nl.store(dQ[m * _TILE_M : (m + 1) * _TILE_M, :], value=dq_sbuf)
 
         return dQ
@@ -406,66 +444,80 @@ if HAS_NKI:
                 # nc_matmul args to be local to the innermost affine_range loop.
                 if head_dim <= _TILE_K:
                     q_t_mi = nl.load_transpose2d(q_gathered_col[ki, mi, :, :])  # stationary
-                    q_sbuf = nl.transpose(q_t_mi)
+                    q_sbuf = nl.load(q_gathered_col[ki, mi, :, :])  # (128, hd) moving for dK
                     do_t_mi = nl.load_transpose2d(do_gathered_col[ki, mi, :, :])  # stationary
-                    do_sbuf = nl.transpose(do_t_mi)
-                    # K/V as moving tiles: use nl.load + nl.transpose (not load_transpose2d)
-                    k_t = nl.transpose(nl.load(k_blocks[ki, :, :]))
-                    v_t = nl.transpose(nl.load(v_blocks[ki, :, :]))
+                    do_sbuf = nl.load(do_gathered_col[ki, mi, :, :])  # (128, hd) moving for dV
+                    k_t = nl.load_transpose2d(k_blocks[ki, :, :])  # moving for score
+                    v_t = nl.load_transpose2d(v_blocks[ki, :, :])  # moving for dP
                 else:
                     q_sbuf = nl.load(q_gathered_col[ki, mi, :, :])  # (128, head_dim)
                     do_sbuf = nl.load(do_gathered_col[ki, mi, :, :])  # (128, head_dim)
 
-                d_mi = nl.load(D_gathered_col[ki, mi, :])
-                row_max_mi = nl.load(row_max_gathered_col[ki, mi, :])
-                row_denom_mi = nl.load(row_denom_gathered_col[ki, mi, :])
+                d_mi = nl.load(D_gathered_col[ki, mi, :, :])  # (128, 1)
+                row_max_mi = nl.load(row_max_gathered_col[ki, mi, :, :])
+                row_denom_mi = nl.load(row_denom_gathered_col[ki, mi, :, :])
 
                 # score = Q_m @ K_ki.T
                 score_psum = nl.zeros((_TILE_M, _TILE_M), dtype=nl.float32, buffer=nl.psum)
                 if head_dim <= _TILE_K:
-                    score_psum[...] += nisa.nc_matmul(q_t_mi, k_t)
+                    nisa.nc_matmul(score_psum, q_t_mi, k_t, accumulate=True)
                 else:
                     for hd in nl.affine_range(head_dim // _TILE_K):
                         q_c = nl.load_transpose2d(
                             q_gathered_col[ki, mi, :, hd * _TILE_K : (hd + 1) * _TILE_K]
                         )
-                        k_c = nl.transpose(
-                            nl.load(k_blocks[ki, :, hd * _TILE_K : (hd + 1) * _TILE_K])
+                        k_c = nl.load_transpose2d(
+                            k_blocks[ki, :, hd * _TILE_K : (hd + 1) * _TILE_K]
                         )
-                        score_psum[...] += nisa.nc_matmul(q_c, k_c)
+                        nisa.nc_matmul(score_psum, q_c, k_c, accumulate=True)
 
-                score = nl.copy(score_psum, dtype=k_blocks.dtype)
-                P = nl.exp(score - row_max_mi.reshape((_TILE_M, 1))) / row_denom_mi.reshape(
-                    (_TILE_M, 1)
-                )
+                _ssp = nl.ndarray((_TILE_M, _TILE_M), dtype=nl.float32)
+                _ssn = nl.ndarray((_TILE_M, _TILE_M), dtype=nl.float32)
+                nisa.activation(_ssp, nl.relu, score_psum)
+                nisa.activation(_ssn, nl.relu, score_psum, scale=-1.0)
+                score = nl.subtract(_ssp, _ssn)
+                stable_s = nl.subtract(score, row_max_mi)
+                P = nl.divide(nl.exp(stable_s), row_denom_mi)
 
                 # dP = dO_m @ V_ki.T
                 dp_psum = nl.zeros((_TILE_M, _TILE_M), dtype=nl.float32, buffer=nl.psum)
                 if head_dim <= _TILE_K:
-                    dp_psum[...] += nisa.nc_matmul(do_t_mi, v_t)
+                    nisa.nc_matmul(dp_psum, do_t_mi, v_t, accumulate=True)
                 else:
                     for hd in nl.affine_range(head_dim // _TILE_K):
                         do_c = nl.load_transpose2d(
                             do_gathered_col[ki, mi, :, hd * _TILE_K : (hd + 1) * _TILE_K]
                         )
-                        v_c = nl.transpose(
-                            nl.load(v_blocks[ki, :, hd * _TILE_K : (hd + 1) * _TILE_K])
+                        v_c = nl.load_transpose2d(
+                            v_blocks[ki, :, hd * _TILE_K : (hd + 1) * _TILE_K]
                         )
-                        dp_psum[...] += nisa.nc_matmul(do_c, v_c)
+                        nisa.nc_matmul(dp_psum, do_c, v_c, accumulate=True)
 
-                dP = nl.copy(dp_psum, dtype=k_blocks.dtype)
-                dS = P * (dP - d_mi.reshape((_TILE_M, 1)))
+                _dpp = nl.ndarray((_TILE_M, _TILE_M), dtype=nl.float32)
+                _dpn = nl.ndarray((_TILE_M, _TILE_M), dtype=nl.float32)
+                nisa.activation(_dpp, nl.relu, dp_psum)
+                nisa.activation(_dpn, nl.relu, dp_psum, scale=-1.0)
+                dP = nl.subtract(_dpp, _dpn)
+                dS = nl.multiply(P, nl.subtract(dP, d_mi))
 
                 # nc_matmul(dS, q_sbuf) = dS.T @ Q_m (scale baked into q_gathered_col)
-                dk_psum[...] += nisa.nc_matmul(dS, q_sbuf)
+                nisa.nc_matmul(dk_psum, dS, q_sbuf, accumulate=True)
 
                 # nc_matmul(P, do_sbuf) = P.T @ dO_m
-                dv_psum[...] += nisa.nc_matmul(P, do_sbuf)
+                nisa.nc_matmul(dv_psum, P, do_sbuf, accumulate=True)
 
-            dk_sbuf = nl.copy(dk_psum, dtype=k_blocks.dtype)
+            _dkp = nl.ndarray((_TILE_M, head_dim), dtype=nl.float32)
+            _dkn = nl.ndarray((_TILE_M, head_dim), dtype=nl.float32)
+            nisa.activation(_dkp, nl.relu, dk_psum)
+            nisa.activation(_dkn, nl.relu, dk_psum, scale=-1.0)
+            dk_sbuf = nl.copy(nl.subtract(_dkp, _dkn), dtype=k_blocks.dtype)
             nl.store(dK[ki * _TILE_M : (ki + 1) * _TILE_M, :], value=dk_sbuf)
 
-            dv_sbuf = nl.copy(dv_psum, dtype=k_blocks.dtype)
+            _dvp = nl.ndarray((_TILE_M, head_dim), dtype=nl.float32)
+            _dvn = nl.ndarray((_TILE_M, head_dim), dtype=nl.float32)
+            nisa.activation(_dvp, nl.relu, dv_psum)
+            nisa.activation(_dvn, nl.relu, dv_psum, scale=-1.0)
+            dv_sbuf = nl.copy(nl.subtract(_dvp, _dvn), dtype=k_blocks.dtype)
             nl.store(dV[ki * _TILE_M : (ki + 1) * _TILE_M, :], value=dv_sbuf)
 
         return dK, dV
@@ -506,9 +558,13 @@ if HAS_NKI:
                     a_t = nl.load_transpose2d(a[m_off : m_off + TILE_M, k_off : k_off + TILE_K])
                     b_tile = nl.load(b[k_off : k_off + TILE_K, n_off : n_off + TILE_N])
 
-                    psum[...] += nisa.nc_matmul(a_t, b_tile)
+                    nisa.nc_matmul(psum, a_t, b_tile, accumulate=True)
 
-                c_sbuf = nl.copy(psum, dtype=a.dtype)
+                _pp = nl.ndarray((TILE_M, TILE_N), dtype=nl.float32)
+                _pn = nl.ndarray((TILE_M, TILE_N), dtype=nl.float32)
+                nisa.activation(_pp, nl.relu, psum)
+                nisa.activation(_pn, nl.relu, psum, scale=-1.0)
+                c_sbuf = nl.copy(nl.subtract(_pp, _pn), dtype=a.dtype)
                 nl.store(
                     c[m_off : m_off + TILE_M, n_off : n_off + TILE_N],
                     value=c_sbuf,
