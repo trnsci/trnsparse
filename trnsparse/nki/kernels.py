@@ -127,9 +127,10 @@ if HAS_NKI:
 
                     # Outer-product pair bound (TILE_M, TILE_K) via (TILE_M,1)*(1,TILE_K) broadcast.
                     pair_bound = nl.multiply(q_m, q_k)
-                    mask = nl.greater(pair_bound, threshold_sqrt)
-                    # Convert bool mask to float (True→1.0, False→0.0) via add 0.0
-                    mask_f = nl.add(mask, 0.0)
+                    # Soft 0/1 mask: relu(diff)/(relu(diff)+eps) = 0 where masked, ≈1 where not.
+                    # Avoids boolean→float conversion issues in NKI 0.3.0 simulator.
+                    relu_diff = nl.relu(nl.subtract(pair_bound, threshold_sqrt))
+                    mask_f = nl.divide(relu_diff, nl.add(relu_diff, 1e-10))
                     a_masked = nl.multiply(a_tile, mask_f)
 
                     # nl.transpose gives PSUM in NKI 0.3.0 which nc_matmul rejects as
