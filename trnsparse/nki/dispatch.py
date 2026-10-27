@@ -512,6 +512,24 @@ def nki_screened_spmm(
     return _ScreenedSpMMFunction.apply(A, diag_integrals, threshold, B)
 
 
+def _attn_slot_valid(mask_bsr, M_tiles: int, K_max: int) -> torch.Tensor:
+    """(M_tiles, K_max) bool: True where the k-slot holds a real block.
+
+    Rows with fewer than K_max blocks are padded with sentinel slots that
+    gather column block 0. Those slots must contribute nothing: callers zero
+    the gathered K/V (forward, dQ) or Q/dO (dK/dV) there and drop their
+    stats from the host softmax reduction.
+    """
+    counts = (mask_bsr.block_row_ptrs[1:] - mask_bsr.block_row_ptrs[:-1]).to(torch.long)
+    return torch.arange(K_max).unsqueeze(0) < counts[:M_tiles].unsqueeze(1)
+
+
+def _zero_invalid_slots(t: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+    """Zero `t[i, j, ...]` wherever `valid[i, j]` is False."""
+    shape = valid.shape + (1,) * (t.dim() - valid.dim())
+    return t * valid.view(shape).to(t.dtype)
+
+
 def _attn_gather(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, mask_bsr, scale: float):
     """Host-side gather for the two-pass NKI attention kernels.
 
@@ -559,8 +577,11 @@ def _attn_gather(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, mask_bsr, sc
     V_by_block = V.view(nb_rows, b, head_dim)
 
     safe_col = torch.where(col_grid >= 0, col_grid, torch.tensor(0, dtype=torch.long))
-    k_gathered_pad = K_by_block[safe_col]  # (M_tiles, K_max, b, head_dim)
-    v_gathered_pad = V_by_block[safe_col]  # (M_tiles, K_max, b, head_dim)
+    # Padded slots (col_grid == -1) gather block 0; zero K/V there so the
+    # slot adds nothing to weights @ V (its stats are dropped on the host).
+    valid = col_grid >= 0
+    k_gathered_pad = _zero_invalid_slots(K_by_block[safe_col], valid)  # (M_tiles, K_max, b, hd)
+    v_gathered_pad = _zero_invalid_slots(V_by_block[safe_col], valid)  # (M_tiles, K_max, b, hd)
 
     q_scaled_blocks = (Q * scale).view(M_tiles, b, head_dim)
 
@@ -577,7 +598,9 @@ def _attn_gather(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, mask_bsr, sc
     return q_scaled_blocks, k_gathered_pad, v_gathered_pad, K_max, M_tiles
 
 
-def _attn_host_reduction(tile_max: torch.Tensor, tile_sumexp: torch.Tensor) -> tuple:
+def _attn_host_reduction(
+    tile_max: torch.Tensor, tile_sumexp: torch.Tensor, valid: torch.Tensor | None = None
+) -> tuple:
     """Reduce per-block stats to per-row softmax denominators.
 
     Args:
@@ -587,7 +610,15 @@ def _attn_host_reduction(tile_max: torch.Tensor, tile_sumexp: torch.Tensor) -> t
     Returns:
         row_max:   (M_tiles, 128) — row-wise global max
         row_denom: (M_tiles, 128) — softmax denominator
+
+    `valid` (M_tiles, K_max) bool, if given, drops padded k-slots from the
+    reduction (rows with no valid slot keep all slots, as before).
     """
+    if valid is not None:
+        valid = valid | ~valid.any(dim=1, keepdim=True)
+        v = valid.unsqueeze(-1)
+        tile_max = torch.where(v, tile_max, torch.full_like(tile_max, float("-inf")))
+        tile_sumexp = torch.where(v, tile_sumexp, torch.zeros_like(tile_sumexp))
     row_max = tile_max.max(dim=1).values  # (M_tiles, 128)
     correction = torch.exp(tile_max - row_max.unsqueeze(1))  # (M_tiles, K_max, 128)
     row_denom = (tile_sumexp * correction).sum(dim=1)  # (M_tiles, 128)
@@ -629,6 +660,7 @@ def nki_bsr_attn_tiled(
     scale = head_dim**-0.5
 
     q_scaled, k_gathered, v_gathered, K_max, M_tiles = _attn_gather(Q, K, V, mask_bsr, scale)
+    slot_valid = _attn_slot_valid(mask_bsr, M_tiles, K_max)
     b = mask_bsr.block_size
 
     # Contiguous inputs for kernel dispatch.
@@ -648,7 +680,7 @@ def nki_bsr_attn_tiled(
                 tile_max = tile_max.squeeze(-1)
                 tile_sumexp = tile_sumexp.squeeze(-1)
 
-            row_max, row_denom = _attn_host_reduction(tile_max, tile_sumexp)
+            row_max, row_denom = _attn_host_reduction(tile_max, tile_sumexp, slot_valid)
             # NKI 0.3.0: row vectors must be 2D for nl.load; unsqueeze (M,128) → (M,128,1)
             rm = row_max.unsqueeze(-1).contiguous()
             rd = row_denom.unsqueeze(-1).contiguous()
@@ -670,7 +702,7 @@ def nki_bsr_attn_tiled(
                 tile_max = tile_max.squeeze(-1)
                 tile_sumexp = tile_sumexp.squeeze(-1)
 
-            row_max, row_denom = _attn_host_reduction(tile_max, tile_sumexp)
+            row_max, row_denom = _attn_host_reduction(tile_max, tile_sumexp, slot_valid)
             rm = row_max.unsqueeze(-1).contiguous()
             rd = row_denom.unsqueeze(-1).contiguous()
 
@@ -766,9 +798,15 @@ def _attn_bwd_gather(
     dO_by_block = dO.view(nb_rows, b, head_dim)
 
     q_scaled = (Q * scale).view(M_tiles, b, head_dim)
-    k_gathered = K_by_block[safe_col]  # (M_tiles, K_max, b, head_dim)
-    v_gathered = V_by_block[safe_col]  # (M_tiles, K_max, b, head_dim)
-    do_gathered = dO_by_block[safe_col]  # (M_tiles, K_max, b, head_dim)
+    # Padded slots gather block 0; zero K/V there so dS @ K and dO @ V.T
+    # contribute nothing to dQ.
+    row_valid = col_grid >= 0
+    k_gathered = _zero_invalid_slots(K_by_block[safe_col], row_valid)
+    v_gathered = _zero_invalid_slots(V_by_block[safe_col], row_valid)
+    # dP = dO_m @ V_ki.T needs the *row* block dO_m in every k-slot of row m
+    # (gathering by column index, as before, fed dO_ki and broke dQ whenever
+    # a row attends to a block other than its own).
+    do_gathered = dO_by_block.unsqueeze(1).expand(M_tiles, K_max, b, head_dim)
 
     # D = dO · O row-wise; reshape to (M_tiles, b) for block indexing.
     D_flat = (dO * O).sum(dim=-1)  # (seq_len,)
@@ -809,8 +847,11 @@ def _attn_bwd_gather(
     v_blocks = V.view(N_col, b, head_dim)
 
     # Gather Q_scaled, dO, D by row index; reuse views computed in row-first section.
-    q_gathered_col = q_scaled[safe_row]  # (N_col, K_max_col, b, head_dim)
-    do_gathered_col = dO_by_block[safe_row]  # (N_col, K_max_col, b, head_dim)
+    # Padded slots gather block-row 0; zero Q/dO there so dS.T @ Q and
+    # P.T @ dO contribute nothing to dK/dV.
+    col_valid = row_grid_col >= 0
+    q_gathered_col = _zero_invalid_slots(q_scaled[safe_row], col_valid)
+    do_gathered_col = _zero_invalid_slots(dO_by_block[safe_row], col_valid)
     D_gathered_col = D_blocks[safe_row]  # (N_col, K_max_col, b)
     row_max_gathered_col = row_max[safe_row]  # (N_col, K_max_col, b)
     row_denom_gathered_col = row_denom[safe_row]  # (N_col, K_max_col, b)

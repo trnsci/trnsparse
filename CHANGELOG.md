@@ -35,8 +35,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     atol=rtol=1e-2`, sized for an fp32 forward (the ops are linear in each
     input, so the larger eps adds no truncation error).
 
+- **Block-sparse attention: two host-side gather bugs** (pre-existing, masked
+  on Trn2 by the compile failures above; found with neuronx-cc BIRSim):
+  - Rows with fewer than `K_max` blocks were padded with sentinel k-slots that
+    gathered column block 0, so block 0 was counted again in the softmax and
+    in `weights @ V` (local-window masks: ~49% of outputs wrong). Padded slots
+    now have K/V (forward, dQ) or Q/dO (dK/dV) zeroed, and their stats are
+    dropped in `_attn_host_reduction`.
+  - `_attn_bwd_gather` gathered `dO` by column block instead of the row block
+    `dO_m`, breaking dQ whenever a row attends to a block other than itself
+    (~99% of dQ wrong). The two simulator xfails attributed to a "PSUM
+    accumulate bug" (`test_bwd_dq_parity_kmax2`, `test_backward_head_dim_256`)
+    were this bug and now pass.
+
 ### Added
 
+- `tests/test_attn_gather.py`: CPU regression tests for both gather bugs.
 - `tests/test_nki_compile.py` (`nki_simulator` marker): CPU MLIR
   verification (`source_to_mlir(...).verify()`) of every kernel for trn1
   and trn2, attention kernels at head_dim 64, 128 and 256; plus a full NEFF
