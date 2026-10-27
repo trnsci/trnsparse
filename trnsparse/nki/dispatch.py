@@ -94,6 +94,19 @@ def _to_xla(*tensors):
     return [t.to(device) for t in tensors], orig
 
 
+def _kernel_input(t: torch.Tensor) -> torch.Tensor:
+    """Cast a kernel operand to a dtype the NeuronCore datapath supports.
+
+    Trainium has no fp64 datapath; the native device silently hands fp64
+    operands to the kernel as fp32, and the kernel output (whose dtype
+    follows its input) then comes back as fp32. Downcast explicitly so the
+    kernel always sees fp32, and have callers cast the result back to the
+    caller's dtype — otherwise fp64 autograd inputs (gradcheck) hit a
+    float/double mix in the PyTorch-level backward.
+    """
+    return t.float() if t.dtype == torch.float64 else t
+
+
 def _csr_to_dense_padded(A) -> torch.Tensor:
     """Materialize a CSRMatrix into a dense (M, K) tensor.
 
@@ -133,6 +146,7 @@ def _nki_spmm_impl(A_dense: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
             A_feed, B_feed = A_p.contiguous(), B_p.contiguous()
         else:
             A_feed, B_feed = A_dense.contiguous(), B.contiguous()
+        A_feed, B_feed = _kernel_input(A_feed), _kernel_input(B_feed)
 
         if _use_simulator():
             # CPU-side: feed NumPy arrays to nki.simulate(kernel). Bypasses
@@ -144,6 +158,7 @@ def _nki_spmm_impl(A_dense: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
             c = _spmm_dense_kernel(a, b)
             result = c.to(orig_device)
 
+        result = result.to(A_dense.dtype)
         return result[:M, :N] if needs_pad else result
     except Exception:
         if _REQUIRE_NKI:
@@ -202,8 +217,8 @@ def _nki_bsr_spmm_impl(
     if not HAS_NKI:
         raise RuntimeError("NKI not available")
     try:
-        bp_feed = blocks_pad.contiguous()
-        bg_feed = b_gathered.contiguous()
+        bp_feed = _kernel_input(blocks_pad.contiguous())
+        bg_feed = _kernel_input(b_gathered.contiguous())
 
         if _use_simulator():
             out_np = nki.simulate(_bsr_spmm_kernel)(bp_feed.cpu().numpy(), bg_feed.cpu().numpy())
@@ -213,7 +228,7 @@ def _nki_bsr_spmm_impl(
             c = _bsr_spmm_kernel(bp, bg)
             result = c.to(orig_device)
 
-        return result[:out_rows, :out_cols].contiguous()
+        return result[:out_rows, :out_cols].to(blocks_pad.dtype).contiguous()
     except Exception:
         if _REQUIRE_NKI:
             raise
@@ -419,6 +434,8 @@ def _nki_screened_spmm_impl(
             A_feed, Q_feed, B_feed = A.contiguous(), Q.contiguous(), B.contiguous()
         # NKI 0.3.0: nl.load requires 2D tensors; unsqueeze Q from (M,) to (M,1)
         Q_feed = Q_feed.unsqueeze(-1).contiguous()
+        A_feed, Q_feed, B_feed = _kernel_input(A_feed), _kernel_input(Q_feed), _kernel_input(B_feed)
+        threshold_sqrt_t = _kernel_input(threshold_sqrt_t)
 
         if _use_simulator():
             out_np = nki.simulate(_screened_spmm_kernel)(
@@ -434,6 +451,7 @@ def _nki_screened_spmm_impl(
             c = _screened_spmm_kernel(a, q, ts, b)
             result = c.to(orig_device)
 
+        result = result.to(A.dtype)
         return result[:M, :N] if needs_pad else result
     except Exception:
         if _REQUIRE_NKI:
@@ -614,9 +632,9 @@ def nki_bsr_attn_tiled(
     b = mask_bsr.block_size
 
     # Contiguous inputs for kernel dispatch.
-    qs = q_scaled.contiguous()
-    kg = k_gathered.contiguous()
-    vg = v_gathered.contiguous()
+    qs = _kernel_input(q_scaled.contiguous())
+    kg = _kernel_input(k_gathered.contiguous())
+    vg = _kernel_input(v_gathered.contiguous())
 
     try:
         if _use_simulator():
@@ -660,7 +678,7 @@ def nki_bsr_attn_tiled(
             result_x = _attn_out_kernel(qs_x, kg_x, vg_x, rm_x, rd_x)
             result = result_x.to(orig_device)
 
-        out = result[:seq_len, :head_dim].contiguous()
+        out = result[:seq_len, :head_dim].to(Q.dtype).contiguous()
         if return_stats:
             # row_max/row_denom are already (M_tiles, b) from _attn_host_reduction.
             return out, row_max[:M_tiles, :b].contiguous(), row_denom[:M_tiles, :b].contiguous()
@@ -838,18 +856,24 @@ def nki_bsr_attn_bwd(
 
     row_first, col_first = _attn_bwd_gather(Q, K, V, dO, O, mask_bsr, scale, row_max, row_denom)
 
-    # Pack contiguous inputs. NKI 0.3.0: row vectors (2D/3D tensors with
-    # trailing dim=b like D_blocks, row_max, row_denom) must be ≥2D in the
-    # kernel — unsqueeze (..., b) → (..., b, 1). Skip 4D tensors (gathered
-    # Q/K/V/dO which have shape (..., b, head_dim)) to avoid false positives
-    # when head_dim == b.
-    def _u(t: torch.Tensor) -> torch.Tensor:
-        if t.ndim <= 3 and t.shape[-1] == b:
+    # Pack contiguous inputs. NKI: per-row stat vectors (D_blocks, D/row_max/
+    # row_denom gathered, trailing dim = b) must be ≥2D in the kernel —
+    # unsqueeze (..., b) → (..., b, 1). Select them by name: a shape test
+    # (`ndim <= 3 and shape[-1] == b`) also matched q_scaled / k_blocks /
+    # v_blocks, which are (tiles, b, head_dim) and collide when head_dim == b
+    # (head_dim=128, or the simulator's padded head_dim).
+    _stat_keys = {"D_blocks", "D_gathered", "row_max_gathered", "row_denom_gathered"}
+
+    def _u(key: str, t: torch.Tensor) -> torch.Tensor:
+        t = _kernel_input(t)
+        if key in _stat_keys:
             return t.unsqueeze(-1).contiguous()
         return t.contiguous()
 
-    rf = {k: _u(v) for k, v in row_first.items()}
-    cf = {k: _u(v) for k, v in col_first.items()}
+    rf = {k: _u(k, v) for k, v in row_first.items()}
+    cf = {k: _u(k, v) for k, v in col_first.items()}
+    rm_in = _kernel_input(row_max).unsqueeze(-1).contiguous()
+    rd_in = _kernel_input(row_denom).unsqueeze(-1).contiguous()
 
     try:
         if _use_simulator():
@@ -859,8 +883,8 @@ def nki_bsr_attn_bwd(
                 rf["v_gathered"].cpu().numpy(),
                 rf["do_gathered"].cpu().numpy(),
                 rf["D_blocks"].cpu().numpy(),
-                row_max.unsqueeze(-1).contiguous().cpu().numpy(),
-                row_denom.unsqueeze(-1).contiguous().cpu().numpy(),
+                rm_in.cpu().numpy(),
+                rd_in.cpu().numpy(),
             )
             dQ_raw = torch.from_numpy(np.asarray(dQ_np)).to(Q.device)
 
@@ -893,8 +917,8 @@ def nki_bsr_attn_bwd(
                 rf["v_gathered"],
                 rf["do_gathered"],
                 rf["D_blocks"],
-                row_max.unsqueeze(-1).contiguous(),
-                row_denom.unsqueeze(-1).contiguous(),
+                rm_in,
+                rd_in,
             )
             dQ_x = _attn_bwd_dq_kernel(qs_x, kg_x, vg_x, dog_x, db_x, rm_x, rd_x)
             dQ_raw = dQ_x.to(orig_device)
@@ -915,9 +939,9 @@ def nki_bsr_attn_bwd(
         # dQ needs scale: kernel gives dS@K (gradient w.r.t. Q_scaled=Q*scale),
         # but dL/dQ = dL/d(Q_scaled)*scale. dK already has scale via q_sbuf=Q*scale.
         return (
-            dQ_raw[:seq_len, :head_dim].contiguous() * scale,
-            dK_raw[:seq_len, :head_dim].contiguous(),
-            dV_raw[:seq_len, :head_dim].contiguous(),
+            dQ_raw[:seq_len, :head_dim].to(Q.dtype).contiguous() * scale,
+            dK_raw[:seq_len, :head_dim].to(Q.dtype).contiguous(),
+            dV_raw[:seq_len, :head_dim].to(Q.dtype).contiguous(),
         )
     except Exception:
         if _REQUIRE_NKI:

@@ -108,6 +108,11 @@ if HAS_NKI:
 
         c = nl.ndarray((M, N), dtype=a.dtype, buffer=nl.shared_hbm)
 
+        # threshold_sqrt is a (1, 1) HBM tensor. NKI 0.7 rejects a 1-partition
+        # scalar operand against a 128-partition tile, so broadcast it to a
+        # (TILE_M, 1) per-partition scalar once, up front.
+        thr = nl.broadcast_to(nl.load(threshold_sqrt), shape=(TILE_M, 1))
+
         for m in nl.affine_range(M // TILE_M):
             for n in nl.affine_range(N // TILE_N):
                 m_off = m * TILE_M
@@ -125,12 +130,19 @@ if HAS_NKI:
                     # load_transpose2d on (TILE_K, 1) → (1, TILE_K) for the outer product
                     q_k = nl.load_transpose2d(q[k_off : k_off + TILE_K, :])  # (1, TILE_K)
 
-                    # Outer-product pair bound (TILE_M, TILE_K) via (TILE_M,1)*(1,TILE_K) broadcast.
-                    pair_bound = nl.multiply(q_m, q_k)
+                    # Outer-product pair bound (TILE_M, TILE_K). NKI 0.7 lowers a
+                    # (TILE_M,1)*(1,TILE_K) multiply to tensor_scalar_arith with a
+                    # 1-partition dst, which the verifier rejects (partition element
+                    # count mismatch). Broadcast q_k across partitions first so the
+                    # multiply is a plain (P,F) x (P,1) tensor-scalar.
+                    q_k_b = nl.broadcast_to(q_k, shape=(TILE_M, TILE_K))
+                    pair_bound = nl.multiply(q_k_b, q_m)
                     # Soft 0/1 mask: relu(diff)/(relu(diff)+eps) = 0 where masked, ≈1 where not.
                     # Avoids boolean→float conversion issues in NKI 0.3.0 simulator.
-                    relu_diff = nl.relu(nl.subtract(pair_bound, threshold_sqrt))
-                    mask_f = nl.divide(relu_diff, nl.add(relu_diff, 1e-10))
+                    relu_diff = nl.relu(nl.subtract(pair_bound, thr))
+                    # NKI 0.7 / neuronx-cc 2.28: tensor_tensor `divide` fails ISA
+                    # validation (s3s3d3_tt_valid_op) — multiply by the reciprocal.
+                    mask_f = nl.multiply(relu_diff, nl.reciprocal(nl.add(relu_diff, 1e-10)))
                     a_masked = nl.multiply(a_tile, mask_f)
 
                     # nl.transpose gives PSUM in NKI 0.3.0 which nc_matmul rejects as
@@ -247,6 +259,9 @@ if HAS_NKI:
         for m in nl.affine_range(M_tiles):
             row_max_m = nl.load(row_max[m, :, :])  # (128, 1)
             row_denom_m = nl.load(row_denom[m, :, :])
+            # NKI 0.7: tensor_scalar_arith has no `divide`; multiply by the
+            # reciprocal of the (128, 1) softmax denominator instead.
+            row_denom_inv_m = nl.reciprocal(row_denom_m)
 
             out_psum = nl.zeros((_TILE_M, head_dim), dtype=nl.float32, buffer=nl.psum)
 
@@ -274,7 +289,7 @@ if HAS_NKI:
                 nisa.activation(_ssn, nl.relu, score_psum, scale=-1.0)
                 score = nl.subtract(_ssp, _ssn)
                 stable = nl.subtract(score, row_max_m)
-                weights = nl.divide(nl.exp(stable), row_denom_m)
+                weights = nl.multiply(nl.exp(stable), row_denom_inv_m)
 
                 # NKI 0.3.0: nl.transpose gives PSUM which nc_matmul rejects as stationary.
                 # Round-trip weights through HBM so load_transpose2d produces SBUF.
@@ -331,6 +346,9 @@ if HAS_NKI:
         for m in nl.affine_range(M_tiles):
             row_max_m = nl.load(row_max[m, :, :])  # (128, 1)
             row_denom_m = nl.load(row_denom[m, :, :])
+            # NKI 0.7: tensor_scalar_arith has no `divide`; multiply by the
+            # reciprocal of the (128, 1) softmax denominator instead.
+            row_denom_inv_m = nl.reciprocal(row_denom_m)
             d_m = nl.load(D_blocks[m, :, :])  # (128, 1)
 
             dq_psum = nl.zeros((_TILE_M, head_dim), dtype=nl.float32, buffer=nl.psum)
@@ -361,7 +379,7 @@ if HAS_NKI:
                 nisa.activation(_ssn, nl.relu, score_psum, scale=-1.0)
                 score = nl.subtract(_ssp, _ssn)
                 stable = nl.subtract(score, row_max_m)
-                P = nl.divide(nl.exp(stable), row_denom_m)
+                P = nl.multiply(nl.exp(stable), row_denom_inv_m)
 
                 # dP = dO_m @ V_ki.T
                 dp_psum = nl.zeros((_TILE_M, _TILE_M), dtype=nl.float32, buffer=nl.psum)
@@ -478,7 +496,7 @@ if HAS_NKI:
                 nisa.activation(_ssn, nl.relu, score_psum, scale=-1.0)
                 score = nl.subtract(_ssp, _ssn)
                 stable_s = nl.subtract(score, row_max_mi)
-                P = nl.divide(nl.exp(stable_s), row_denom_mi)
+                P = nl.multiply(nl.exp(stable_s), nl.reciprocal(row_denom_mi))
 
                 # dP = dO_m @ V_ki.T
                 dp_psum = nl.zeros((_TILE_M, _TILE_M), dtype=nl.float32, buffer=nl.psum)
