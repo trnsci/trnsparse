@@ -65,7 +65,7 @@ def _cg_spd_kernel(A_blocks, A_cols, A_row_ptrs, b, max_iter):
     rr = nl.reduce(r * r)
 
     for k in nl.affine_range(max_iter):
-        Ap = _bsr_matvec_sbuf(A_sbuf, A_cols, A_row_ptrs, p)   # all SBUF
+        Ap = _bsr_matvec_sbuf(A_sbuf, A_cols, A_row_ptrs, p)  # all SBUF
         pAp = nl.reduce(p * Ap)
         alpha = rr / pAp
         x = x + alpha * p
