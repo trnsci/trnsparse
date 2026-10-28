@@ -28,9 +28,11 @@ Each token block attends to its `window` nearest neighbors in block space:
 ```python
 import trnsparse
 
+
 def local_window_mask(seq_len: int, block_size: int, window: int) -> trnsparse.BSRMatrix:
     """BSRMatrix for sliding-window attention."""
     import torch
+
     n_blocks = seq_len // block_size
     block_mask = torch.zeros(n_blocks, n_blocks, dtype=torch.bool)
     for i in range(n_blocks):
@@ -53,6 +55,7 @@ iff `(i - j) % stride == 0`:
 ```python
 def dilated_mask(seq_len: int, block_size: int, stride: int) -> trnsparse.BSRMatrix:
     import torch
+
     n_blocks = seq_len // block_size
     block_mask = torch.zeros(n_blocks, n_blocks, dtype=torch.bool)
     for i in range(n_blocks):
@@ -73,10 +76,11 @@ def global_token_mask(
     seq_len: int, block_size: int, window: int, n_global: int
 ) -> trnsparse.BSRMatrix:
     import torch
+
     n_blocks = seq_len // block_size
     block_mask = torch.zeros(n_blocks, n_blocks, dtype=torch.bool)
-    block_mask[:n_global, :] = True   # global rows attend everywhere
-    block_mask[:, :n_global] = True   # global columns attended by all
+    block_mask[:n_global, :] = True  # global rows attend everywhere
+    block_mask[:, :n_global] = True  # global columns attended by all
     for i in range(n_global, n_blocks):
         lo, hi = max(0, i - window), min(n_blocks, i + window + 1)
         block_mask[i, lo:hi] = True
@@ -90,6 +94,7 @@ Given a `mask_bsr` constructed above:
 
 ```python
 import torch
+
 
 def block_sparse_attention(Q, K, V, mask_bsr):
     """Q, K, V: (seq_len, head_dim) → (seq_len, head_dim)."""

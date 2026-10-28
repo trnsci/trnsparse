@@ -42,7 +42,7 @@ keep = trnsparse.screen_quartets(Q, threshold=1e-10)
 ## Backend selection
 
 ```python
-trnsparse.set_backend("auto")     # default
+trnsparse.set_backend("auto")  # default
 trnsparse.set_backend("pytorch")  # force PyTorch fallback
-trnsparse.set_backend("nki")      # force NKI (requires Neuron hardware)
+trnsparse.set_backend("nki")  # force NKI (requires Neuron hardware)
 ```

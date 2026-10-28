@@ -5,6 +5,57 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **NKI 0.7.0 / neuronx-cc 2.28 kernel compatibility (#29).** Kernels that
+  passed `nki.simulate` failed to compile on Trn2 (Neuron SDK 2.33):
+  - `_attn_out_kernel`, `_attn_bwd_dq_kernel`, `_attn_bwd_dkdv_kernel`:
+    softmax normalisation `nl.divide(exp, row_denom)` by a `(128, 1)`
+    denominator lowered to `tensor_scalar_arith`, which no longer supports
+    `divide`. Now multiplies by `nl.reciprocal(row_denom)` (hoisted per
+    block-row in the forward and dQ kernels).
+  - `_screened_spmm_kernel`: the `(128, 1) * (1, 128)` Schwarz outer product
+    and the `(1, 1)` threshold subtract produced partition-count mismatches
+    (`operand0 partition total elements 128 != dst partition total elements
+    1`). `q_k` is now `nl.broadcast_to` `(128, 128)` and the threshold is
+    loaded once and broadcast to `(128, 1)`. The soft-mask tensor-tensor
+    divide (fails ISA validation `s3s3d3_tt_valid_op`) is now a reciprocal
+    multiply.
+  - `nki_bsr_attn_bwd`: the host-side `(..., b) → (..., b, 1)` unsqueeze
+    for per-row stats matched `q_scaled` / `k_blocks` / `v_blocks` by shape
+    whenever `head_dim == 128` (and in the simulator's padded path), feeding
+    the kernels a 4-D tensor. Stats are now selected by name.
+  - Dispatch: kernels always receive fp32 (Trainium has no fp64 datapath;
+    the native device downcast fp64 silently) and results are cast back to
+    the caller's dtype. Fixes `expected m1 and m2 to have the same dtype,
+    but got: float != double` in the PyTorch-level backward under fp64
+    gradcheck. The hardware gradcheck tests now use `eps=1e-2,
+    atol=rtol=1e-2`, sized for an fp32 forward (the ops are linear in each
+    input, so the larger eps adds no truncation error).
+
+- **Block-sparse attention: two host-side gather bugs** (pre-existing, masked
+  on Trn2 by the compile failures above; found with neuronx-cc BIRSim):
+  - Rows with fewer than `K_max` blocks were padded with sentinel k-slots that
+    gathered column block 0, so block 0 was counted again in the softmax and
+    in `weights @ V` (local-window masks: ~49% of outputs wrong). Padded slots
+    now have K/V (forward, dQ) or Q/dO (dK/dV) zeroed, and their stats are
+    dropped in `_attn_host_reduction`.
+  - `_attn_bwd_gather` gathered `dO` by column block instead of the row block
+    `dO_m`, breaking dQ whenever a row attends to a block other than itself
+    (~99% of dQ wrong). The two simulator xfails attributed to a "PSUM
+    accumulate bug" (`test_bwd_dq_parity_kmax2`, `test_backward_head_dim_256`)
+    were this bug and now pass.
+
+### Added
+
+- `tests/test_attn_gather.py`: CPU regression tests for both gather bugs.
+- `tests/test_nki_compile.py` (`nki_simulator` marker): CPU MLIR
+  verification (`source_to_mlir(...).verify()`) of every kernel for trn1
+  and trn2, attention kernels at head_dim 64, 128 and 256; plus a full NEFF
+  compile per kernel/target when `neuronx-cc` is on PATH.
+
 ## [0.6.0] — 2026-04-17
 
 ### Added
