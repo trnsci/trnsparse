@@ -25,8 +25,10 @@ trnsparse/
 │   ├── iterative.py     # cg_bsr, power_iteration_bsr, jacobi_preconditioner_bsr
 │   └── nki/
 │       ├── __init__.py
-│       ├── kernels.py   # _bsr_spmm_kernel, _screened_spmm_kernel
-│       └── dispatch.py  # torch.autograd.Function wrappers + NKI/PyTorch routing
+│       ├── kernels.py       # _bsr_spmm_kernel, _screened_spmm_kernel, attention kernels
+│       ├── dispatch.py      # dispatch-path selection, _launch, autograd.Function wrappers (XLA/CPU)
+│       ├── _native.py       # TorchNeuron nki_op custom ops + register_autograd, loaded lazily
+│       └── _native_attn.py  # trnsparse::bsr_attn / bsr_attn_bwd composite ops (native path)
 ├── tests/
 ├── examples/
 │   ├── sparse_fock.py             # Schwarz-screened Fock build (3 paths + trnblas)

@@ -30,15 +30,26 @@ def bsr_diagonal(A: BSRMatrix) -> torch.Tensor:
     m, _ = A.shape
     b = A.block_size
     M_tiles = (m + b - 1) // b
-    out = torch.zeros(M_tiles * b, dtype=A.dtype)
+    # Find each block row's diagonal block on host copies of the structure,
+    # then gather all of them in one indexing op on the blocks' device (no
+    # per-element reads or writes of device tensors).
+    row_ptrs = A.block_row_ptrs.cpu()
+    col_indices = A.block_col_indices.cpu()
+    rows, ks = [], []
     for i in range(M_tiles):
-        start = A.block_row_ptrs[i].item()
-        end = A.block_row_ptrs[i + 1].item()
+        start = row_ptrs[i].item()
+        end = row_ptrs[i + 1].item()
         for k in range(start, end):
-            if A.block_col_indices[k].item() == i:
-                out[i * b : (i + 1) * b] = torch.diagonal(A.blocks[k])
+            if col_indices[k].item() == i:
+                rows.append(i)
+                ks.append(k)
                 break
-    return out[:m]
+    dev = A.blocks.device
+    out = torch.zeros(M_tiles, b, dtype=A.dtype, device=dev)
+    if rows:
+        diag = torch.diagonal(A.blocks[torch.tensor(ks, device=dev)], dim1=-2, dim2=-1)
+        out[torch.tensor(rows, device=dev)] = diag
+    return out.reshape(-1)[:m]
 
 
 def _bsr_matvec(A: BSRMatrix) -> Callable[[torch.Tensor], torch.Tensor]:
@@ -140,7 +151,8 @@ def jacobi_preconditioner_bsr(
     inv_d = 1.0 / d
 
     def precond(r: torch.Tensor) -> torch.Tensor:
-        return r * inv_d
+        # No-op when r is on A.blocks' device (the usual case).
+        return r * inv_d.to(r.device)
 
     return precond
 

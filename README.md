@@ -34,7 +34,33 @@ Suite-wide tracker: [trnsci/trnsci#1](https://github.com/trnsci/trnsci/issues/1)
 
 ```bash
 pip install trnsparse
+
+# Trn2/Trn3 with TorchNeuron (native PyTorch, Neuron SDK 2.33+)
+pip install "trnsparse[torchneuron]" --extra-index-url https://pip.repos.neuron.amazonaws.com
+
+# Trn1 / PyTorch-XLA lineage
+pip install "trnsparse[neuron]" --extra-index-url https://pip.repos.neuron.amazonaws.com
 ```
+
+Kernels dispatch on whichever Neuron PyTorch lineage is installed:
+
+- **TorchNeuron (native)** — Trn2/Trn3, Neuron SDK 2.33+, Python ≥ 3.12,
+  `torch` 2.14, `torch-neuronx` 2.14.*. Each kernel is a PyTorch custom op
+  (`torch.ops.trnsparse.*`) on the `neuron` device, with its backward
+  attached via `register_autograd`; no `torch_xla`.
+- **PyTorch/XLA** — Trn1 (and any host on the `torch-neuronx` 2.9 lineage).
+  Kernels dispatch through `torch_xla`, unchanged.
+
+**Placement on the native path:** the `neuron` device has no sparse CSR
+tensors, so keep sparse *structure* (CSR `row_ptrs` / `col_indices`, BSR
+`block_row_ptrs` / `block_col_indices`) on the host and put dense operands
+(and BSR `blocks`) on `device="neuron"`. Results come back on the dense
+operand's device. See [installation](docs/installation.md#placement-sparse-structure-on-the-host).
+
+Set `TRNSCI_NKI_DISPATCH=native|xla|cpu` (shared by all trnsci libraries)
+to force a path. With an editable install (`pip install -e`), set
+`NKI_ENABLE_TRACE_CACHE=0`: the NKI kernel cache only versions installed
+wheels and can serve stale kernels.
 
 ## Usage
 

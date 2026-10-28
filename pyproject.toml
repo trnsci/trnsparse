@@ -26,6 +26,7 @@ dependencies = [
 
 [project.optional-dependencies]
 neuron = [
+    # PyTorch/XLA lineage (Trn1, and Trn2 on PyTorch 2.9).
     # NKI 0.3.0 Stable (Neuron SDK 2.29+, April 2026). trnsparse imports
     # from the canonical `nki.*` namespace; the legacy `neuronxcc.nki.*`
     # shim is not used. SDK 2.29 DLAMI bundles nki==0.3.0 alongside
@@ -34,6 +35,17 @@ neuron = [
     "nki>=0.3.0",
     "neuronxcc>=2.24",
     "torch-neuronx>=2.9",
+]
+torchneuron = [
+    # TorchNeuron / native PyTorch (Neuron SDK 2.33+, Trn2/Trn3; torch-neuronx
+    # 2.14 itself requires Python >= 3.12). Install with
+    # --extra-index-url https://pip.repos.neuron.amazonaws.com. The nki floor
+    # also keeps pip off the unrelated `nki` 0.0.1 on public PyPI. Both
+    # lineages publish a package named torch-neuronx and pip markers cannot
+    # tell them apart, hence two extras.
+    "torch>=2.14",
+    "torch-neuronx>=2.14",
+    "nki>=0.6",
 ]
 dev = ["pytest>=7.0", "pytest-benchmark>=4.0", "pytest-cov>=4.1", "scipy>=1.11"]
 

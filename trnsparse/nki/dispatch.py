@@ -2,18 +2,30 @@
 
 v0.2.0 — `nki_spmm` is the first NKI-dispatched op. Forward path:
 materialize the CSR into a padded dense view, run the NKI GEMM kernel
-(`kernels._spmm_dense_kernel`) on the XLA device, slice back to the
+(`kernels._spmm_dense_kernel`) on the Neuron device, slice back to the
 original shape. Backward runs at the PyTorch level — see
 `_SpMMFunction.backward` for the analytic adjoints.
 
 Autograd wrapping is a hard requirement across the trnsci suite (see
-trnsci/trnsci#3). This module's `_SpMMFunction` is the first concrete
-example in the suite; sibling projects copying this pattern is expected.
+trnsci/trnsci#3). On the PyTorch/XLA path (Trn1) and the CPU fallback the
+wrappers are `torch.autograd.Function`s (`_SpMMFunction`, `_BSRSpMMFunction`,
+`_ScreenedSpMMFunction`, `ops._AttnTiledFunction`). On the native
+TorchNeuron path (Trn2/Trn3) every kernel is a `trnsparse::` custom op and
+its backward is attached with `register_autograd` (see `_native.py` and
+`_native_attn.py`), so the host wrappers below call the forward directly.
+
+Placement on the native path: the `neuron` device has no sparse CSR
+tensors (aws-neuron-sdk#1442). CSR / BSR structure (row pointers, column
+indices, block grids) stays on the host; only dense operands, dense blocks
+and densified tiles go to `device="neuron"`. Results come back on the
+device of the dense operand.
 """
 
 from __future__ import annotations
 
+import importlib.util
 import os
+import warnings
 
 import numpy as np
 import torch
@@ -94,6 +106,166 @@ def _to_xla(*tensors):
     return [t.to(device) for t in tensors], orig
 
 
+# ── Device dispatch path: native TorchNeuron vs XLA ──────────────────────────
+#
+# Two Neuron PyTorch lineages coexist:
+#   native  torch-neuronx 2.14+ (TorchNeuron, Trn2/Trn3): Trainium is a
+#           PyTorch `neuron` device; kernels are custom ops registered via
+#           `torch_neuronx.nki_op` (see `_native.py`).
+#   xla     torch-neuronx 2.9 lineage (PyTorch/XLA; Trn1 and Inf2 stay
+#           here): kernels dispatch on the torch_xla device via `_to_xla()`.
+# Anything else is "cpu": no device path, so a kernel launch outside the
+# simulator fails in `_to_xla` and the wrapper falls back to PyTorch (or
+# re-raises under TRNSPARSE_REQUIRE_NKI), exactly as before the native path
+# existed. Detection runs on the first launch, not at import, and the
+# native probe never imports torch_xla.
+
+_NEURON_DEVICE = "neuron"
+_dispatch_path: str | None = None
+_native_ops: dict | None = None
+_xla_deprecation_warned = False
+
+_XLA_DEPRECATION_MESSAGE = (
+    "the PyTorch/XLA path is deprecated on Trn2/Trn3; use TorchNeuron (native). "
+    "Trn1/Inf2 remain supported in maintenance mode."
+)
+
+
+def _native_available() -> bool:
+    try:
+        import torch_neuronx
+    except Exception:
+        return False
+    # The XLA-lineage torch_neuronx has no `nki_op`.
+    if not hasattr(torch_neuronx, "nki_op"):
+        return False
+    try:
+        torch.device(_NEURON_DEVICE)  # torch_neuronx renames PrivateUse1 to "neuron"
+        return torch_neuronx.device_count() > 0
+    except Exception:
+        return False
+
+
+def _detect_dispatch_path() -> str:
+    # TRNSCI_NKI_DISPATCH=auto|native|xla|cpu is shared by every trnsci
+    # library, so one variable pins the whole suite on hosts that have both
+    # lineages.
+    forced = os.environ.get("TRNSCI_NKI_DISPATCH", "auto").strip().lower()
+    if forced == "native":
+        if not _native_available():
+            raise RuntimeError(
+                "TRNSCI_NKI_DISPATCH=native, but no TorchNeuron backend with a "
+                "'neuron' device is available"
+            )
+        return "native"
+    if forced == "xla":
+        if importlib.util.find_spec("torch_xla") is None:
+            raise RuntimeError("TRNSCI_NKI_DISPATCH=xla, but torch_xla is not installed")
+        return "xla"
+    if forced == "cpu":
+        return "cpu"
+    if forced != "auto":
+        raise ValueError(f"TRNSCI_NKI_DISPATCH must be auto, native, xla, or cpu; got {forced!r}")
+    if _native_available():
+        return "native"
+    if importlib.util.find_spec("torch_xla") is not None:
+        return "xla"
+    return "cpu"
+
+
+def _maybe_warn_xla_deprecated() -> None:
+    # Dormant until TorchNeuron GA: the suite turns it on with
+    # TRNSCI_XLA_DEPRECATION=1 (trnsci/trnsci#35). Fires once per process.
+    global _xla_deprecation_warned
+    if _xla_deprecation_warned or os.environ.get("TRNSCI_XLA_DEPRECATION", "") != "1":
+        return
+    _xla_deprecation_warned = True
+    warnings.warn(_XLA_DEPRECATION_MESSAGE, DeprecationWarning, stacklevel=3)
+
+
+def _get_dispatch_path() -> str:
+    """Return "native", "xla", or "cpu" (cached after the first call)."""
+    global _dispatch_path
+    if _dispatch_path is None:
+        _dispatch_path = _detect_dispatch_path()
+    if _dispatch_path == "xla":
+        _maybe_warn_xla_deprecated()
+    return _dispatch_path
+
+
+def _get_native_ops() -> dict:
+    """Import `_native` (registering the trnsparse:: custom ops) on first use."""
+    global _native_ops
+    if _native_ops is None:
+        from . import _native
+
+        _native_ops = _native.OPS
+    return _native_ops
+
+
+def _native_path() -> bool:
+    """True when kernels launch as native `trnsparse::` custom ops.
+
+    On this path autograd comes from `register_autograd` on those ops, so the
+    host wrappers skip their `torch.autograd.Function`s. The simulator keeps
+    its own (autograd.Function) path.
+    """
+    return HAS_NKI and not _use_simulator() and _get_dispatch_path() == "native"
+
+
+def _to_device(*tensors: torch.Tensor):
+    """Move kernel operands to the device of the selected dispatch path.
+
+    Returns `(device_tensors, orig_device)`. The XLA (and "cpu") path is
+    `_to_xla` unchanged.
+    """
+    if _get_dispatch_path() == "native":
+        orig = tensors[0].device
+        return [t.to(_NEURON_DEVICE) for t in tensors], orig
+    return _to_xla(*tensors)
+
+
+def _run(kernel, op_name: str, *device_tensors: torch.Tensor):
+    """Call one kernel on operands already placed by `_to_device`.
+
+    `op_name` is the `trnsparse::<op_name>` custom op used on the native
+    path; the XLA path calls `kernel` directly on torch_xla tensors.
+    """
+    if _get_dispatch_path() == "native":
+        return _get_native_ops()[op_name](*device_tensors)
+    return kernel(*device_tensors)
+
+
+def _launch(kernel, op_name: str, *tensors: torch.Tensor):
+    """Run one kernel launch on the Neuron device; results return to the
+    device of the first operand. Every host wrapper goes through this (or
+    through its two halves, `_to_device` + `_run`, when several kernels
+    share operands that should cross to the device once)."""
+    xs, orig = _to_device(*tensors)
+    out = _run(kernel, op_name, *xs)
+    if isinstance(out, tuple | list):
+        return tuple(o.to(orig) for o in out)
+    return out.to(orig)
+
+
+class _MaskPattern:
+    """Structure-only BSR view (no block values): what attention needs.
+
+    Index tensors are kept on the host (copied there if they arrive on a
+    device) so the per-block-row loops below never touch a device tensor.
+    """
+
+    def __init__(self, block_col_indices, block_row_ptrs, shape, block_size):
+        self.block_col_indices = block_col_indices.cpu()
+        self.block_row_ptrs = block_row_ptrs.cpu()
+        self.shape = tuple(shape)
+        self.block_size = int(block_size)
+
+    @property
+    def n_blocks(self) -> int:
+        return len(self.block_col_indices)
+
+
 def _kernel_input(t: torch.Tensor) -> torch.Tensor:
     """Cast a kernel operand to a dtype the NeuronCore datapath supports.
 
@@ -154,9 +326,7 @@ def _nki_spmm_impl(A_dense: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
             out_np = nki.simulate(_spmm_dense_kernel)(A_feed.cpu().numpy(), B_feed.cpu().numpy())
             result = torch.from_numpy(np.asarray(out_np)).to(A_dense.device)
         else:
-            (a, b), orig_device = _to_xla(A_feed, B_feed)
-            c = _spmm_dense_kernel(a, b)
-            result = c.to(orig_device)
+            result = _launch(_spmm_dense_kernel, "spmm_dense", A_feed, B_feed)
 
         result = result.to(A_dense.dtype)
         return result[:M, :N] if needs_pad else result
@@ -200,7 +370,18 @@ def nki_spmm(A, B: torch.Tensor) -> torch.Tensor:
     On NKI backend, forward runs the kernel; on PyTorch, torch.matmul
     on the densified A is the fallback — the autograd wrapper is kept
     on both paths for API uniformity.
+
+    Native TorchNeuron path: A's CSR structure stays on the host and is
+    densified there (no torch sparse tensor), the dense A moves to B's
+    device, and the `trnsparse::spmm_dense` op (autograd registered with
+    `register_autograd`) runs the kernel. B may live on the host or on
+    `neuron`; the result is on B's device.
     """
+    if _native_path():
+        from ..formats import _csr_to_dense_host
+
+        A_dense = _csr_to_dense_host(A).to(B.device)
+        return _nki_spmm_impl(A_dense, B)
     A_dense = _csr_to_dense_padded(A)
     return _SpMMFunction.apply(A_dense, B)
 
@@ -224,9 +405,7 @@ def _nki_bsr_spmm_impl(
             out_np = nki.simulate(_bsr_spmm_kernel)(bp_feed.cpu().numpy(), bg_feed.cpu().numpy())
             result = torch.from_numpy(np.asarray(out_np)).to(blocks_pad.device)
         else:
-            (bp, bg), orig_device = _to_xla(bp_feed, bg_feed)
-            c = _bsr_spmm_kernel(bp, bg)
-            result = c.to(orig_device)
+            result = _launch(_bsr_spmm_kernel, "bsr_spmm", bp_feed, bg_feed)
 
         return result[:out_rows, :out_cols].to(blocks_pad.dtype).contiguous()
     except Exception:
@@ -268,8 +447,11 @@ def _bsr_pad_and_gather(A, B: torch.Tensor):
     M_tiles = m_pad // b
     nb_cols = n_pad // b
 
-    # Count blocks per row and pad up to K_max
-    block_row_ptrs = A.block_row_ptrs
+    # Count blocks per row and pad up to K_max. The structure is read from
+    # host copies (a no-op when it already lives on the host), so the loop
+    # below never does scalar reads of device tensors.
+    block_row_ptrs = A.block_row_ptrs.cpu()
+    block_col_indices = A.block_col_indices.cpu()
     blocks_per_row = (block_row_ptrs[1:] - block_row_ptrs[:-1]).tolist()
     K_max = max(blocks_per_row) if blocks_per_row else 1
 
@@ -281,7 +463,7 @@ def _bsr_pad_and_gather(A, B: torch.Tensor):
         start = block_row_ptrs[i].item()
         end = block_row_ptrs[i + 1].item()
         row_len = end - start
-        col_grid[i, :row_len] = A.block_col_indices[start:end]
+        col_grid[i, :row_len] = block_col_indices[start:end]
         block_idx_grid[i, :row_len] = torch.arange(start, end)
 
     # Pad A with a single zero block at index `n_blocks` for masked slots.
@@ -290,14 +472,16 @@ def _bsr_pad_and_gather(A, B: torch.Tensor):
     masked_idx = torch.where(
         block_idx_grid >= 0, block_idx_grid, torch.tensor(A.n_blocks, dtype=torch.long)
     )
-    blocks_pad = blocks_with_zero[masked_idx]  # (M_tiles, K_max, b, b)
+    # The index grids are built on the host; move them to the data's device
+    # for the gather (a no-op on the host).
+    blocks_pad = blocks_with_zero[masked_idx.to(blocks_with_zero.device)]  # (M_tiles, K_max, b, b)
 
     # Gather B slices per slot. For masked slots, a zero slice (columns 0..b)
     # times a zero block contributes zero anyway — we use column 0 as sentinel.
     safe_col = torch.where(col_grid >= 0, col_grid, torch.tensor(0, dtype=torch.long))
     # Build (M_tiles, K_max, b, N_pad) via fancy indexing into B reshaped (nb_cols, b, N_pad).
     B_by_block = B.view(nb_cols, b, N_pad)
-    b_gathered = B_by_block[safe_col]  # (M_tiles, K_max, b, N_pad)
+    b_gathered = B_by_block[safe_col.to(B.device)]  # (M_tiles, K_max, b, N_pad)
 
     return blocks_pad, b_gathered, m, out_cols, K_max
 
@@ -385,7 +569,20 @@ class _BSRSpMMFunction(torch.autograd.Function):
 
 
 def nki_bsr_spmm(A, B: torch.Tensor) -> torch.Tensor:
-    """BSR SpMM entry point — wraps `_BSRSpMMFunction.apply` for autograd."""
+    """BSR SpMM entry point — wraps `_BSRSpMMFunction.apply` for autograd.
+
+    Native TorchNeuron path: the block structure (`block_row_ptrs`,
+    `block_col_indices`) stays on the host; `A.blocks` (dense) moves to B's
+    device and the gather into kernel tiles runs there. The
+    `trnsparse::bsr_spmm` op carries the autograd (gradients reach
+    `A.blocks` and `B` through the gather), so no per-block Python loop
+    runs on device tensors. The result is on B's device.
+    """
+    if _native_path():
+        blocks_pad, b_gathered, out_rows, out_cols, _ = _bsr_pad_and_gather(
+            _BlockView(A, A.blocks.to(B.device)), B
+        )
+        return _nki_bsr_spmm_impl(blocks_pad, b_gathered, out_rows, out_cols)
     return _BSRSpMMFunction.apply(
         A.blocks,
         A.block_col_indices,
@@ -394,6 +591,25 @@ def nki_bsr_spmm(A, B: torch.Tensor) -> torch.Tensor:
         A.block_size,
         B,
     )
+
+
+class _BlockView:
+    """A BSR matrix with its dense blocks placed on another device."""
+
+    def __init__(self, A, blocks: torch.Tensor):
+        self.shape = A.shape
+        self.block_size = A.block_size
+        self.blocks = blocks
+        self.block_col_indices = A.block_col_indices
+        self.block_row_ptrs = A.block_row_ptrs
+
+    @property
+    def n_blocks(self) -> int:
+        return self.blocks.shape[0]
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self.blocks.dtype
 
 
 def _nki_screened_spmm_impl(
@@ -446,10 +662,9 @@ def _nki_screened_spmm_impl(
             )
             result = torch.from_numpy(np.asarray(out_np)).to(A.device)
         else:
-            (a, q, b), orig_device = _to_xla(A_feed, Q_feed, B_feed)
-            ts = threshold_sqrt_t.to(a.device)
-            c = _screened_spmm_kernel(a, q, ts, b)
-            result = c.to(orig_device)
+            result = _launch(
+                _screened_spmm_kernel, "screened_spmm", A_feed, Q_feed, threshold_sqrt_t, B_feed
+            )
 
         result = result.to(A.dtype)
         return result[:M, :N] if needs_pad else result
@@ -508,7 +723,19 @@ def nki_screened_spmm(
     B: torch.Tensor,
     threshold: float,
 ) -> torch.Tensor:
-    """Screened SpMM entry point — wraps `_ScreenedSpMMFunction.apply` for autograd."""
+    """Screened SpMM entry point — wraps `_ScreenedSpMMFunction.apply` for autograd.
+
+    Native TorchNeuron path: all operands are dense; `A` and
+    `diag_integrals` follow B's device, and the `trnsparse::screened_spmm`
+    op carries the autograd (no gradient to `diag_integrals` or
+    `threshold`). The result is on B's device.
+    """
+    if _native_path():
+        import math as _math
+
+        A = A.to(B.device)
+        Q = torch.sqrt(torch.abs(diag_integrals.to(B.device)))
+        return _nki_screened_spmm_impl(A, Q, _math.sqrt(threshold), B)
     return _ScreenedSpMMFunction.apply(A, diag_integrals, threshold, B)
 
 
@@ -520,14 +747,15 @@ def _attn_slot_valid(mask_bsr, M_tiles: int, K_max: int) -> torch.Tensor:
     the gathered K/V (forward, dQ) or Q/dO (dK/dV) there and drop their
     stats from the host softmax reduction.
     """
-    counts = (mask_bsr.block_row_ptrs[1:] - mask_bsr.block_row_ptrs[:-1]).to(torch.long)
+    ptrs = mask_bsr.block_row_ptrs.cpu()
+    counts = (ptrs[1:] - ptrs[:-1]).to(torch.long)
     return torch.arange(K_max).unsqueeze(0) < counts[:M_tiles].unsqueeze(1)
 
 
 def _zero_invalid_slots(t: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
     """Zero `t[i, j, ...]` wherever `valid[i, j]` is False."""
     shape = valid.shape + (1,) * (t.dim() - valid.dim())
-    return t * valid.view(shape).to(t.dtype)
+    return t * valid.view(shape).to(device=t.device, dtype=t.dtype)
 
 
 def _attn_gather(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, mask_bsr, scale: float):
@@ -558,7 +786,9 @@ def _attn_gather(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, mask_bsr, sc
     # output is sliced to [:seq_len, :head_dim] so the padding is transparent.
     head_dim_k = _TILE_K if (_use_simulator() and head_dim < _TILE_K) else head_dim
 
-    block_row_ptrs = mask_bsr.block_row_ptrs
+    # Structure on the host (no-op if it already is); grids are host tensors.
+    block_row_ptrs = mask_bsr.block_row_ptrs.cpu()
+    block_col_indices = mask_bsr.block_col_indices.cpu()
     blocks_per_row = (block_row_ptrs[1:] - block_row_ptrs[:-1]).tolist()
     K_max = max(blocks_per_row) if blocks_per_row else 1
 
@@ -568,7 +798,7 @@ def _attn_gather(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, mask_bsr, sc
         start = block_row_ptrs[i].item()
         end = block_row_ptrs[i + 1].item()
         row_len = end - start
-        col_grid[i, :row_len] = mask_bsr.block_col_indices[start:end]
+        col_grid[i, :row_len] = block_col_indices[start:end]
 
     # Gather K and V: reshape (seq_len, head_dim) → (seq_len//b, b, head_dim)
     # then fancy-index by col_grid (use col 0 as sentinel for padded slots).
@@ -580,8 +810,9 @@ def _attn_gather(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, mask_bsr, sc
     # Padded slots (col_grid == -1) gather block 0; zero K/V there so the
     # slot adds nothing to weights @ V (its stats are dropped on the host).
     valid = col_grid >= 0
+    safe_col = safe_col.to(K.device)
     k_gathered_pad = _zero_invalid_slots(K_by_block[safe_col], valid)  # (M_tiles, K_max, b, hd)
-    v_gathered_pad = _zero_invalid_slots(V_by_block[safe_col], valid)  # (M_tiles, K_max, b, hd)
+    v_gathered_pad = _zero_invalid_slots(V_by_block[safe_col.to(V.device)], valid)
 
     q_scaled_blocks = (Q * scale).view(M_tiles, b, head_dim)
 
@@ -615,6 +846,7 @@ def _attn_host_reduction(
     reduction (rows with no valid slot keep all slots, as before).
     """
     if valid is not None:
+        valid = valid.to(tile_max.device)
         valid = valid | ~valid.any(dim=1, keepdim=True)
         v = valid.unsqueeze(-1)
         tile_max = torch.where(v, tile_max, torch.full_like(tile_max, float("-inf")))
@@ -694,8 +926,9 @@ def nki_bsr_attn_tiled(
             )
             result = torch.from_numpy(np.asarray(out_np)).to(Q.device)
         else:
-            (qs_x, kg_x, vg_x), orig_device = _to_xla(qs, kg, vg)
-            tile_max_x, tile_sumexp_x = _attn_stats_kernel(qs_x, kg_x)
+            # Q/K/V tiles cross to the device once and feed both passes.
+            (qs_x, kg_x, vg_x), orig_device = _to_device(qs, kg, vg)
+            tile_max_x, tile_sumexp_x = _run(_attn_stats_kernel, "attn_stats", qs_x, kg_x)
             tile_max = tile_max_x.to(orig_device)
             tile_sumexp = tile_sumexp_x.to(orig_device)
             if tile_max.dim() == 4:
@@ -706,8 +939,8 @@ def nki_bsr_attn_tiled(
             rm = row_max.unsqueeze(-1).contiguous()
             rd = row_denom.unsqueeze(-1).contiguous()
 
-            (rm_x, rd_x), _ = _to_xla(rm, rd)
-            result_x = _attn_out_kernel(qs_x, kg_x, vg_x, rm_x, rd_x)
+            (rm_x, rd_x), _ = _to_device(rm, rd)
+            result_x = _run(_attn_out_kernel, "attn_out", qs_x, kg_x, vg_x, rm_x, rd_x)
             result = result_x.to(orig_device)
 
         out = result[:seq_len, :head_dim].to(Q.dtype).contiguous()
@@ -761,8 +994,10 @@ def _attn_bwd_gather(
     b = mask_bsr.block_size
     M_tiles = seq_len // b
     nb_rows = M_tiles  # alias
-    block_row_ptrs = mask_bsr.block_row_ptrs
-    block_col_indices = mask_bsr.block_col_indices
+    # Structure on the host (no-op if it already is): the grid loops below
+    # read scalars from these, never from device tensors.
+    block_row_ptrs = mask_bsr.block_row_ptrs.cpu()
+    block_col_indices = mask_bsr.block_col_indices.cpu()
 
     # NKI 0.3.0 simulator: pad head_dim to TILE_K so nc_matmul gets K=TILE_K.
     # Padding with zeros is correct: [dO|0]·[O|0] = dO·O for D, and the kernel
@@ -801,8 +1036,8 @@ def _attn_bwd_gather(
     # Padded slots gather block 0; zero K/V there so dS @ K and dO @ V.T
     # contribute nothing to dQ.
     row_valid = col_grid >= 0
-    k_gathered = _zero_invalid_slots(K_by_block[safe_col], row_valid)
-    v_gathered = _zero_invalid_slots(V_by_block[safe_col], row_valid)
+    k_gathered = _zero_invalid_slots(K_by_block[safe_col.to(K.device)], row_valid)
+    v_gathered = _zero_invalid_slots(V_by_block[safe_col.to(V.device)], row_valid)
     # dP = dO_m @ V_ki.T needs the *row* block dO_m in every k-slot of row m
     # (gathering by column index, as before, fed dO_ki and broke dQ whenever
     # a row attends to a block other than its own).
@@ -850,11 +1085,11 @@ def _attn_bwd_gather(
     # Padded slots gather block-row 0; zero Q/dO there so dS.T @ Q and
     # P.T @ dO contribute nothing to dK/dV.
     col_valid = row_grid_col >= 0
-    q_gathered_col = _zero_invalid_slots(q_scaled[safe_row], col_valid)
-    do_gathered_col = _zero_invalid_slots(dO_by_block[safe_row], col_valid)
-    D_gathered_col = D_blocks[safe_row]  # (N_col, K_max_col, b)
-    row_max_gathered_col = row_max[safe_row]  # (N_col, K_max_col, b)
-    row_denom_gathered_col = row_denom[safe_row]  # (N_col, K_max_col, b)
+    q_gathered_col = _zero_invalid_slots(q_scaled[safe_row.to(q_scaled.device)], col_valid)
+    do_gathered_col = _zero_invalid_slots(dO_by_block[safe_row.to(dO.device)], col_valid)
+    D_gathered_col = D_blocks[safe_row.to(D_blocks.device)]  # (N_col, K_max_col, b)
+    row_max_gathered_col = row_max[safe_row.to(row_max.device)]  # (N_col, K_max_col, b)
+    row_denom_gathered_col = row_denom[safe_row.to(row_denom.device)]  # (N_col, K_max_col, b)
 
     col_first = {
         "k_blocks": k_blocks,
@@ -952,7 +1187,7 @@ def nki_bsr_attn_bwd(
                     rd_x,
                 ),
                 orig_device,
-            ) = _to_xla(
+            ) = _to_device(
                 rf["q_scaled"],
                 rf["k_gathered"],
                 rf["v_gathered"],
@@ -961,10 +1196,12 @@ def nki_bsr_attn_bwd(
                 rm_in,
                 rd_in,
             )
-            dQ_x = _attn_bwd_dq_kernel(qs_x, kg_x, vg_x, dog_x, db_x, rm_x, rd_x)
+            dQ_x = _run(
+                _attn_bwd_dq_kernel, "attn_bwd_dq", qs_x, kg_x, vg_x, dog_x, db_x, rm_x, rd_x
+            )
             dQ_raw = dQ_x.to(orig_device)
 
-            (kb_x, vb_x, qgc_x, dogc_x, dgc_x, rmgc_x, rdgc_x), _ = _to_xla(
+            (kb_x, vb_x, qgc_x, dogc_x, dgc_x, rmgc_x, rdgc_x), _ = _to_device(
                 cf["k_blocks"],
                 cf["v_blocks"],
                 cf["q_gathered"],
@@ -973,7 +1210,17 @@ def nki_bsr_attn_bwd(
                 cf["row_max_gathered"],
                 cf["row_denom_gathered"],
             )
-            dK_x, dV_x = _attn_bwd_dkdv_kernel(kb_x, vb_x, qgc_x, dogc_x, dgc_x, rmgc_x, rdgc_x)
+            dK_x, dV_x = _run(
+                _attn_bwd_dkdv_kernel,
+                "attn_bwd_dkdv",
+                kb_x,
+                vb_x,
+                qgc_x,
+                dogc_x,
+                dgc_x,
+                rmgc_x,
+                rdgc_x,
+            )
             dK_raw = dK_x.to(orig_device)
             dV_raw = dV_x.to(orig_device)
 

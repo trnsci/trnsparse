@@ -27,6 +27,13 @@ class CSRMatrix:
         col_indices: (nnz,) — column index for each value
         row_ptrs: (m+1,) — row_ptrs[i]:row_ptrs[i+1] span row i's entries
         shape: (m, n)
+
+    Placement on Trainium (native TorchNeuron, Trn2/Trn3): keep all three
+    tensors on the host. The `neuron` device has no sparse CSR tensors, so
+    `spmm` / `spmv` densify A on the host and move only dense data to the
+    device of the dense operand, which may be `neuron`. Results land on the
+    dense operand's device. Index tensors found on a device are copied to
+    the host on each call.
     """
 
     values: torch.Tensor
@@ -152,6 +159,13 @@ class BSRMatrix:
     and interop; on-device compute should go through BSR wherever the
     matrix has block structure (Fock matrices, FEM stiffness, GNN
     adjacencies, block-sparse attention masks).
+
+    Placement on Trainium (native TorchNeuron, Trn2/Trn3): keep
+    `block_col_indices` and `block_row_ptrs` on the host. `blocks` is dense
+    and may live on the host or on `neuron`; `bsr_spmm` moves it to the
+    dense operand's device, gathers the kernel tiles there and returns the
+    result on that device. Index tensors found on a device are copied to
+    the host on each call.
     """
 
     blocks: torch.Tensor
@@ -261,6 +275,27 @@ class BSRMatrix:
             f"BSRMatrix(shape={self.shape}, block_size={self.block_size}, "
             f"n_blocks={self.n_blocks}, block_density={self.density:.4f})"
         )
+
+
+def _csr_to_dense_host(A: CSRMatrix) -> torch.Tensor:
+    """Densify a CSRMatrix on the host, without a torch sparse tensor.
+
+    Used where the dense view has to reach a device that has no sparse CSR
+    support (the TorchNeuron `neuron` device, aws-neuron-sdk#1442): build
+    the dense matrix on the host, then move only the dense result. Every
+    shape here is static (`searchsorted` over `nnz` positions instead of a
+    data-dependent `repeat_interleave`), so the function also traces under
+    `torch.compile`. Differentiable w.r.t. `A.values`; duplicate entries are
+    summed, as in `torch.sparse_csr_tensor(...).to_dense()`.
+    """
+    m, n = A.shape
+    row_ptrs = A.row_ptrs.cpu()
+    values = A.values.cpu()
+    positions = torch.arange(values.shape[0], dtype=row_ptrs.dtype)
+    rows = torch.searchsorted(row_ptrs, positions, right=True) - 1
+    cols = A.col_indices.cpu().to(torch.long)
+    dense = torch.zeros(m, n, dtype=values.dtype)
+    return dense.index_put((rows.to(torch.long), cols), values, accumulate=True)
 
 
 # --- Construction helpers ---
