@@ -66,17 +66,18 @@ def _block_causal_mask(seq_len):
 
 class TestNativeRegistration:
     def test_native_path_never_imports_torch_xla(self):
-        code = (
-            "import sys, torch, trnsparse; "
-            "from trnsparse.nki.dispatch import _get_dispatch_path; "
-            "trnsparse.set_backend('nki'); "
-            "A = trnsparse.from_dense(torch.eye(128)); "
-            "C = trnsparse.spmm(A, torch.ones(128, 4, device='neuron')); "
-            "assert C.device.type == 'neuron'; "
-            "assert _get_dispatch_path() == 'native'; "
-            "assert 'torch_xla' not in sys.modules"
-        )
-        subprocess.run([sys.executable, "-c", code], check=True)
+        # In-process on purpose: a subprocess that launches a kernel needs its
+        # own Neuron runtime, and nrt_init fails (NRT_FAILURE) while this
+        # pytest process holds the only visible NeuronCore. Fresh-interpreter
+        # import isolation (no _native / torch_neuronx / torch_xla on import)
+        # is covered on CPU by test_native_dispatch.py::TestLazyRegistration.
+        if "torch_xla" in sys.modules:
+            pytest.skip("torch_xla was already imported in this process by something else")
+        A = trnsparse.from_dense(torch.eye(128))
+        C = trnsparse.spmm(A, torch.ones(128, 4, device=DEV))
+        assert C.device.type == DEV
+        assert _get_dispatch_path() == "native"
+        assert "torch_xla" not in sys.modules
 
     def test_ops_registered_in_torch_ops(self):
         _get_native_ops()

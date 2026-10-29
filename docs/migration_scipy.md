@@ -63,10 +63,10 @@ argument; scipy infers it from the indices when possible. Be explicit:
 
 ```python
 # scipy
-A = csr_matrix((data, indices, indptr))              # shape inferred
+A = csr_matrix((data, indices, indptr))  # shape inferred
 
 # trnsparse
-A = CSRMatrix(data, indices, indptr, shape=(m, n))   # shape required
+A = CSRMatrix(data, indices, indptr, shape=(m, n))  # shape required
 ```
 
 **Operator access.** scipy overloads `@`, `+`, `*` on its matrix
@@ -110,9 +110,9 @@ import torch
 import trnsparse
 import trnsolver
 
-A = trnsparse.from_scipy(scipy_matrix)            # zero-copy ingestion
+A = trnsparse.from_scipy(scipy_matrix)  # zero-copy ingestion
 b = torch.as_tensor(b_numpy, dtype=torch.float32)
-x = trnsolver.cg(A, b, tol=1e-6)                  # uses trnsparse.spmv
+x = trnsolver.cg(A, b, tol=1e-6)  # uses trnsparse.spmv
 ```
 
 The hot path (`spmv` inside CG) dispatches to NKI when

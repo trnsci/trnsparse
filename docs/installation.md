@@ -74,9 +74,9 @@ Index tensors found on a device are copied to the host on each call, which
 works but costs a device sync; build them on the host.
 
 ```python
-A = trnsparse.from_dense(D)                    # host CSR
-B = torch.randn(n, 64, device="neuron")        # device operand
-C = trnsparse.spmm(A, B)                       # C on neuron; differentiable in A.values and B
+A = trnsparse.from_dense(D)  # host CSR
+B = torch.randn(n, 64, device="neuron")  # device operand
+C = trnsparse.spmm(A, B)  # C on neuron; differentiable in A.values and B
 C = torch.compile(lambda B: trnsparse.spmm(A, B), backend="neuron")(B)
 ```
 
