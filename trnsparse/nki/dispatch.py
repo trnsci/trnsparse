@@ -70,6 +70,25 @@ def _use_simulator() -> bool:
     return _USE_SIMULATOR and HAS_NKI
 
 
+# Static-structure kernels on the native path (trnsparse#30): the host-side
+# block structure becomes compile-time constants of the kernel instead of
+# padded, gathered device tensors. TRNSPARSE_STATIC_STRUCTURE=0 restores the
+# gather path. Structures above _STATIC_MAX_UNROLL unrolled block matmuls
+# (n_blocks x output column tiles) also take the gather path, to bound the
+# trace / compile time (8192x8192 at 50% block density, 2048 blocks,
+# compiles in ~5 s on Trn2).
+_STATIC_STRUCTURE = os.environ.get("TRNSPARSE_STATIC_STRUCTURE", "1").lower() not in (
+    "0",
+    "false",
+    "no",
+)
+_STATIC_MAX_UNROLL = int(os.environ.get("TRNSPARSE_STATIC_MAX_UNROLL", "16384"))
+
+
+def _static_structure_ok(n_unrolled: int) -> bool:
+    return _STATIC_STRUCTURE and n_unrolled <= _STATIC_MAX_UNROLL
+
+
 _backend = "auto"
 
 
@@ -291,6 +310,53 @@ def _csr_to_dense_padded(A) -> torch.Tensor:
     return t.to_dense()
 
 
+# Densify on the device below this element density, on the host above it.
+# Trn2 crossover (4096^2 / 8192^2): a device scatter costs ~15 ns per stored
+# entry, a host densify + H2D copy ~1.4 ns per matrix element.
+_DEVICE_DENSIFY_MAX_DENSITY = 0.1
+
+
+def _csr_to_dense_on(A, device) -> torch.Tensor:
+    """Densify a host-structure CSRMatrix for a kernel on `device`.
+
+    Sparse enough (`nnz < _DEVICE_DENSIFY_MAX_DENSITY * M * K`): the row
+    index of each entry is computed on the host, only the nnz-sized
+    (flat index, value) pairs cross to the device, and the scatter into a
+    zero tile runs there. Otherwise the dense matrix is built on the host and
+    copied (`formats._csr_to_dense_host`), as before. Before this, every
+    call copied the full host-built dense matrix (156 ms of a 157 ms
+    `spmm` at 8192 x 8192, 0.1% dense, on Trn2).
+
+    Canonical CSR (strictly increasing columns per row, as `from_dense`
+    builds) uses `scatter`; duplicates fall back to `index_add` (summed, as
+    `torch.sparse_csr_tensor(...).to_dense()`; ~8x slower on Trn2).
+    Differentiable w.r.t. `A.values` either way.
+    """
+    from ..formats import _csr_to_dense_host
+
+    m, n = A.shape
+    nnz = A.values.shape[0]
+    if torch.device(device).type == "cpu" or nnz >= _DEVICE_DENSIFY_MAX_DENSITY * m * n:
+        return _csr_to_dense_host(A).to(device)
+    row_ptrs = A.row_ptrs.cpu()
+    positions = torch.arange(nnz, dtype=row_ptrs.dtype)
+    rows = (torch.searchsorted(row_ptrs, positions, right=True) - 1).to(torch.long)
+    flat = rows * n + A.col_indices.cpu().to(torch.long)
+    values = A.values.to(device)
+    dense = torch.zeros(m * n, dtype=values.dtype, device=device)
+    flat_d = flat.to(device)
+    # Under torch.compile the duplicate check would be a data-dependent
+    # branch; index_add is correct either way.
+    canonical = not torch.compiler.is_compiling() and (
+        nnz < 2 or bool((flat[1:] > flat[:-1]).all())
+    )
+    if canonical:
+        dense = dense.scatter(0, flat_d, values)
+    else:
+        dense = dense.index_add(0, flat_d, values)
+    return dense.view(m, n)
+
+
 def _nki_spmm_impl(A_dense: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     """Dispatch a dense (M, K) @ (K, N) matmul through the NKI kernel.
 
@@ -378,9 +444,7 @@ def nki_spmm(A, B: torch.Tensor) -> torch.Tensor:
     `neuron`; the result is on B's device.
     """
     if _native_path():
-        from ..formats import _csr_to_dense_host
-
-        A_dense = _csr_to_dense_host(A).to(B.device)
+        A_dense = _csr_to_dense_on(A, B.device)
         return _nki_spmm_impl(A_dense, B)
     A_dense = _csr_to_dense_padded(A)
     return _SpMMFunction.apply(A_dense, B)
@@ -579,6 +643,14 @@ def nki_bsr_spmm(A, B: torch.Tensor) -> torch.Tensor:
     runs on device tensors. The result is on B's device.
     """
     if _native_path():
+        out_cols = B.shape[1]
+        n_tiles = 1 if out_cols <= _TILE_N else -(-out_cols // _TILE_N)
+        if A.block_size == _TILE_M and _static_structure_ok(A.n_blocks * n_tiles):
+            try:
+                return _nki_bsr_spmm_static(A, B)
+            except Exception:
+                if _REQUIRE_NKI:
+                    raise
         blocks_pad, b_gathered, out_rows, out_cols, _ = _bsr_pad_and_gather(
             _BlockView(A, A.blocks.to(B.device)), B
         )
@@ -591,6 +663,39 @@ def nki_bsr_spmm(A, B: torch.Tensor) -> torch.Tensor:
         A.block_size,
         B,
     )
+
+
+def _bsr_structure_lists(A) -> tuple[list[int], list[int]]:
+    """Host BSR structure as Python int lists (the static kernels' constants)."""
+    return A.block_row_ptrs.cpu().tolist(), A.block_col_indices.cpu().tolist()
+
+
+def _nki_bsr_spmm_static(A, B: torch.Tensor) -> torch.Tensor:
+    """BSR SpMM through `trnsparse::bsr_spmm_static` (native path).
+
+    No (M_tiles, K_max) padding and no gather: `A.blocks` and B go to the
+    device as they are (B zero-padded to block / 512-column alignment only
+    when needed) and the kernel walks the stored blocks, addressing B by
+    each block's column index. Autograd to `A.blocks` and B is registered
+    on the op.
+    """
+    m, n = A.shape
+    b = A.block_size
+    out_cols = B.shape[1]
+    n_pad = _round_up(n, b)
+    N_pad = out_cols if out_cols <= _TILE_N else _round_up(out_cols, _TILE_N)
+    if N_pad != out_cols or n_pad != n:
+        B_p = torch.zeros(n_pad, N_pad, dtype=B.dtype, device=B.device)
+        B_p[:n, :out_cols] = B
+        B = B_p
+    row_ptrs, cols = _bsr_structure_lists(A)
+    # Kernel operands go to the neuron device (a no-op when they are already
+    # there); the result returns to B's device.
+    orig = B.device
+    blocks = _kernel_input(A.blocks.contiguous()).to(_NEURON_DEVICE)
+    b_dev = _kernel_input(B.contiguous()).to(_NEURON_DEVICE)
+    out = _get_native_ops()["bsr_spmm_static"](blocks, b_dev, row_ptrs, cols)
+    return out[:m, :out_cols].to(device=orig, dtype=A.blocks.dtype)
 
 
 class _BlockView:
@@ -891,6 +996,19 @@ def nki_bsr_attn_tiled(
     seq_len, head_dim = Q.shape
     scale = head_dim**-0.5
 
+    if (
+        _native_path()
+        and head_dim <= _TILE_K
+        and mask_bsr.block_size == _TILE_M
+        and seq_len % _TILE_M == 0
+        and _static_structure_ok(2 * mask_bsr.n_blocks)
+    ):
+        try:
+            return _nki_attn_fwd_static(Q, K, V, mask_bsr, scale, return_stats)
+        except Exception:
+            if _REQUIRE_NKI:
+                raise
+
     q_scaled, k_gathered, v_gathered, K_max, M_tiles = _attn_gather(Q, K, V, mask_bsr, scale)
     slot_valid = _attn_slot_valid(mask_bsr, M_tiles, K_max)
     b = mask_bsr.block_size
@@ -958,6 +1076,87 @@ def nki_bsr_attn_tiled(
         if return_stats:
             return _block_sparse_attn_pytorch(Q, K, V, mask_bsr, scale_val, return_stats=True)
         return _block_sparse_attn_pytorch(Q, K, V, mask_bsr, scale_val)
+
+
+def _nki_attn_fwd_static(Q, K, V, mask_bsr, scale: float, return_stats: bool):
+    """Block-sparse attention forward via `trnsparse::attn_fwd_static`.
+
+    One kernel launch over exactly the stored mask blocks (no K_max padding,
+    no K/V gather, no host softmax reduction between two launches). Q and K
+    are passed transposed (head_dim on partitions) so every load is a plain
+    strided DMA.
+    """
+    seq_len, head_dim = Q.shape
+    M_tiles = seq_len // mask_bsr.block_size
+    row_ptrs, cols = _bsr_structure_lists(mask_bsr)
+    orig, dtype = Q.device, Q.dtype
+    Qd, Kd, Vd = (_kernel_input(t).to(_NEURON_DEVICE) for t in (Q, K, V))
+    q_t = (Qd * scale).T.contiguous()
+    out, row_max, row_denom = _get_native_ops()["attn_fwd_static"](
+        q_t, Kd.T.contiguous(), Vd.contiguous(), row_ptrs, cols
+    )
+    out, row_max, row_denom = (t.to(orig) for t in (out, row_max, row_denom))
+    out = out.to(dtype)
+    if return_stats:
+        return out, row_max.reshape(M_tiles, -1), row_denom.reshape(M_tiles, -1)
+    return out
+
+
+def _column_structure(row_ptrs: list[int], cols: list[int], n_col: int):
+    """Transpose a block structure: (col_ptrs, rows), rows ascending per column."""
+    by_col: list[list[int]] = [[] for _ in range(n_col)]
+    for m in range(len(row_ptrs) - 1):
+        for idx in range(row_ptrs[m], row_ptrs[m + 1]):
+            by_col[cols[idx]].append(m)
+    col_ptrs = [0]
+    rows: list[int] = []
+    for r in by_col:
+        rows.extend(r)
+        col_ptrs.append(len(rows))
+    return col_ptrs, rows
+
+
+def _nki_attn_bwd_static(Q, K, V, dO, O, mask_bsr, row_max, row_denom, scale: float):
+    """Block-sparse attention backward via `trnsparse::attn_bwd_static`.
+
+    One launch for dQ, dK and dV over exactly the stored blocks (row-first
+    for dQ, column-first for dK / dV, both structures as kernel constants).
+    D = rowsum(dO * O) and 1 / row_denom are computed with device aten ops.
+    """
+    seq_len, head_dim = Q.shape
+    orig, dtype = Q.device, Q.dtype
+    dev = _NEURON_DEVICE
+    row_ptrs, cols = _bsr_structure_lists(mask_bsr)
+    col_ptrs, rows = _column_structure(row_ptrs, cols, seq_len // mask_bsr.block_size)
+    f = _kernel_input
+    Q, K, V, dO, O = (f(t).to(dev) for t in (Q, K, V, dO, O))
+    q_s = (Q * scale).contiguous()
+    k = f(K.contiguous())
+    do = f(dO.contiguous())
+    rm = f(row_max.to(dev).reshape(seq_len, 1))
+    rinv = 1.0 / f(row_denom.to(dev).reshape(seq_len, 1))
+    d = f((dO * O).sum(dim=-1, keepdim=True))
+    dQ, dK, dV = _get_native_ops()["attn_bwd_static"](
+        q_s.T.contiguous(),
+        k.T.contiguous(),
+        f(V.T.contiguous()),
+        do.T.contiguous(),
+        q_s,
+        k,
+        do,
+        rm.contiguous(),
+        rinv.contiguous(),
+        d.contiguous(),
+        rm.reshape(1, seq_len).contiguous(),
+        rinv.reshape(1, seq_len).contiguous(),
+        d.reshape(1, seq_len).contiguous(),
+        row_ptrs,
+        cols,
+        col_ptrs,
+        rows,
+        float(scale),
+    )
+    return tuple(t.to(device=orig, dtype=dtype) for t in (dQ, dK, dV))
 
 
 def _attn_bwd_gather(
@@ -1129,6 +1328,19 @@ def nki_bsr_attn_bwd(
     seq_len, head_dim = Q.shape
     b = mask_bsr.block_size
     scale = head_dim**-0.5
+
+    if (
+        _native_path()
+        and head_dim <= _TILE_K
+        and b == _TILE_M
+        and seq_len % _TILE_M == 0
+        and _static_structure_ok(2 * mask_bsr.n_blocks)
+    ):
+        try:
+            return _nki_attn_bwd_static(Q, K, V, dO, O, mask_bsr, row_max, row_denom, scale)
+        except Exception:
+            if _REQUIRE_NKI:
+                raise
 
     row_first, col_first = _attn_bwd_gather(Q, K, V, dO, O, mask_bsr, scale, row_max, row_denom)
 

@@ -22,7 +22,7 @@ AMI Neuron or install from `https://pip.repos.neuron.amazonaws.com`.
 
 | Lineage | Instances | Stack | Kernel dispatch |
 |---|---|---|---|
-| TorchNeuron (native) | Trn2, Trn3 | Neuron SDK 2.33+, Python ≥ 3.12, `torch` 2.14, `torch-neuronx` 2.14.* | Each kernel is a PyTorch custom op registered with `torch_neuronx.nki_op` (`torch.ops.trnsparse.spmm_dense`, `bsr_spmm`, `screened_spmm`, `attn_stats`, `attn_out`, `attn_bwd_dq`, `attn_bwd_dkdv`), plus the composite `trnsparse::bsr_attn` / `bsr_attn_bwd`; tensors live on `device="neuron"`. Backwards are attached with `register_autograd`. |
+| TorchNeuron (native) | Trn2, Trn3 | Neuron SDK 2.33+, Python ≥ 3.12, `torch` 2.14, `torch-neuronx` 2.14.* | Each kernel is a PyTorch custom op registered with `torch_neuronx.nki_op` (`torch.ops.trnsparse.spmm_dense`, `bsr_spmm`, `screened_spmm`, `attn_stats`, `attn_out`, `attn_bwd_dq`, `attn_bwd_dkdv`, and the static-structure `bsr_spmm_static`, `attn_fwd_static`, `attn_bwd_static` that `bsr_spmm` and attention use by default), plus the composite `trnsparse::bsr_attn` / `bsr_attn_bwd`; tensors live on `device="neuron"`. Backwards are attached with `register_autograd`. |
 | PyTorch/XLA | Trn1 (also Inf2) | `torch-neuronx` 2.9 lineage, `torch_xla` | Unchanged: kernels run on the `torch_xla` device; autograd via `torch.autograd.Function` wrappers. |
 
 Selection is automatic, on the first kernel launch:

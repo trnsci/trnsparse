@@ -7,7 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+#### Native path: static-structure kernels (#30)
+
+On TorchNeuron the sparse structure is host-resident, so the native path now
+hands it to the kernels as compile-time constants (`int[]` op arguments,
+tuples inside the kernel) instead of padded, gathered device tensors.
+Measured on Trn2 (`benchmarks/bench_native_trn2.py`; tables on #30):
+
+- `bsr_spmm` → `trnsparse::bsr_spmm_static`: walks exactly the stored
+  blocks and addresses B by block column; no `(M_tiles, K_max)` padding and
+  no device-side gather. 8192×8192 @ 8192×512: 3.1–12.5 ms → 0.7–3.9 ms;
+  beats dense aten `matmul` on the device up to ~13% (width 128) to ~34%
+  (width 512) block density at n = 8192.
+- Block-sparse attention forward → `trnsparse::attn_fwd_static`: one launch,
+  two passes with the softmax statistics on chip; no K/V gather, no host
+  reduction, no per-block score round trip through HBM. Backward →
+  `trnsparse::attn_bwd_static`: one launch for dQ (row-first) and dK/dV
+  (column-first). seq 8192 global mask, fwd+bwd: 127–195 ms → ~4 ms.
+- Screened SpMM masks each tile in the transposed frame, so the masked tile
+  is directly the stationary operand (no HBM round trip per tile).
+- `spmm` with host CSR scatters the nnz triplets on the device when that is
+  cheaper than copying a host-built dense matrix.
+
+One compile per distinct structure (seconds; cached in-process by the
+structure). `TRNSPARSE_STATIC_STRUCTURE=0` restores the gather path;
+structures above `TRNSPARSE_STATIC_MAX_UNROLL` (default 16384 unrolled
+block matmuls) use it automatically.
+
 ### Added
+
+- `benchmarks/bench_native_trn2.py`: warm-latency benchmark for the native
+  path against dense aten on the device, CPU, and `torch.sparse` on CPU.
 
 #### Native PyTorch dispatch on TorchNeuron (#29, #30)
 

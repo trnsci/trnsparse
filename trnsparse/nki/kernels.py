@@ -120,36 +120,29 @@ if HAS_NKI:
 
                 psum = nl.zeros((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
 
-                # q is (M, 1) 2D — load as (TILE_M, 1) to satisfy NKI 2D constraint.
-                q_m = nl.load(q[m_off : m_off + TILE_M, :])  # (TILE_M, 1)
+                # Q[m-tile] as a (1, TILE_M) row, broadcast over the k partitions.
+                q_m_row = nl.broadcast_to(
+                    nl.load_transpose2d(q[m_off : m_off + TILE_M, :]), shape=(TILE_K, TILE_M)
+                )
 
                 for k in nl.affine_range(K // TILE_K):
                     k_off = k * TILE_K
 
-                    a_tile = nl.load(a[m_off : m_off + TILE_M, k_off : k_off + TILE_K])
-                    # load_transpose2d on (TILE_K, 1) → (1, TILE_K) for the outer product
-                    q_k = nl.load_transpose2d(q[k_off : k_off + TILE_K, :])  # (1, TILE_K)
-
-                    # Outer-product pair bound (TILE_M, TILE_K). NKI 0.7 lowers a
-                    # (TILE_M,1)*(1,TILE_K) multiply to tensor_scalar_arith with a
-                    # 1-partition dst, which the verifier rejects (partition element
-                    # count mismatch). Broadcast q_k across partitions first so the
-                    # multiply is a plain (P,F) x (P,1) tensor-scalar.
-                    q_k_b = nl.broadcast_to(q_k, shape=(TILE_M, TILE_K))
-                    pair_bound = nl.multiply(q_k_b, q_m)
-                    # Soft 0/1 mask: relu(diff)/(relu(diff)+eps) = 0 where masked, ≈1 where not.
-                    # Avoids boolean→float conversion issues in NKI 0.3.0 simulator.
+                    # Work in the transposed frame (k on partitions): the masked
+                    # tile is then directly the stationary operand. The mask is
+                    # symmetric in (i, j), so mask^T[k, m] = Q[k] Q[m] > thr.
+                    # Before this, each tile was masked in the (m, k) frame and
+                    # round-tripped through HBM to transpose it (4-5x slower
+                    # than dense masked matmul on Trn2).
+                    a_t = nl.load_transpose2d(a[m_off : m_off + TILE_M, k_off : k_off + TILE_K])
+                    q_k = nl.load(q[k_off : k_off + TILE_K, :])  # (TILE_K, 1)
+                    pair_bound = nl.multiply(q_m_row, q_k)  # (P, F) x (P, 1)
+                    # Soft 0/1 mask: relu(diff)/(relu(diff)+eps) = 0 where masked, ~1 where not.
                     relu_diff = nl.relu(nl.subtract(pair_bound, thr))
                     # NKI 0.7 / neuronx-cc 2.28: tensor_tensor `divide` fails ISA
-                    # validation (s3s3d3_tt_valid_op) — multiply by the reciprocal.
+                    # validation (s3s3d3_tt_valid_op) - multiply by the reciprocal.
                     mask_f = nl.multiply(relu_diff, nl.reciprocal(nl.add(relu_diff, 1e-10)))
-                    a_masked = nl.multiply(a_tile, mask_f)
-
-                    # nl.transpose gives PSUM in NKI 0.3.0 which nc_matmul rejects as
-                    # stationary. Store a_masked to HBM and reload transposed.
-                    _ah = nl.ndarray((TILE_M, TILE_K), dtype=a.dtype, buffer=nl.shared_hbm)
-                    nl.store(_ah, value=a_masked)
-                    a_t = nl.load_transpose2d(_ah)  # SBUF (transposed)
+                    a_t = nl.multiply(a_t, mask_f)
                     b_tile = nl.load(b[k_off : k_off + TILE_K, n_off : n_off + TILE_N])
 
                     nisa.nc_matmul(psum, a_t, b_tile, accumulate=True)
@@ -590,3 +583,269 @@ if HAS_NKI:
                 )
 
         return c
+
+    # ── Static-structure kernels (native path) ───────────────────────────────
+    #
+    # On TorchNeuron the sparse structure lives on the host (the `neuron`
+    # device has no sparse CSR, trnsparse#30). These kernels take that
+    # structure as compile-time constants (`row_ptrs`, `cols`: tuples of
+    # Python ints) instead of as padded, gathered device tensors. The trace
+    # unrolls exactly the stored blocks: no (M_tiles, K_max) padding (a
+    # global-token row no longer makes every row cost K_max blocks), no
+    # device-side gather of B / K / V before the launch, and every DMA
+    # address is static. The cost is one compile per distinct structure
+    # (a few seconds; cached in-process by the constant key), which is the
+    # right trade when a pattern is reused: iterative solvers, Fock builds,
+    # fixed attention masks.
+
+    @nki.jit
+    def _bsr_spmm_static_kernel(blocks, b, row_ptrs, cols):
+        """C = A @ B for a BSR A whose structure is static.
+
+        Shapes:
+            blocks:   (n_blocks, 128, 128)  stored blocks, row-major
+            b:        (n_pad, N)            N <= 512 or a multiple of 512
+            row_ptrs: tuple[int]            block-row pointers (M_tiles + 1)
+            cols:     tuple[int]            block-column index per block
+        Returns:
+            out:      (M_tiles * 128, N)
+        """
+        _, N = b.shape
+        M_tiles = len(row_ptrs) - 1
+        TILE_N = N if N <= _TILE_N else _TILE_N
+
+        out = nl.ndarray((M_tiles * _TILE_M, N), dtype=b.dtype, buffer=nl.shared_hbm)
+
+        for m in range(M_tiles):
+            lo = row_ptrs[m]
+            hi = row_ptrs[m + 1]
+            r0 = m * _TILE_M
+            for nt in range(N // TILE_N):
+                n0 = nt * TILE_N
+                if hi == lo:
+                    nl.store(
+                        out[r0 : r0 + _TILE_M, n0 : n0 + TILE_N],
+                        value=nl.zeros((_TILE_M, TILE_N), dtype=b.dtype),
+                    )
+                    continue
+                psum = nl.zeros((_TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
+                for idx in range(lo, hi):
+                    j = cols[idx]
+                    a_t = nl.load_transpose2d(blocks[idx, :, :])
+                    b_tile = nl.load(b[j * _TILE_K : (j + 1) * _TILE_K, n0 : n0 + TILE_N])
+                    nisa.nc_matmul(psum, a_t, b_tile, accumulate=True)
+                _pp = nl.ndarray((_TILE_M, TILE_N), dtype=nl.float32)
+                _pn = nl.ndarray((_TILE_M, TILE_N), dtype=nl.float32)
+                nisa.activation(_pp, nl.relu, psum)
+                nisa.activation(_pn, nl.relu, psum, scale=-1.0)
+                c_sbuf = nl.copy(nl.subtract(_pp, _pn), dtype=b.dtype)
+                nl.store(out[r0 : r0 + _TILE_M, n0 : n0 + TILE_N], value=c_sbuf)
+
+        return out
+
+    @nki.jit
+    def _attn_fwd_static_kernel(q_t, k_t, v, row_ptrs, cols):
+        """Block-sparse attention forward, one launch, static mask structure.
+
+        Per block-row m (128 queries), over exactly the row's stored blocks:
+
+        pass 1: S = Q_m K_j^T (queries on partitions); online row max and
+                softmax denominator, kept on chip.
+        pass 2: S^T = K_j Q_m^T (keys on partitions), P^T = exp(S^T - max)
+                with the row max transposed once to a (1, 128) row and
+                broadcast over partitions; P^T is directly the stationary
+                operand of out += P @ V_j. No score round trip through HBM
+                and no PE transpose per block.
+        out = acc * (1 / denom), the reciprocal as rsqrt^2 (the hardware
+        reciprocal alone is ~1e-3).
+
+        Shapes:
+            q_t:  (head_dim, seq)  (Q * scale)^T, head_dim <= 128
+            k_t:  (head_dim, seq)  K^T
+            v:    (seq, head_dim)
+            row_ptrs, cols: block-mask structure (tuples of int)
+        Returns:
+            out (seq, head_dim), row_max (seq, 1), row_denom (seq, 1)
+            (row_denom = sum exp(s - row_max), as the backward expects).
+        """
+        head_dim, seq = q_t.shape
+        M_tiles = len(row_ptrs) - 1
+
+        out = nl.ndarray((seq, head_dim), dtype=v.dtype, buffer=nl.shared_hbm)
+        rmax_o = nl.ndarray((seq, 1), dtype=nl.float32, buffer=nl.shared_hbm)
+        rden_o = nl.ndarray((seq, 1), dtype=nl.float32, buffer=nl.shared_hbm)
+
+        for m in range(M_tiles):
+            lo = row_ptrs[m]
+            hi = row_ptrs[m + 1]
+            r0 = m * _TILE_M
+            if hi == lo:
+                nl.store(
+                    out[r0 : r0 + _TILE_M, :], value=nl.zeros((_TILE_M, head_dim), dtype=v.dtype)
+                )
+                nl.store(
+                    rmax_o[r0 : r0 + _TILE_M, :], value=nl.zeros((_TILE_M, 1), dtype=nl.float32)
+                )
+                nl.store(
+                    rden_o[r0 : r0 + _TILE_M, :], value=nl.full((_TILE_M, 1), 1.0, dtype=nl.float32)
+                )
+                continue
+            qm = nl.load(q_t[:, r0 : r0 + _TILE_M])  # (head_dim, 128)
+            rm = None
+            den = None
+            for idx in range(lo, hi):
+                j = cols[idx]
+                kj = nl.load(k_t[:, j * _TILE_M : (j + 1) * _TILE_M])
+                s_ps = nl.zeros((_TILE_M, _TILE_M), dtype=nl.float32, buffer=nl.psum)
+                nisa.nc_matmul(s_ps, qm, kj, accumulate=True)
+                s = nl.copy(s_ps, dtype=nl.float32)
+                t_max = nl.max(s, axis=1, keepdims=True)
+                if rm is None:
+                    rm = t_max
+                    den = nl.sum(nl.exp(nl.subtract(s, rm)), axis=1, keepdims=True)
+                else:
+                    rm_new = nl.maximum(rm, t_max)
+                    alpha = nl.exp(nl.subtract(rm, rm_new))
+                    t_sum = nl.sum(nl.exp(nl.subtract(s, rm_new)), axis=1, keepdims=True)
+                    den = nl.add(nl.multiply(den, alpha), t_sum)
+                    rm = rm_new
+            nl.store(rmax_o[r0 : r0 + _TILE_M, :], value=rm)
+            nl.store(rden_o[r0 : r0 + _TILE_M, :], value=den)
+
+            rm_ps = nl.ndarray((1, _TILE_M), dtype=nl.float32, buffer=nl.psum)
+            nisa.nc_transpose(rm_ps, rm, engine=nisa.engine.tensor)
+            rm_b = nl.broadcast_to(nl.copy(rm_ps, dtype=nl.float32), shape=(_TILE_M, _TILE_M))
+            rs = nl.rsqrt(den)
+            rinv = nl.multiply(rs, rs)
+
+            o_ps = nl.zeros((_TILE_M, head_dim), dtype=nl.float32, buffer=nl.psum)
+            for idx in range(lo, hi):
+                j = cols[idx]
+                kj = nl.load(k_t[:, j * _TILE_M : (j + 1) * _TILE_M])
+                vj = nl.load(v[j * _TILE_M : (j + 1) * _TILE_M, :])
+                st_ps = nl.zeros((_TILE_M, _TILE_M), dtype=nl.float32, buffer=nl.psum)
+                nisa.nc_matmul(st_ps, kj, qm, accumulate=True)  # S^T: keys on partitions
+                p_t = nl.exp(nl.subtract(nl.copy(st_ps, dtype=nl.float32), rm_b))
+                nisa.nc_matmul(o_ps, p_t, vj, accumulate=True)  # out += P @ V_j
+            o = nl.multiply(nl.copy(o_ps, dtype=nl.float32), rinv)
+            nl.store(out[r0 : r0 + _TILE_M, :], value=nl.copy(o, dtype=v.dtype))
+
+        return out, rmax_o, rden_o
+
+    @nki.jit
+    def _attn_bwd_static_kernel(
+        q_t,
+        k_t,
+        v_t,
+        do_t,
+        q_s,
+        k,
+        do,
+        rm_col,
+        rinv_col,
+        d_col,
+        rm_row,
+        rinv_row,
+        d_row,
+        row_ptrs,
+        cols,
+        col_ptrs,
+        rows,
+        scale,
+    ):
+        """Block-sparse attention backward, one launch, static mask structure.
+
+        With Qs = Q * scale, S = Qs K^T, P = exp(S - row_max) / row_denom,
+        D = rowsum(dO * O), per stored block (m, j):
+
+            dS = P * (dO_m V_j^T - D_m)
+            dQ_m += scale * dS K_j        (row-first loop, dS^T on partitions)
+            dV_j += P^T dO_m              (column-first loop, P on partitions)
+            dK_j += dS^T Qs_m
+
+        Each output tile accumulates in PSUM over exactly its stored blocks.
+        The row-first loop works in the transposed (keys-on-partitions)
+        frame, so its per-query statistics come in as (1, seq) rows broadcast
+        over partitions; the column-first loop uses (seq, 1) columns.
+        `rinv` is 1 / row_denom computed by the caller (exact division on
+        the device, not the ~1e-3 hardware reciprocal).
+
+        Shapes: *_t (head_dim, seq); q_s, k, do (seq, head_dim);
+        *_col (seq, 1); *_row (1, seq). head_dim <= 128.
+        Returns dQ, dK, dV, each (seq, head_dim).
+        """
+        head_dim, seq = q_t.shape
+        M_tiles = len(row_ptrs) - 1
+        N_col = len(col_ptrs) - 1
+        T = _TILE_M
+
+        dQ = nl.ndarray((seq, head_dim), dtype=q_s.dtype, buffer=nl.shared_hbm)
+        dK = nl.ndarray((seq, head_dim), dtype=q_s.dtype, buffer=nl.shared_hbm)
+        dV = nl.ndarray((seq, head_dim), dtype=q_s.dtype, buffer=nl.shared_hbm)
+
+        # ── dQ: row-first ────────────────────────────────────────────────────
+        for m in range(M_tiles):
+            lo = row_ptrs[m]
+            hi = row_ptrs[m + 1]
+            r0 = m * T
+            if hi == lo:
+                nl.store(dQ[r0 : r0 + T, :], value=nl.zeros((T, head_dim), dtype=q_s.dtype))
+                continue
+            qm_t = nl.load(q_t[:, r0 : r0 + T])  # (hd, q)
+            dom_t = nl.load(do_t[:, r0 : r0 + T])  # (hd, q)
+            rm_b = nl.broadcast_to(nl.load(rm_row[:, r0 : r0 + T]), shape=(T, T))
+            ri_b = nl.broadcast_to(nl.load(rinv_row[:, r0 : r0 + T]), shape=(T, T))
+            d_b = nl.broadcast_to(nl.load(d_row[:, r0 : r0 + T]), shape=(T, T))
+            dq_ps = nl.zeros((T, head_dim), dtype=nl.float32, buffer=nl.psum)
+            for idx in range(lo, hi):
+                j = cols[idx]
+                c0 = j * T
+                kj_t = nl.load(k_t[:, c0 : c0 + T])
+                vj_t = nl.load(v_t[:, c0 : c0 + T])
+                kj = nl.load(k[c0 : c0 + T, :])  # (k, hd)
+                st_ps = nl.zeros((T, T), dtype=nl.float32, buffer=nl.psum)
+                nisa.nc_matmul(st_ps, kj_t, qm_t, accumulate=True)  # S^T (k, q)
+                pt = nl.multiply(nl.exp(nl.subtract(nl.copy(st_ps, dtype=nl.float32), rm_b)), ri_b)
+                dpt_ps = nl.zeros((T, T), dtype=nl.float32, buffer=nl.psum)
+                nisa.nc_matmul(dpt_ps, vj_t, dom_t, accumulate=True)  # dP^T (k, q)
+                dst = nl.multiply(pt, nl.subtract(nl.copy(dpt_ps, dtype=nl.float32), d_b))
+                nisa.nc_matmul(dq_ps, dst, kj, accumulate=True)  # dS @ K_j (q, hd)
+            dq = nl.multiply(nl.copy(dq_ps, dtype=nl.float32), scale)
+            nl.store(dQ[r0 : r0 + T, :], value=nl.copy(dq, dtype=q_s.dtype))
+
+        # ── dK, dV: column-first ─────────────────────────────────────────────
+        for j in range(N_col):
+            lo = col_ptrs[j]
+            hi = col_ptrs[j + 1]
+            c0 = j * T
+            if hi == lo:
+                zero = nl.zeros((T, head_dim), dtype=q_s.dtype)
+                nl.store(dK[c0 : c0 + T, :], value=zero)
+                nl.store(dV[c0 : c0 + T, :], value=zero)
+                continue
+            kj_t = nl.load(k_t[:, c0 : c0 + T])
+            vj_t = nl.load(v_t[:, c0 : c0 + T])
+            dk_ps = nl.zeros((T, head_dim), dtype=nl.float32, buffer=nl.psum)
+            dv_ps = nl.zeros((T, head_dim), dtype=nl.float32, buffer=nl.psum)
+            for idx in range(lo, hi):
+                m = rows[idx]
+                r0 = m * T
+                qm_t = nl.load(q_t[:, r0 : r0 + T])
+                dom_t = nl.load(do_t[:, r0 : r0 + T])
+                qm = nl.load(q_s[r0 : r0 + T, :])  # (q, hd)
+                dom = nl.load(do[r0 : r0 + T, :])  # (q, hd)
+                rm_m = nl.load(rm_col[r0 : r0 + T, :])
+                ri_m = nl.load(rinv_col[r0 : r0 + T, :])
+                d_m = nl.load(d_col[r0 : r0 + T, :])
+                s_ps = nl.zeros((T, T), dtype=nl.float32, buffer=nl.psum)
+                nisa.nc_matmul(s_ps, qm_t, kj_t, accumulate=True)  # S (q, k)
+                p = nl.multiply(nl.exp(nl.subtract(nl.copy(s_ps, dtype=nl.float32), rm_m)), ri_m)
+                dp_ps = nl.zeros((T, T), dtype=nl.float32, buffer=nl.psum)
+                nisa.nc_matmul(dp_ps, dom_t, vj_t, accumulate=True)  # dP (q, k)
+                ds = nl.multiply(p, nl.subtract(nl.copy(dp_ps, dtype=nl.float32), d_m))
+                nisa.nc_matmul(dv_ps, p, dom, accumulate=True)  # P^T dO_m (k, hd)
+                nisa.nc_matmul(dk_ps, ds, qm, accumulate=True)  # dS^T Qs_m (k, hd)
+            nl.store(dK[c0 : c0 + T, :], value=nl.copy(dk_ps, dtype=q_s.dtype))
+            nl.store(dV[c0 : c0 + T, :], value=nl.copy(dv_ps, dtype=q_s.dtype))
+
+        return dQ, dK, dV

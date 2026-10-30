@@ -83,6 +83,48 @@ def _cases():
             _f32(256, 128),
         ),
     }
+    # Static-structure kernels: structure as tuple constants. An empty block
+    # row and a reused column exercise the unrolled loops' edge cases.
+    cases[("_bsr_spmm_static_kernel", "n128")] = lambda: (
+        _f32(3, _P, _P),
+        _f32(3 * _P, 128),
+        (0, 2, 2, 3),
+        (0, 2, 2),
+    )
+    cases[("_bsr_spmm_static_kernel", "n1024")] = lambda: (
+        _f32(3, _P, _P),
+        _f32(3 * _P, 1024),
+        (0, 2, 2, 3),
+        (0, 2, 2),
+    )
+    for hd in (64, 128):
+        cases[("_attn_fwd_static_kernel", f"hd{hd}")] = lambda hd=hd: (
+            _f32(hd, 3 * _P),
+            _f32(hd, 3 * _P),
+            _f32(3 * _P, hd),
+            (0, 2, 2, 5),
+            (0, 1, 0, 1, 2),
+        )
+        cases[("_attn_bwd_static_kernel", f"hd{hd}")] = lambda hd=hd: (
+            _f32(hd, 3 * _P),
+            _f32(hd, 3 * _P),
+            _f32(hd, 3 * _P),
+            _f32(hd, 3 * _P),
+            _f32(3 * _P, hd),
+            _f32(3 * _P, hd),
+            _f32(3 * _P, hd),
+            _f32(3 * _P, 1),
+            np.abs(_f32(3 * _P, 1)),
+            _f32(3 * _P, 1),
+            _f32(1, 3 * _P),
+            np.abs(_f32(1, 3 * _P)),
+            _f32(1, 3 * _P),
+            (0, 2, 2, 5),
+            (0, 1, 0, 1, 2),
+            (0, 2, 4, 5),
+            (0, 2, 0, 2, 2),
+            0.125,
+        )
     # head_dim 64 / 128: single-tile path; head_dim=256: K-tiled path.
     for hd in (64, 128, 256):
         for name in _attn_inputs(hd):

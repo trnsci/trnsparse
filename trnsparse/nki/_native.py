@@ -76,6 +76,78 @@ def screened_spmm(
     return _k._screened_spmm_kernel(a, q, threshold_sqrt, b)
 
 
+def _fake_bsr_spmm_static(blocks, b, row_ptrs, cols):
+    return b.new_empty(((len(row_ptrs) - 1) * _P, b.shape[1]))
+
+
+@nki_op("trnsparse::bsr_spmm_static", mutates_args={}, fake_fn=_fake_bsr_spmm_static)
+def bsr_spmm_static(
+    blocks: torch.Tensor, b: torch.Tensor, row_ptrs: list[int], cols: list[int]
+) -> torch.Tensor:
+    # Structure arrives as int lists and reaches the kernel as tuples, i.e.
+    # compile-time constants (torch_neuronx keys the compiled kernel on them).
+    return _k._bsr_spmm_static_kernel(blocks, b, tuple(row_ptrs), tuple(cols))
+
+
+def _fake_attn_fwd_static(q_t, k_t, v, row_ptrs, cols):
+    seq = v.shape[0]
+    return v.new_empty(v.shape), v.new_empty((seq, 1)), v.new_empty((seq, 1))
+
+
+@nki_op("trnsparse::attn_fwd_static", mutates_args={}, fake_fn=_fake_attn_fwd_static)
+def attn_fwd_static(
+    q_t: torch.Tensor, k_t: torch.Tensor, v: torch.Tensor, row_ptrs: list[int], cols: list[int]
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return _k._attn_fwd_static_kernel(q_t, k_t, v, tuple(row_ptrs), tuple(cols))
+
+
+def _fake_attn_bwd_static(q_t, k_t, v_t, do_t, q_s, *rest):
+    return q_s.new_empty(q_s.shape), q_s.new_empty(q_s.shape), q_s.new_empty(q_s.shape)
+
+
+@nki_op("trnsparse::attn_bwd_static", mutates_args={}, fake_fn=_fake_attn_bwd_static)
+def attn_bwd_static(
+    q_t: torch.Tensor,
+    k_t: torch.Tensor,
+    v_t: torch.Tensor,
+    do_t: torch.Tensor,
+    q_s: torch.Tensor,
+    k: torch.Tensor,
+    do: torch.Tensor,
+    rm_col: torch.Tensor,
+    rinv_col: torch.Tensor,
+    d_col: torch.Tensor,
+    rm_row: torch.Tensor,
+    rinv_row: torch.Tensor,
+    d_row: torch.Tensor,
+    row_ptrs: list[int],
+    cols: list[int],
+    col_ptrs: list[int],
+    rows: list[int],
+    scale: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return _k._attn_bwd_static_kernel(
+        q_t,
+        k_t,
+        v_t,
+        do_t,
+        q_s,
+        k,
+        do,
+        rm_col,
+        rinv_col,
+        d_col,
+        rm_row,
+        rinv_row,
+        d_row,
+        tuple(row_ptrs),
+        tuple(cols),
+        tuple(col_ptrs),
+        tuple(rows),
+        float(scale),
+    )
+
+
 def _fake_attn_stats(q_scaled_blocks, k_gathered_pad):
     M_tiles, K_max = k_gathered_pad.shape[:2]
     shape = (M_tiles, K_max, _P, 1)
@@ -187,6 +259,36 @@ def _bsr_spmm_backward(ctx, grad):
     return grad_blocks, grad_b
 
 
+def _save_static(ctx, inputs, output):
+    blocks, b, row_ptrs, cols = inputs
+    ctx.save_for_backward(blocks, b)
+    ctx.row_ptrs = row_ptrs
+    ctx.cols = cols
+
+
+def _bsr_spmm_static_backward(ctx, grad):
+    # out[m] = sum_{idx in row m} blocks[idx] @ b[cols[idx]]
+    blocks, b = ctx.saved_tensors
+    row_ptrs, cols = ctx.row_ptrs, ctx.cols
+    n_blocks, bs, _ = blocks.shape
+    N = b.shape[1]
+    counts = [row_ptrs[i + 1] - row_ptrs[i] for i in range(len(row_ptrs) - 1)]
+    rows = torch.repeat_interleave(
+        torch.arange(len(counts)), torch.tensor(counts, dtype=torch.long)
+    )
+    rows = rows.to(grad.device)
+    cols_t = torch.tensor(cols, dtype=torch.long, device=grad.device)
+    g_rows = grad.reshape(-1, bs, N)[rows]  # (n_blocks, bs, N)
+    b_cols = b.reshape(-1, bs, N)[cols_t]  # (n_blocks, bs, N)
+    grad_blocks = g_rows @ b_cols.transpose(-1, -2) if ctx.needs_input_grad[0] else None
+    grad_b = None
+    if ctx.needs_input_grad[1]:
+        contrib = blocks.transpose(-1, -2) @ g_rows  # (n_blocks, bs, N)
+        grad_b = torch.zeros(b.shape[0] // bs, bs, N, dtype=b.dtype, device=b.device)
+        grad_b = grad_b.index_add(0, cols_t, contrib.to(b.dtype)).reshape(b.shape)
+    return grad_blocks, grad_b, None, None
+
+
 def _screened_mask(a, q, threshold_sqrt):
     # Same predicate as the kernel: Q[i] * Q[j] > sqrt(threshold).
     return ((q * q.reshape(1, -1)) > threshold_sqrt.reshape(1, 1)).to(a.dtype)
@@ -203,6 +305,10 @@ def _screened_spmm_backward(ctx, grad):
 spmm_dense.register_autograd(_spmm_dense_backward, setup_context=_save_inputs)
 bsr_spmm.register_autograd(_bsr_spmm_backward, setup_context=_save_inputs)
 screened_spmm.register_autograd(_screened_spmm_backward, setup_context=_save_inputs)
+bsr_spmm_static.register_autograd(_bsr_spmm_static_backward, setup_context=_save_static)
+# attn_fwd_static / attn_bwd_static have no register_autograd of their own:
+# they run inside the composite trnsparse::bsr_attn / bsr_attn_bwd ops, whose
+# autograd link is attached in _native_attn.
 
 
 # Composite attention ops (forward/backward over Q, K, V with host mask
@@ -213,6 +319,9 @@ from . import _native_attn  # noqa: E402
 OPS = {
     "spmm_dense": spmm_dense,
     "bsr_spmm": bsr_spmm,
+    "bsr_spmm_static": bsr_spmm_static,
+    "attn_fwd_static": attn_fwd_static,
+    "attn_bwd_static": attn_bwd_static,
     "screened_spmm": screened_spmm,
     "attn_stats": attn_stats,
     "attn_out": attn_out,
