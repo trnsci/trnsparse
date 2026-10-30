@@ -242,14 +242,15 @@ def _rel(x, ref):
 
 
 def _skewed_bsr(n_rows, n_cols, seed):
-    """Block row 0 dense (a global-token row), the rest one or two blocks, one row empty."""
+    """Block row 0 dense (a global-token row), the rest one or two blocks; a middle row empty."""
     g = torch.Generator().manual_seed(seed)
     bm = torch.zeros(n_rows, n_cols, dtype=torch.bool)
     bm[0, :] = True
     for i in range(1, n_rows):
         bm[i, i % n_cols] = True
         bm[i, (3 * i + 1) % n_cols] = True
-    bm[n_rows // 2, :] = False
+    if n_rows > 2:
+        bm[n_rows // 2, :] = False
     dense = torch.randn(n_rows * P, n_cols * P, generator=g)
     dense *= bm.repeat_interleave(P, 0).repeat_interleave(P, 1)
     return dense, trnsparse.BSRMatrix.from_dense(dense, block_size=P)
