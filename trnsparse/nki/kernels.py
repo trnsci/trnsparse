@@ -28,9 +28,51 @@ except ImportError:
     HAS_NKI = False
 
 
+import os
+
 _TILE_M = 128
 _TILE_K = 128
 _TILE_N = 512
+
+# Split the static-structure kernels across the physical cores of a logical
+# NeuronCore (LNC=2 on Trn2). `TRNSPARSE_CORE_SPLIT=0` keeps the whole kernel
+# on every core (the pre-split behaviour; both cores then write identical
+# results), for A/B measurements. Read at trace time.
+_CORE_SPLIT_ENV = "TRNSPARSE_CORE_SPLIT"
+
+
+def _core_split_enabled() -> bool:
+    return os.environ.get(_CORE_SPLIT_ENV, "1").lower() not in ("0", "false", "no")
+
+
+def _assign_units(costs, n_prog: int, pid: int) -> list[int]:
+    """Indices of the work units that program `pid` of `n_prog` owns.
+
+    Each unit writes a disjoint output tile, so any partition is race-free;
+    this one balances the static cost (stored blocks per unit) with a
+    longest-processing-time greedy: units in decreasing cost order go to the
+    least-loaded program, ties to the lower program id and the lower unit
+    index. Deterministic, so both traces (one per core) agree on the
+    partition. Returned indices are ascending (each core walks its units in
+    structure order, which keeps neighbouring DMAs together).
+    """
+    if n_prog <= 1:
+        return list(range(len(costs)))
+    load = [0.0] * n_prog
+    owner = [0] * len(costs)
+    for u in sorted(range(len(costs)), key=lambda i: (-costs[i], i)):
+        k = min(range(n_prog), key=lambda q: (load[q], q))
+        owner[u] = k
+        load[k] += costs[u]
+    return [u for u in range(len(costs)) if owner[u] == pid]
+
+
+def _row_block_counts(ptrs) -> list[int]:
+    return [ptrs[i + 1] - ptrs[i] for i in range(len(ptrs) - 1)]
+
+
+# Relative cost of a unit with no stored blocks (it only stores a zero tile).
+_EMPTY_UNIT_COST = 0.25
 
 
 if HAS_NKI:
@@ -597,6 +639,33 @@ if HAS_NKI:
     # (a few seconds; cached in-process by the constant key), which is the
     # right trade when a pattern is reused: iterative solvers, Fock builds,
     # fixed attention masks.
+    #
+    # Both physical cores (#30 follow-up). Under LNC=2 (the Trn2 default)
+    # NKI traces a kernel once per physical core, with `program_id` 0 and 1
+    # as Python ints. Each kernel splits its output tiles (block rows, plus
+    # 512-column tiles for wide B; block columns for dK/dV) between the
+    # cores with `_assign_units`, balanced by stored blocks. Every output
+    # tile has exactly one writer, so the cores never share a write.
+    #
+    # Precision. Inputs may be fp32 or bf16 (all matmul operands of one
+    # call share a dtype). Every product accumulates in an fp32 PSUM tile;
+    # the softmax statistics and the score-space arithmetic (exp, max, sums,
+    # P * (dP - D)) stay fp32, and only the stationary operands built from
+    # them (P, dS) are rounded to the input dtype before their matmul, as in
+    # flash attention. Outputs take the input dtype; the attention statistics
+    # are always fp32.
+
+    def _program_split():
+        """(n_programs, program_id) of the current trace, as Python ints."""
+        if not _core_split_enabled():
+            return 1, 0
+        n_prog = int(nl.num_programs()) if nl.program_ndim() > 0 else 1
+        pid = int(nl.program_id(0)) if n_prog > 1 else 0
+        return n_prog, pid
+
+    def _cast(t, dtype, like_dtype):
+        """`t` as `dtype`, or `t` itself when it already has that dtype."""
+        return t if dtype == like_dtype else nl.copy(t, dtype=dtype)
 
     @nki.jit
     def _bsr_spmm_static_kernel(blocks, b, row_ptrs, cols):
@@ -607,39 +676,51 @@ if HAS_NKI:
             b:        (n_pad, N)            N <= 512 or a multiple of 512
             row_ptrs: tuple[int]            block-row pointers (M_tiles + 1)
             cols:     tuple[int]            block-column index per block
+        blocks and b share a dtype (fp32 or bf16); PSUM accumulates in fp32.
         Returns:
-            out:      (M_tiles * 128, N)
+            out:      (M_tiles * 128, N), b's dtype
+
+        Work units are (block row, column tile) output tiles, split between
+        the physical cores by stored-block count. A product with fewer
+        output tiles than cores splits its columns instead.
         """
         _, N = b.shape
         M_tiles = len(row_ptrs) - 1
         TILE_N = N if N <= _TILE_N else _TILE_N
+        n_prog, pid = _program_split()
+        if M_tiles * (N // TILE_N) < n_prog and TILE_N % (n_prog * 64) == 0:
+            TILE_N //= n_prog
+        n_nt = N // TILE_N
+        counts = _row_block_counts(row_ptrs)
+        units = [(m, nt) for m in range(M_tiles) for nt in range(n_nt)]
+        costs = [counts[m] if counts[m] else _EMPTY_UNIT_COST for m, _ in units]
 
         out = nl.ndarray((M_tiles * _TILE_M, N), dtype=b.dtype, buffer=nl.shared_hbm)
 
-        for m in range(M_tiles):
+        for u in _assign_units(costs, n_prog, pid):
+            m, nt = units[u]
             lo = row_ptrs[m]
             hi = row_ptrs[m + 1]
             r0 = m * _TILE_M
-            for nt in range(N // TILE_N):
-                n0 = nt * TILE_N
-                if hi == lo:
-                    nl.store(
-                        out[r0 : r0 + _TILE_M, n0 : n0 + TILE_N],
-                        value=nl.zeros((_TILE_M, TILE_N), dtype=b.dtype),
-                    )
-                    continue
-                psum = nl.zeros((_TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
-                for idx in range(lo, hi):
-                    j = cols[idx]
-                    a_t = nl.load_transpose2d(blocks[idx, :, :])
-                    b_tile = nl.load(b[j * _TILE_K : (j + 1) * _TILE_K, n0 : n0 + TILE_N])
-                    nisa.nc_matmul(psum, a_t, b_tile, accumulate=True)
-                _pp = nl.ndarray((_TILE_M, TILE_N), dtype=nl.float32)
-                _pn = nl.ndarray((_TILE_M, TILE_N), dtype=nl.float32)
-                nisa.activation(_pp, nl.relu, psum)
-                nisa.activation(_pn, nl.relu, psum, scale=-1.0)
-                c_sbuf = nl.copy(nl.subtract(_pp, _pn), dtype=b.dtype)
-                nl.store(out[r0 : r0 + _TILE_M, n0 : n0 + TILE_N], value=c_sbuf)
+            n0 = nt * TILE_N
+            if hi == lo:
+                nl.store(
+                    out[r0 : r0 + _TILE_M, n0 : n0 + TILE_N],
+                    value=nl.zeros((_TILE_M, TILE_N), dtype=b.dtype),
+                )
+                continue
+            psum = nl.zeros((_TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
+            for idx in range(lo, hi):
+                j = cols[idx]
+                a_t = nl.load_transpose2d(blocks[idx, :, :])
+                b_tile = nl.load(b[j * _TILE_K : (j + 1) * _TILE_K, n0 : n0 + TILE_N])
+                nisa.nc_matmul(psum, a_t, b_tile, accumulate=True)
+            _pp = nl.ndarray((_TILE_M, TILE_N), dtype=nl.float32)
+            _pn = nl.ndarray((_TILE_M, TILE_N), dtype=nl.float32)
+            nisa.activation(_pp, nl.relu, psum)
+            nisa.activation(_pn, nl.relu, psum, scale=-1.0)
+            c_sbuf = nl.copy(nl.subtract(_pp, _pn), dtype=b.dtype)
+            nl.store(out[r0 : r0 + _TILE_M, n0 : n0 + TILE_N], value=c_sbuf)
 
         return out
 
@@ -659,23 +740,32 @@ if HAS_NKI:
         out = acc * (1 / denom), the reciprocal as rsqrt^2 (the hardware
         reciprocal alone is ~1e-3).
 
+        Block rows are split between the physical cores by stored-block
+        count. q_t, k_t and v share a dtype (fp32 or bf16); S and the
+        statistics are fp32, P^T is rounded to v's dtype for the P @ V
+        matmul (fp32 PSUM).
+
         Shapes:
             q_t:  (head_dim, seq)  (Q * scale)^T, head_dim <= 128
             k_t:  (head_dim, seq)  K^T
             v:    (seq, head_dim)
             row_ptrs, cols: block-mask structure (tuples of int)
         Returns:
-            out (seq, head_dim), row_max (seq, 1), row_denom (seq, 1)
-            (row_denom = sum exp(s - row_max), as the backward expects).
+            out (seq, head_dim) in v's dtype, row_max (seq, 1) and
+            row_denom (seq, 1) in fp32 (row_denom = sum exp(s - row_max),
+            as the backward expects).
         """
         head_dim, seq = q_t.shape
         M_tiles = len(row_ptrs) - 1
+        n_prog, pid = _program_split()
+        counts = _row_block_counts(row_ptrs)
+        costs = [2 * c if c else _EMPTY_UNIT_COST for c in counts]
 
         out = nl.ndarray((seq, head_dim), dtype=v.dtype, buffer=nl.shared_hbm)
         rmax_o = nl.ndarray((seq, 1), dtype=nl.float32, buffer=nl.shared_hbm)
         rden_o = nl.ndarray((seq, 1), dtype=nl.float32, buffer=nl.shared_hbm)
 
-        for m in range(M_tiles):
+        for m in _assign_units(costs, n_prog, pid):
             lo = row_ptrs[m]
             hi = row_ptrs[m + 1]
             r0 = m * _TILE_M
@@ -725,7 +815,7 @@ if HAS_NKI:
                 vj = nl.load(v[j * _TILE_M : (j + 1) * _TILE_M, :])
                 st_ps = nl.zeros((_TILE_M, _TILE_M), dtype=nl.float32, buffer=nl.psum)
                 nisa.nc_matmul(st_ps, kj, qm, accumulate=True)  # S^T: keys on partitions
-                p_t = nl.exp(nl.subtract(nl.copy(st_ps, dtype=nl.float32), rm_b))
+                p_t = nl.exp(nl.subtract(nl.copy(st_ps, dtype=nl.float32), rm_b), dtype=v.dtype)
                 nisa.nc_matmul(o_ps, p_t, vj, accumulate=True)  # out += P @ V_j
             o = nl.multiply(nl.copy(o_ps, dtype=nl.float32), rinv)
             nl.store(out[r0 : r0 + _TILE_M, :], value=nl.copy(o, dtype=v.dtype))
@@ -770,26 +860,41 @@ if HAS_NKI:
         `rinv` is 1 / row_denom computed by the caller (exact division on
         the device, not the ~1e-3 hardware reciprocal).
 
+        The dQ block rows and the dK/dV block columns form one pool of
+        output tiles, split between the physical cores by matmul count
+        (3 per block for a dQ row, 4 for a dK/dV column). The seven operand
+        tensors share a dtype (fp32 or bf16); the statistics are fp32, and
+        P, dS are rounded to the operand dtype only for their matmuls.
+
         Shapes: *_t (head_dim, seq); q_s, k, do (seq, head_dim);
         *_col (seq, 1); *_row (1, seq). head_dim <= 128.
-        Returns dQ, dK, dV, each (seq, head_dim).
+        Returns dQ, dK, dV, each (seq, head_dim) in q_s's dtype.
         """
         head_dim, seq = q_t.shape
         M_tiles = len(row_ptrs) - 1
         N_col = len(col_ptrs) - 1
         T = _TILE_M
+        dt = q_s.dtype
+        n_prog, pid = _program_split()
+        row_counts = _row_block_counts(row_ptrs)
+        col_counts = _row_block_counts(col_ptrs)
+        units = [(0, m) for m in range(M_tiles)] + [(1, j) for j in range(N_col)]
+        costs = [3 * c if c else _EMPTY_UNIT_COST for c in row_counts] + [
+            4 * c if c else _EMPTY_UNIT_COST for c in col_counts
+        ]
+        mine = [units[u] for u in _assign_units(costs, n_prog, pid)]
 
-        dQ = nl.ndarray((seq, head_dim), dtype=q_s.dtype, buffer=nl.shared_hbm)
-        dK = nl.ndarray((seq, head_dim), dtype=q_s.dtype, buffer=nl.shared_hbm)
-        dV = nl.ndarray((seq, head_dim), dtype=q_s.dtype, buffer=nl.shared_hbm)
+        dQ = nl.ndarray((seq, head_dim), dtype=dt, buffer=nl.shared_hbm)
+        dK = nl.ndarray((seq, head_dim), dtype=dt, buffer=nl.shared_hbm)
+        dV = nl.ndarray((seq, head_dim), dtype=dt, buffer=nl.shared_hbm)
 
         # ── dQ: row-first ────────────────────────────────────────────────────
-        for m in range(M_tiles):
+        for m in [i for kind, i in mine if kind == 0]:
             lo = row_ptrs[m]
             hi = row_ptrs[m + 1]
             r0 = m * T
             if hi == lo:
-                nl.store(dQ[r0 : r0 + T, :], value=nl.zeros((T, head_dim), dtype=q_s.dtype))
+                nl.store(dQ[r0 : r0 + T, :], value=nl.zeros((T, head_dim), dtype=dt))
                 continue
             qm_t = nl.load(q_t[:, r0 : r0 + T])  # (hd, q)
             dom_t = nl.load(do_t[:, r0 : r0 + T])  # (hd, q)
@@ -808,18 +913,18 @@ if HAS_NKI:
                 pt = nl.multiply(nl.exp(nl.subtract(nl.copy(st_ps, dtype=nl.float32), rm_b)), ri_b)
                 dpt_ps = nl.zeros((T, T), dtype=nl.float32, buffer=nl.psum)
                 nisa.nc_matmul(dpt_ps, vj_t, dom_t, accumulate=True)  # dP^T (k, q)
-                dst = nl.multiply(pt, nl.subtract(nl.copy(dpt_ps, dtype=nl.float32), d_b))
+                dst = nl.multiply(pt, nl.subtract(nl.copy(dpt_ps, dtype=nl.float32), d_b), dtype=dt)
                 nisa.nc_matmul(dq_ps, dst, kj, accumulate=True)  # dS @ K_j (q, hd)
             dq = nl.multiply(nl.copy(dq_ps, dtype=nl.float32), scale)
-            nl.store(dQ[r0 : r0 + T, :], value=nl.copy(dq, dtype=q_s.dtype))
+            nl.store(dQ[r0 : r0 + T, :], value=nl.copy(dq, dtype=dt))
 
         # ── dK, dV: column-first ─────────────────────────────────────────────
-        for j in range(N_col):
+        for j in [i for kind, i in mine if kind == 1]:
             lo = col_ptrs[j]
             hi = col_ptrs[j + 1]
             c0 = j * T
             if hi == lo:
-                zero = nl.zeros((T, head_dim), dtype=q_s.dtype)
+                zero = nl.zeros((T, head_dim), dtype=dt)
                 nl.store(dK[c0 : c0 + T, :], value=zero)
                 nl.store(dV[c0 : c0 + T, :], value=zero)
                 continue
@@ -842,10 +947,10 @@ if HAS_NKI:
                 p = nl.multiply(nl.exp(nl.subtract(nl.copy(s_ps, dtype=nl.float32), rm_m)), ri_m)
                 dp_ps = nl.zeros((T, T), dtype=nl.float32, buffer=nl.psum)
                 nisa.nc_matmul(dp_ps, dom_t, vj_t, accumulate=True)  # dP (q, k)
-                ds = nl.multiply(p, nl.subtract(nl.copy(dp_ps, dtype=nl.float32), d_m))
-                nisa.nc_matmul(dv_ps, p, dom, accumulate=True)  # P^T dO_m (k, hd)
+                ds = nl.multiply(p, nl.subtract(nl.copy(dp_ps, dtype=nl.float32), d_m), dtype=dt)
+                nisa.nc_matmul(dv_ps, _cast(p, dt, nl.float32), dom, accumulate=True)  # P^T dO_m
                 nisa.nc_matmul(dk_ps, ds, qm, accumulate=True)  # dS^T Qs_m (k, hd)
-            nl.store(dK[c0 : c0 + T, :], value=nl.copy(dk_ps, dtype=q_s.dtype))
-            nl.store(dV[c0 : c0 + T, :], value=nl.copy(dv_ps, dtype=q_s.dtype))
+            nl.store(dK[c0 : c0 + T, :], value=nl.copy(dk_ps, dtype=dt))
+            nl.store(dV[c0 : c0 + T, :], value=nl.copy(dv_ps, dtype=dt))
 
         return dQ, dK, dV

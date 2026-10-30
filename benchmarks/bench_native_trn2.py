@@ -15,6 +15,17 @@ Sections:
     attn    Block-sparse attention (local / dilated / global masks), forward
             and forward+backward, vs dense SDPA on the device and on CPU.
 
+Options for the bsr and attn sections:
+    --dtype bf16  run the operands in bf16 (fp32 PSUM inside the kernels)
+                  and the dense aten baselines in bf16 too, so each side has
+                  matched precision. Errors are against fp64 on the
+                  bf16-rounded inputs.
+    --fast        only the device columns (trnsparse e2e, static kernel,
+                  dense aten); skips the gather path and the CPU baselines.
+    TRNSPARSE_CORE_SPLIT=0 in the environment keeps each static kernel on
+    one physical core's partition (the whole kernel on both cores, as
+    before the split), for A/B runs.
+
 Timing: each callable is run ``--warmup`` times (the first call compiles),
 then ``--reps`` times with ``torch.neuron.synchronize()`` after every call;
 the median is reported in milliseconds. Structure stays on the host, dense
@@ -106,21 +117,26 @@ def random_bsr(n, density, seed=0):
     )
 
 
+_DTYPES = {"fp32": torch.float32, "bf16": torch.bfloat16}
+
+
 def section_bsr(args):
     densities = [float(x) for x in args.densities.split(",")]
     widths = [int(x) for x in args.widths.split(",")]
     n = args.size
+    dt = _DTYPES[args.dtype]
     for width in widths:
         g = torch.Generator().manual_seed(1)
-        Bc = torch.randn(n, width, generator=g)
-        Bd = Bc.to(DEV)
+        Bc = torch.randn(n, width, generator=g).to(dt).float()  # values exact in dt
+        Bd = Bc.to(DEV, dt)
         dense_dev_ms = None
         cpu_dense_ms = None
         for dens in densities:
             A = random_bsr(n, dens)
+            A.blocks = A.blocks.to(dt).float()
             Ac = A.to_dense()
             Ad_dev = trnsparse.BSRMatrix(
-                blocks=A.blocks.to(DEV),
+                blocks=A.blocks.to(DEV, dt),
                 block_col_indices=A.block_col_indices,
                 block_row_ptrs=A.block_row_ptrs,
                 shape=A.shape,
@@ -130,6 +146,8 @@ def section_bsr(args):
             K_max = max(counts)
             row = {
                 "section": "bsr",
+                "dtype": args.dtype,
+                "core_split": _core_split(),
                 "n": n,
                 "width": width,
                 "block_density": dens,
@@ -141,13 +159,28 @@ def section_bsr(args):
             out = trnsparse.bsr_spmm(Ad_dev, Bd)
             row["rel_err"] = rel_err(out, ref)
             row["trnsparse_ms"] = safe_bench(lambda: trnsparse.bsr_spmm(Ad_dev, Bd), reps=args.reps)
+            ops = _d._get_native_ops()
+            if args.fast:
+                rp, cl = _d._bsr_structure_lists(A)
+                bl = Ad_dev.blocks
+                row["static_kernel_ms"] = safe_bench(
+                    lambda: ops["bsr_spmm_static"](bl, Bd, rp, cl), reps=args.reps
+                )
+                Ad = Ac.to(DEV, dt)
+                if dense_dev_ms is None:
+                    dense_dev_ms = safe_bench(lambda: Ad @ Bd, reps=args.reps)
+                row["dense_dev_ms"] = dense_dev_ms
+                Ad = None
+                if row["trnsparse_ms"] and dense_dev_ms:
+                    row["speedup_vs_dense_dev"] = dense_dev_ms / row["trnsparse_ms"]
+                emit(row, args.out)
+                continue
 
             # Split: device-side prep (gather) vs the kernel launch.
             def prep():
                 return _d._bsr_pad_and_gather(_d._BlockView(Ad_dev, Ad_dev.blocks), Bd)
 
             bp, bg, *_ = prep()
-            ops = _d._get_native_ops()
             # Gather path (main before trnsparse#30 static kernels): device-side
             # pad + gather, then the K_max-padded kernel.
             row["gather_prep_ms"] = safe_bench(prep, reps=args.reps)
@@ -160,7 +193,7 @@ def section_bsr(args):
                     lambda: ops["bsr_spmm_static"](bl, Bd, rp, cl), reps=args.reps
                 )
 
-            Ad = Ac.to(DEV)
+            Ad = Ac.to(DEV, dt)
             if dense_dev_ms is None:
                 dense_dev_ms = safe_bench(lambda: Ad @ Bd, reps=args.reps)
             row["dense_dev_ms"] = dense_dev_ms
@@ -302,11 +335,12 @@ def section_attn(args):
     seq = args.size
     nb = seq // P
     F = torch.nn.functional
+    dt = _DTYPES[args.dtype]
     for hd in [int(x) for x in args.head_dims.split(",")]:
         g = torch.Generator().manual_seed(0)
-        Qc, Kc, Vc = (torch.randn(seq, hd, generator=g) for _ in range(3))
-        dOc = torch.randn(seq, hd, generator=g)
-        Qd, Kd, Vd, dOd = (t.to(DEV) for t in (Qc, Kc, Vc, dOc))
+        Qc, Kc, Vc = (torch.randn(seq, hd, generator=g).to(dt).float() for _ in range(3))
+        dOc = torch.randn(seq, hd, generator=g).to(dt).float()
+        Qd, Kd, Vd, dOd = (t.to(DEV, dt) for t in (Qc, Kc, Vc, dOc))
 
         def sdpa_fwd(q, k, v, m=None):
             return F.scaled_dot_product_attention(q[None], k[None], v[None], attn_mask=m)[0]
@@ -320,7 +354,9 @@ def section_attn(args):
             return q.grad
 
         dense_fb = safe_bench(dense_fwd_bwd, reps=args.reps)
-        cpu_fwd = safe_bench(lambda: sdpa_fwd(Qc, Kc, Vc), warmup=1, reps=args.cpu_reps)
+        cpu_fwd = None
+        if not args.fast:
+            cpu_fwd = safe_bench(lambda: sdpa_fwd(Qc, Kc, Vc), warmup=1, reps=args.cpu_reps)
         for kind in args.masks.split(","):
             bm = block_mask(kind, nb)
             mb = mask_bsr_from_block_mask(bm)
@@ -328,6 +364,8 @@ def section_attn(args):
             counts = bm.sum(1).tolist()
             row = {
                 "section": "attn",
+                "dtype": args.dtype,
+                "core_split": _core_split(),
                 "seq": seq,
                 "head_dim": hd,
                 "mask": kind,
@@ -365,12 +403,19 @@ def section_attn(args):
             row["sdpa_masked_dev_fwd_ms"] = safe_bench(
                 lambda: sdpa_fwd(Qd, Kd, Vd, em_d), reps=args.reps
             )
-            row["sdpa_cpu_fwd_ms"] = cpu_fwd
-            row["sdpa_masked_cpu_fwd_ms"] = safe_bench(
-                lambda: sdpa_fwd(Qc, Kc, Vc, elem_mask), warmup=1, reps=args.cpu_reps
-            )
+            if not args.fast:
+                row["sdpa_cpu_fwd_ms"] = cpu_fwd
+                row["sdpa_masked_cpu_fwd_ms"] = safe_bench(
+                    lambda: sdpa_fwd(Qc, Kc, Vc, elem_mask), warmup=1, reps=args.cpu_reps
+                )
             emit(row, args.out)
             em_d = None
+
+
+def _core_split():
+    from trnsparse.nki import kernels
+
+    return kernels._core_split_enabled()
 
 
 def main():
@@ -383,6 +428,8 @@ def main():
     ap.add_argument("--head-dims", default="64,128")
     ap.add_argument("--masks", default="local,dilated,global")
     ap.add_argument("--no-bwd", action="store_true")
+    ap.add_argument("--dtype", default="fp32", choices=sorted(_DTYPES))
+    ap.add_argument("--fast", action="store_true")
     ap.add_argument("--reps", type=int, default=10)
     ap.add_argument("--cpu-reps", type=int, default=3)
     ap.add_argument("--out", default="")

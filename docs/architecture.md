@@ -97,6 +97,24 @@ cost is one compile per distinct structure (seconds), which a reused pattern
 amortizes. `TRNSPARSE_STATIC_STRUCTURE=0` restores the gather path. Measured
 crossovers against dense aten: `docs/benchmarks.md`.
 
+Under LNC=2 (the Trn2 default) NKI traces each kernel once per physical
+core, with `program_id` 0 and 1 as Python ints. The static kernels split
+their output tiles between the two traces, balanced by stored blocks:
+
+- SpMM: block rows and 512-column tiles.
+- Attention forward: block rows.
+- Attention backward: one pool of dQ block rows and dK/dV block columns.
+
+Each output tile has exactly one writer. `TRNSPARSE_CORE_SPLIT=0` turns the
+split off, for A/B measurements.
+
+The static kernels take fp32 or bf16 operands. When every operand is bf16,
+the matmuls run in bf16 and accumulate in fp32 PSUM. Scores, softmax
+statistics and score-space arithmetic stay fp32; only P and dS are rounded
+to bf16 for their matmuls. Outputs come back in bf16, and the attention
+statistics (`row_max`, `row_denom`) are always fp32. Mixed fp32/bf16
+operands run in fp32.
+
 ## Formats
 
 - **CSR**: row pointer + column indices + values. Preferred for construction,
