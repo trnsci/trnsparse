@@ -310,26 +310,50 @@ def _csr_to_dense_padded(A) -> torch.Tensor:
     return t.to_dense()
 
 
-def _csr_to_dense_on(A, device) -> torch.Tensor:
-    """Densify a host-structure CSRMatrix directly on `device`.
+# Densify on the device below this element density, on the host above it.
+# Trn2 crossover (4096^2 / 8192^2): a device scatter costs ~15 ns per stored
+# entry, a host densify + H2D copy ~1.4 ns per matrix element.
+_DEVICE_DENSIFY_MAX_DENSITY = 0.1
 
-    The row index of each stored entry is computed on the host (as in
-    `formats._csr_to_dense_host`); only the nnz-sized (row, col, value)
-    triplets cross to the device, and the scatter into a zero (M, K) tile
-    runs there. Before this, the whole dense M x K matrix was built on the
-    host and copied over on every call (156 ms of a 157 ms `spmm` at
-    8192 x 8192 on Trn2). Differentiable w.r.t. `A.values`; duplicates are
-    summed.
+
+def _csr_to_dense_on(A, device) -> torch.Tensor:
+    """Densify a host-structure CSRMatrix for a kernel on `device`.
+
+    Sparse enough (`nnz < _DEVICE_DENSIFY_MAX_DENSITY * M * K`): the row
+    index of each entry is computed on the host, only the nnz-sized
+    (flat index, value) pairs cross to the device, and the scatter into a
+    zero tile runs there. Otherwise the dense matrix is built on the host and
+    copied (`formats._csr_to_dense_host`), as before. Before this, every
+    call copied the full host-built dense matrix (156 ms of a 157 ms
+    `spmm` at 8192 x 8192, 0.1% dense, on Trn2).
+
+    Canonical CSR (strictly increasing columns per row, as `from_dense`
+    builds) uses `scatter`; duplicates fall back to `index_add` (summed, as
+    `torch.sparse_csr_tensor(...).to_dense()`; ~8x slower on Trn2).
+    Differentiable w.r.t. `A.values` either way.
     """
+    from ..formats import _csr_to_dense_host
+
     m, n = A.shape
-    row_ptrs = A.row_ptrs.cpu()
     nnz = A.values.shape[0]
+    if torch.device(device).type == "cpu" or nnz >= _DEVICE_DENSIFY_MAX_DENSITY * m * n:
+        return _csr_to_dense_host(A).to(device)
+    row_ptrs = A.row_ptrs.cpu()
     positions = torch.arange(nnz, dtype=row_ptrs.dtype)
     rows = (torch.searchsorted(row_ptrs, positions, right=True) - 1).to(torch.long)
     flat = rows * n + A.col_indices.cpu().to(torch.long)
     values = A.values.to(device)
     dense = torch.zeros(m * n, dtype=values.dtype, device=device)
-    dense = dense.index_add(0, flat.to(device), values)
+    flat_d = flat.to(device)
+    # Under torch.compile the duplicate check would be a data-dependent
+    # branch; index_add is correct either way.
+    canonical = not torch.compiler.is_compiling() and (
+        nnz < 2 or bool((flat[1:] > flat[:-1]).all())
+    )
+    if canonical:
+        dense = dense.scatter(0, flat_d, values)
+    else:
+        dense = dense.index_add(0, flat_d, values)
     return dense.view(m, n)
 
 
@@ -665,11 +689,13 @@ def _nki_bsr_spmm_static(A, B: torch.Tensor) -> torch.Tensor:
         B_p[:n, :out_cols] = B
         B = B_p
     row_ptrs, cols = _bsr_structure_lists(A)
-    blocks = _kernel_input(A.blocks.to(B.device).contiguous())
-    out = _get_native_ops()["bsr_spmm_static"](
-        blocks, _kernel_input(B.contiguous()), row_ptrs, cols
-    )
-    return out[:m, :out_cols].to(A.blocks.dtype)
+    # Kernel operands go to the neuron device (a no-op when they are already
+    # there); the result returns to B's device.
+    orig = B.device
+    blocks = _kernel_input(A.blocks.contiguous()).to(_NEURON_DEVICE)
+    b_dev = _kernel_input(B.contiguous()).to(_NEURON_DEVICE)
+    out = _get_native_ops()["bsr_spmm_static"](blocks, b_dev, row_ptrs, cols)
+    return out[:m, :out_cols].to(device=orig, dtype=A.blocks.dtype)
 
 
 class _BlockView:
@@ -1063,12 +1089,14 @@ def _nki_attn_fwd_static(Q, K, V, mask_bsr, scale: float, return_stats: bool):
     seq_len, head_dim = Q.shape
     M_tiles = seq_len // mask_bsr.block_size
     row_ptrs, cols = _bsr_structure_lists(mask_bsr)
-    dev = Q.device
-    q_t = _kernel_input((Q * scale).T.contiguous())
-    k_t = _kernel_input(K.to(dev).T.contiguous())
-    v = _kernel_input(V.to(dev).contiguous())
-    out, row_max, row_denom = _get_native_ops()["attn_fwd_static"](q_t, k_t, v, row_ptrs, cols)
-    out = out.to(Q.dtype)
+    orig, dtype = Q.device, Q.dtype
+    Qd, Kd, Vd = (_kernel_input(t).to(_NEURON_DEVICE) for t in (Q, K, V))
+    q_t = (Qd * scale).T.contiguous()
+    out, row_max, row_denom = _get_native_ops()["attn_fwd_static"](
+        q_t, Kd.T.contiguous(), Vd.contiguous(), row_ptrs, cols
+    )
+    out, row_max, row_denom = (t.to(orig) for t in (out, row_max, row_denom))
+    out = out.to(dtype)
     if return_stats:
         return out, row_max.reshape(M_tiles, -1), row_denom.reshape(M_tiles, -1)
     return out
@@ -1096,12 +1124,13 @@ def _nki_attn_bwd_static(Q, K, V, dO, O, mask_bsr, row_max, row_denom, scale: fl
     D = rowsum(dO * O) and 1 / row_denom are computed with device aten ops.
     """
     seq_len, head_dim = Q.shape
-    dev = Q.device
+    orig, dtype = Q.device, Q.dtype
+    dev = _NEURON_DEVICE
     row_ptrs, cols = _bsr_structure_lists(mask_bsr)
     col_ptrs, rows = _column_structure(row_ptrs, cols, seq_len // mask_bsr.block_size)
     f = _kernel_input
-    K, V, dO, O = (t.to(dev) for t in (K, V, dO, O))
-    q_s = f((Q * scale).contiguous())
+    Q, K, V, dO, O = (f(t).to(dev) for t in (Q, K, V, dO, O))
+    q_s = (Q * scale).contiguous()
     k = f(K.contiguous())
     do = f(dO.contiguous())
     rm = f(row_max.to(dev).reshape(seq_len, 1))
@@ -1127,7 +1156,7 @@ def _nki_attn_bwd_static(Q, K, V, dO, O, mask_bsr, row_max, row_denom, scale: fl
         rows,
         float(scale),
     )
-    return dQ.to(Q.dtype), dK.to(Q.dtype), dV.to(Q.dtype)
+    return tuple(t.to(device=orig, dtype=dtype) for t in (dQ, dK, dV))
 
 
 def _attn_bwd_gather(

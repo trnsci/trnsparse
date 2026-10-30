@@ -793,8 +793,25 @@ class TestNativePathOnCpu:
         torch.testing.assert_close(trnsparse.bsr_spmm(A, B), C, atol=1e-3, rtol=1e-4)
         assert calls == [1]
 
-    def test_csr_densify_on_device_matches_host(self):
-        dense, A = _random_csr(37, 53, 0.2, seed=4)
+    @pytest.mark.parametrize("duplicates", [False, True])
+    def test_csr_densify_on_device_matches_host(self, monkeypatch, duplicates):
+        dense, A = _random_csr(37, 53, 0.05, seed=4)
+        if duplicates:  # repeat each row's first entry: must be summed
+            v, ci, rp = [], [], [0]
+            for i in range(37):
+                lo, hi = A.row_ptrs[i].item(), A.row_ptrs[i + 1].item()
+                if hi > lo:
+                    v += [A.values[lo].item()]
+                    ci += [A.col_indices[lo].item()]
+                v += A.values[lo:hi].tolist()
+                ci += A.col_indices[lo:hi].tolist()
+                rp.append(len(v))
+            A = trnsparse.CSRMatrix(torch.tensor(v), torch.tensor(ci), torch.tensor(rp), A.shape)
+            dense = A.to_dense()
+        # Exercise the device branch on CPU: treat "cpu" as a device target.
+        monkeypatch.setattr(
+            dispatch.torch, "device", lambda d: types.SimpleNamespace(type="neuron")
+        )
         A.values.requires_grad_(True)
         D = dispatch._csr_to_dense_on(A, "cpu")
         torch.testing.assert_close(D, dense)

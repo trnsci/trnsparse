@@ -83,6 +83,20 @@ Fock-build-sized inputs.
 kernel — a `BSRMatrix` with a local-window or dilated block pattern IS
 an attention mask. See [sparse_attention.md](sparse_attention.md).
 
+### Static structure on the native path (Trn2/Trn3)
+
+TorchNeuron has no device sparse CSR, so the structure stays on the host
+(#30). The native path turns that into an advantage: `bsr_spmm` and
+block-sparse attention pass `block_row_ptrs` / `block_col_indices` to the
+kernel as compile-time constants (`trnsparse::bsr_spmm_static`,
+`attn_fwd_static`, `attn_bwd_static`). The trace unrolls exactly the stored
+blocks with static DMA addresses: no `(M_tiles, K_max)` padding (one dense
+global-token row no longer makes every row cost `K_max` blocks), no gathered
+copies of B / K / V, and the attention softmax statistics stay on chip. The
+cost is one compile per distinct structure (seconds), which a reused pattern
+amortizes. `TRNSPARSE_STATIC_STRUCTURE=0` restores the gather path. Measured
+crossovers against dense aten: `docs/benchmarks.md`.
+
 ## Formats
 
 - **CSR**: row pointer + column indices + values. Preferred for construction,

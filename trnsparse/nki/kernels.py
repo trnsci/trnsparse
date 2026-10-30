@@ -120,36 +120,29 @@ if HAS_NKI:
 
                 psum = nl.zeros((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
 
-                # q is (M, 1) 2D — load as (TILE_M, 1) to satisfy NKI 2D constraint.
-                q_m = nl.load(q[m_off : m_off + TILE_M, :])  # (TILE_M, 1)
+                # Q[m-tile] as a (1, TILE_M) row, broadcast over the k partitions.
+                q_m_row = nl.broadcast_to(
+                    nl.load_transpose2d(q[m_off : m_off + TILE_M, :]), shape=(TILE_K, TILE_M)
+                )
 
                 for k in nl.affine_range(K // TILE_K):
                     k_off = k * TILE_K
 
-                    a_tile = nl.load(a[m_off : m_off + TILE_M, k_off : k_off + TILE_K])
-                    # load_transpose2d on (TILE_K, 1) → (1, TILE_K) for the outer product
-                    q_k = nl.load_transpose2d(q[k_off : k_off + TILE_K, :])  # (1, TILE_K)
-
-                    # Outer-product pair bound (TILE_M, TILE_K). NKI 0.7 lowers a
-                    # (TILE_M,1)*(1,TILE_K) multiply to tensor_scalar_arith with a
-                    # 1-partition dst, which the verifier rejects (partition element
-                    # count mismatch). Broadcast q_k across partitions first so the
-                    # multiply is a plain (P,F) x (P,1) tensor-scalar.
-                    q_k_b = nl.broadcast_to(q_k, shape=(TILE_M, TILE_K))
-                    pair_bound = nl.multiply(q_k_b, q_m)
-                    # Soft 0/1 mask: relu(diff)/(relu(diff)+eps) = 0 where masked, ≈1 where not.
-                    # Avoids boolean→float conversion issues in NKI 0.3.0 simulator.
+                    # Work in the transposed frame (k on partitions): the masked
+                    # tile is then directly the stationary operand. The mask is
+                    # symmetric in (i, j), so mask^T[k, m] = Q[k] Q[m] > thr.
+                    # Before this, each tile was masked in the (m, k) frame and
+                    # round-tripped through HBM to transpose it (4-5x slower
+                    # than dense masked matmul on Trn2).
+                    a_t = nl.load_transpose2d(a[m_off : m_off + TILE_M, k_off : k_off + TILE_K])
+                    q_k = nl.load(q[k_off : k_off + TILE_K, :])  # (TILE_K, 1)
+                    pair_bound = nl.multiply(q_m_row, q_k)  # (P, F) x (P, 1)
+                    # Soft 0/1 mask: relu(diff)/(relu(diff)+eps) = 0 where masked, ~1 where not.
                     relu_diff = nl.relu(nl.subtract(pair_bound, thr))
                     # NKI 0.7 / neuronx-cc 2.28: tensor_tensor `divide` fails ISA
-                    # validation (s3s3d3_tt_valid_op) — multiply by the reciprocal.
+                    # validation (s3s3d3_tt_valid_op) - multiply by the reciprocal.
                     mask_f = nl.multiply(relu_diff, nl.reciprocal(nl.add(relu_diff, 1e-10)))
-                    a_masked = nl.multiply(a_tile, mask_f)
-
-                    # nl.transpose gives PSUM in NKI 0.3.0 which nc_matmul rejects as
-                    # stationary. Store a_masked to HBM and reload transposed.
-                    _ah = nl.ndarray((TILE_M, TILE_K), dtype=a.dtype, buffer=nl.shared_hbm)
-                    nl.store(_ah, value=a_masked)
-                    a_t = nl.load_transpose2d(_ah)  # SBUF (transposed)
+                    a_t = nl.multiply(a_t, mask_f)
                     b_tile = nl.load(b[k_off : k_off + TILE_K, n_off : n_off + TILE_N])
 
                     nisa.nc_matmul(psum, a_t, b_tile, accumulate=True)
