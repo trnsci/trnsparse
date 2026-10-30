@@ -65,6 +65,10 @@ are unchanged.
   `torch.compile(backend="neuron", fullgraph=True)` of `spmm` with
   host-CSR structure. Not yet run on hardware.
 
+## [0.7.0] — 2026-10-28
+
+Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron device) — see trnsci/trnsci#35.
+
 ### Fixed
 
 - PyTorch reference attention (`_block_sparse_attn_pytorch` and the
