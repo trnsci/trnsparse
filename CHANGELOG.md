@@ -7,11 +7,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+#### Native PyTorch dispatch on TorchNeuron (#29, #30)
+
+On TorchNeuron (Neuron SDK 2.33+, `torch-neuronx` 2.14, PyTorch 2.14,
+Trn2/Trn3), every NKI kernel is now registered as a PyTorch custom op with
+`torch_neuronx.nki_op` and dispatched on `device="neuron"`, with no
+`torch_xla` import. Ops: `trnsparse::spmm_dense`, `bsr_spmm`,
+`screened_spmm`, `attn_stats`, `attn_out`, `attn_bwd_dq`, `attn_bwd_dkdv`,
+plus the composite `trnsparse::bsr_attn` / `bsr_attn_bwd`. Kernel bodies
+are unchanged.
+
+- Autograd on the native path uses `register_autograd` on the ops instead
+  of `torch.autograd.Function`: `spmm_dense`, `bsr_spmm` and
+  `screened_spmm` carry their analytic adjoints, and `bsr_attn` carries the
+  NKI dQ / dK-dV backward (via `bsr_attn_bwd`). Gradients reach
+  `CSRMatrix.values`, `BSRMatrix.blocks` and the dense operands through the
+  host-side densify / pad / gather. `_SpMMFunction`, `_BSRSpMMFunction`,
+  `_ScreenedSpMMFunction` and `_AttnTiledFunction` remain for the XLA path,
+  the simulator and the PyTorch backend. The native BSR backward has no
+  per-block Python loop.
+- Placement (#30): the `neuron` device has no sparse CSR tensors
+  (aws-neuron-sdk#1442), so sparse structure stays on the host and only
+  dense data moves. `spmm`, `spmv`, `spmv_symmetric`, `bsr_spmm`,
+  `screened_spmm`, `block_sparse_attention_tiled`, `cg_bsr` and
+  `jacobi_preconditioner_bsr` accept host CSR/BSR structure with dense
+  operands (and BSR `blocks`) on `neuron`, and return results on the dense
+  operand's device. A host CSR against a device operand is densified on the
+  host without a torch sparse tensor (`formats._csr_to_dense_host`, static
+  shapes), so `spmm` with host-CSR structure traces under
+  `torch.compile(..., fullgraph=True)`. Index tensors found on a device are
+  read through host copies. Documented in `docs/installation.md` and the
+  format and op docstrings.
+- The dispatch path is detected on the first kernel launch: native when
+  `torch_neuronx` exports `nki_op` and a `neuron` device is available, XLA
+  when `torch_xla` is installed, otherwise none. The XLA path (Trn1) is
+  unchanged, as are the PyTorch fallback and the `TRNSPARSE_USE_SIMULATOR`
+  path. All kernel launches share one helper (`dispatch._launch`, or its
+  halves `_to_device` / `_run` where several attention kernels share
+  operands).
+- Custom ops are registered lazily (`trnsparse/nki/_native.py` and
+  `_native_attn.py` are imported only when the native path is selected).
+- `TRNSCI_NKI_DISPATCH=auto|native|xla|cpu` forces the dispatch path (a
+  suite-wide variable). Forcing an unavailable path raises instead of
+  falling back. `TRNSCI_XLA_DEPRECATION=1` makes the XLA path emit a
+  one-time `DeprecationWarning` (off by default).
+- New `[torchneuron]` extra (`torch>=2.14`, `torch-neuronx>=2.14`,
+  `nki>=0.6`); `[neuron]` stays the PyTorch/XLA lineage.
+- Tests: `conftest.py` sets `NKI_ENABLE_TRACE_CACHE=0` by default.
+  `tests/test_native_dispatch.py` (CPU) covers path selection, launch
+  routing, lazy registration, op schemas and fake shapes, the registered
+  backward formulas, the native wrappers end to end on CPU with real custom
+  ops, and a CPU `fullgraph=True` trace of host-CSR `spmm`.
+  `tests/test_nki_native.py` (`@pytest.mark.neuron`, native only) covers
+  host-structure / device-operand calls, gradients, and
+  `torch.compile(backend="neuron", fullgraph=True)` of `spmm` with
+  host-CSR structure. Not yet run on hardware.
+
 ## [0.7.0] — 2026-10-28
 
 Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron device) — see trnsci/trnsci#35.
 
 ### Fixed
+
+- PyTorch reference attention (`_block_sparse_attn_pytorch` and the
+  recompute branch of `_block_sparse_attn_backward`) allocates on Q's
+  device instead of the default device.
 
 - **NKI 0.7.0 / neuronx-cc 2.28 kernel compatibility (#29).** Kernels that
   passed `nki.simulate` failed to compile on Trn2 (Neuron SDK 2.33):

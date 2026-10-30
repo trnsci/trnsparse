@@ -11,6 +11,13 @@ For quantum chemistry:
 
 On Trainium, SpMV/SpMM map to gather-matmul patterns on the Tensor Engine:
 gather non-zero rows/cols into dense tiles, matmul, scatter back.
+
+Placement (native TorchNeuron, Trn2/Trn3): sparse structure lives on the
+host, dense operands may live on the host or on `device="neuron"`, and
+every result lands on the dense operand's device. The `neuron` device has
+no sparse CSR tensors (aws-neuron-sdk#1442), so when the dense operand is
+on another device than the CSR, A is densified on the host (no torch
+sparse tensor) and only the dense data moves.
 """
 
 from __future__ import annotations
@@ -19,12 +26,33 @@ import math
 
 import torch
 
-from .formats import BSRMatrix, COOMatrix, CSRMatrix
+from .formats import BSRMatrix, COOMatrix, CSRMatrix, _csr_to_dense_host
 
 
 def _as_torch_csr(A: CSRMatrix) -> torch.Tensor:
     """View CSRMatrix as a torch.sparse_csr_tensor (no copy)."""
     return torch.sparse_csr_tensor(A.row_ptrs, A.col_indices, A.values, size=A.shape)
+
+
+def _torch_sparse_ok(A: CSRMatrix, X: torch.Tensor) -> bool:
+    """Can `A @ X` use a torch sparse tensor? Only when A and X share a
+    device and that device is not `neuron` (no sparse CSR there,
+    aws-neuron-sdk#1442)."""
+    same = A.values.device == A.row_ptrs.device == A.col_indices.device == X.device
+    return same and X.device.type != "neuron"
+
+
+def _csr_matmul(A: CSRMatrix, X: torch.Tensor) -> torch.Tensor:
+    """`A @ X` on X's device.
+
+    Same (non-neuron) device: the torch sparse CSR matmul, as before.
+    Otherwise (a host CSR against a `neuron` operand): densify A on the host
+    and move only the dense matrix, because the device has no sparse CSR
+    tensors.
+    """
+    if _torch_sparse_ok(A, X):
+        return _as_torch_csr(A) @ X
+    return _csr_to_dense_host(A).to(X.device) @ X
 
 
 def spmv(
@@ -38,11 +66,17 @@ def spmv(
 
     Lowers to `torch.sparse_csr_tensor @ x` — a single vectorized call
     instead of a per-row Python loop.
+
+    Placement: `A` on the host, `x` on the host or on `neuron`. With `x` on
+    a device, A is densified on the host and the dense product runs on
+    x's device (the `neuron` device has no sparse CSR); the result is on
+    x's device. For repeated SpMVs with the same A on device, prefer
+    `bsr_spmm` (dense blocks stay resident) or densify once yourself.
     """
     m, n = A.shape
     assert x.shape[0] == n, f"Dimension mismatch: A is {A.shape}, x is {x.shape}"
 
-    result = alpha * (_as_torch_csr(A) @ x)
+    result = alpha * _csr_matmul(A, x)
     if y is not None and beta != 0.0:
         result = result + beta * y
     return result
@@ -63,6 +97,12 @@ def spmm(
 
     On PyTorch backend: lowers to `torch.sparse_csr_tensor @ B` (v0.1.3
     vectorized fallback).
+
+    Placement (native TorchNeuron): `A` (structure and values) on the
+    host, `B` on the host or on `neuron`. A is densified on the host and
+    the dense tile moves to the device for the `trnsparse::spmm_dense`
+    kernel op; the result is on B's device. Differentiable w.r.t.
+    `A.values` and `B` (autograd registered on the op).
     """
     from .nki.dispatch import _use_nki, nki_spmm
 
@@ -72,7 +112,7 @@ def spmm(
     if _use_nki():
         result = alpha * nki_spmm(A, B)
     else:
-        result = alpha * (_as_torch_csr(A) @ B)
+        result = alpha * _csr_matmul(A, B)
     if C is not None and beta != 0.0:
         result = result + beta * C
     return result
@@ -90,6 +130,9 @@ def spmv_symmetric(
     m, n = A.shape
     assert m == n, "Matrix must be square for symmetric SpMV"
 
+    if not _torch_sparse_ok(A, x):
+        return _spmv_symmetric_dense(A, x, alpha)
+
     rows = torch.repeat_interleave(torch.arange(m), A.row_ptrs[1:] - A.row_ptrs[:-1])
     cols = A.col_indices
     strict_mask = rows != cols
@@ -102,6 +145,18 @@ def spmv_symmetric(
     ).coalesce()
 
     return alpha * (A_sparse @ x + strict.t() @ x)
+
+
+def _spmv_symmetric_dense(A: CSRMatrix, x: torch.Tensor, alpha: float) -> torch.Tensor:
+    """`spmv_symmetric` for a host CSR and an operand on another device.
+
+    The device has no sparse tensors: build the symmetric dense view
+    (stored triangle plus the transpose of its strict part) on the host and
+    move it once.
+    """
+    D = _csr_to_dense_host(A)
+    strict = D - torch.diag(torch.diagonal(D))
+    return alpha * ((D + strict.T).to(x.device) @ x)
 
 
 def sparse_add(A: CSRMatrix, B: CSRMatrix, alpha: float = 1.0, beta: float = 1.0) -> CSRMatrix:
@@ -183,12 +238,16 @@ def _bsr_spmm_pytorch(A: BSRMatrix, B: torch.Tensor) -> torch.Tensor:
         B = B_p
 
     out = torch.zeros(m_pad, k, dtype=A.dtype, device=B.device)
+    # Structure from host copies; blocks follow B's device.
+    row_ptrs = A.block_row_ptrs.cpu()
+    col_indices = A.block_col_indices.cpu()
+    blocks = A.blocks.to(B.device)
     for i in range(mb):
-        start = A.block_row_ptrs[i].item()
-        end = A.block_row_ptrs[i + 1].item()
+        start = row_ptrs[i].item()
+        end = row_ptrs[i + 1].item()
         for idx in range(start, end):
-            j = A.block_col_indices[idx].item()
-            out[i * b : (i + 1) * b] += A.blocks[idx] @ B[j * b : (j + 1) * b]
+            j = col_indices[idx].item()
+            out[i * b : (i + 1) * b] += blocks[idx] @ B[j * b : (j + 1) * b]
     return out[:m]
 
 
@@ -200,6 +259,10 @@ def bsr_spmm(A: BSRMatrix, B: torch.Tensor) -> torch.Tensor:
     already a Tensor Engine tile).
 
     On PyTorch backend: the reference loop in `_bsr_spmm_pytorch`.
+
+    Placement (native TorchNeuron): `A.block_row_ptrs` and
+    `A.block_col_indices` on the host; `A.blocks` and `B` on the host or on
+    `neuron`. The result is on B's device.
     """
     from .nki.dispatch import _use_nki
 
@@ -300,8 +363,9 @@ def _block_sparse_attn_pytorch(
     M_tiles = seq_len // b
     n_blocks = mask_bsr.n_blocks
 
-    tile_max = torch.full((n_blocks, b), float("-inf"), dtype=Q.dtype)
-    tile_sumexp = torch.zeros((n_blocks, b), dtype=Q.dtype)
+    dev = Q.device
+    tile_max = torch.full((n_blocks, b), float("-inf"), dtype=Q.dtype, device=dev)
+    tile_sumexp = torch.zeros((n_blocks, b), dtype=Q.dtype, device=dev)
 
     for m in range(M_tiles):
         start = mask_bsr.block_row_ptrs[m].item()
@@ -313,7 +377,7 @@ def _block_sparse_attn_pytorch(
             tile_max[idx] = score.max(dim=1).values
             tile_sumexp[idx] = torch.exp(score - tile_max[idx].unsqueeze(1)).sum(dim=1)
 
-    row_max_flat = torch.full((seq_len,), float("-inf"), dtype=Q.dtype)
+    row_max_flat = torch.full((seq_len,), float("-inf"), dtype=Q.dtype, device=dev)
     for m in range(M_tiles):
         start = mask_bsr.block_row_ptrs[m].item()
         end = mask_bsr.block_row_ptrs[m + 1].item()
@@ -322,7 +386,7 @@ def _block_sparse_attn_pytorch(
             continue
         row_max_flat[m * b : (m + 1) * b] = tile_max[start:end].max(dim=0).values
 
-    row_denom_flat = torch.zeros(seq_len, dtype=Q.dtype)
+    row_denom_flat = torch.zeros(seq_len, dtype=Q.dtype, device=dev)
     for m in range(M_tiles):
         start = mask_bsr.block_row_ptrs[m].item()
         end = mask_bsr.block_row_ptrs[m + 1].item()
@@ -336,7 +400,7 @@ def _block_sparse_attn_pytorch(
 
     row_denom_flat = row_denom_flat.clamp(min=1e-12)
 
-    out = torch.zeros(seq_len, head_dim, dtype=Q.dtype)
+    out = torch.zeros(seq_len, head_dim, dtype=Q.dtype, device=dev)
     for m in range(M_tiles):
         start = mask_bsr.block_row_ptrs[m].item()
         end = mask_bsr.block_row_ptrs[m + 1].item()
@@ -400,7 +464,7 @@ def _block_sparse_attn_backward(
         row_denom_flat = row_denom.reshape(seq_len)
     else:
         # --- Recompute row_max (one pass over blocks) ---
-        row_max_flat = torch.full((seq_len,), float("-inf"), dtype=Q.dtype)
+        row_max_flat = torch.full((seq_len,), float("-inf"), dtype=Q.dtype, device=Q.device)
         for m in range(M_tiles):
             start = mask_bsr.block_row_ptrs[m].item()
             end = mask_bsr.block_row_ptrs[m + 1].item()
@@ -416,7 +480,7 @@ def _block_sparse_attn_backward(
             row_max_flat[m * b : (m + 1) * b] = row_max_m
 
         # --- Recompute row_denom (second pass over blocks) ---
-        row_denom_flat = torch.zeros(seq_len, dtype=Q.dtype)
+        row_denom_flat = torch.zeros(seq_len, dtype=Q.dtype, device=Q.device)
         for m in range(M_tiles):
             start = mask_bsr.block_row_ptrs[m].item()
             end = mask_bsr.block_row_ptrs[m + 1].item()
@@ -481,6 +545,11 @@ class _AttnTiledFunction(torch.autograd.Function):
 
     Saves Q, K, V, O plus the BSRMatrix sparsity pattern components
     (not the block values — only the pattern is needed for backward).
+
+    Used on the PyTorch/XLA path, the simulator and the PyTorch backend. On
+    the native TorchNeuron path the same forward/backward pair is the
+    `trnsparse::bsr_attn` custom op with `register_autograd`
+    (`nki/_native_attn.py`).
     """
 
     @staticmethod
@@ -595,6 +664,12 @@ def block_sparse_attention_tiled(
         multiple of 128 (K-tiling, e.g., 256 or 512). The PyTorch backend
         accepts any head_dim.
 
+        Placement (native TorchNeuron): the mask's `block_row_ptrs` /
+        `block_col_indices` stay on the host; Q, K, V may be on the host or
+        on `neuron`, and the output is on Q's device. The call runs as the
+        `trnsparse::bsr_attn` custom op, whose backward (the NKI dQ and
+        dK/dV kernels) is attached with `register_autograd`.
+
     Returns:
         (seq_len, head_dim) attention output.
     """
@@ -602,6 +677,21 @@ def block_sparse_attention_tiled(
 
     if scale is None:
         scale = head_dim**-0.5
+
+    from .nki.dispatch import _native_path, _use_nki
+
+    if _use_nki() and _native_path():
+        from .nki.dispatch import _get_native_ops
+
+        out, _, _ = _get_native_ops()["bsr_attn"](
+            Q,
+            K,
+            V,
+            mask_bsr.block_col_indices.cpu(),
+            mask_bsr.block_row_ptrs.cpu(),
+            mask_bsr.block_size,
+        )
+        return out
 
     if torch.is_grad_enabled() and (Q.requires_grad or K.requires_grad or V.requires_grad):
         return _AttnTiledFunction.apply(
@@ -614,8 +704,6 @@ def block_sparse_attention_tiled(
             mask_bsr.block_size,
             scale,
         )
-
-    from .nki.dispatch import _use_nki
 
     if _use_nki():
         from .nki.dispatch import nki_bsr_attn_tiled
