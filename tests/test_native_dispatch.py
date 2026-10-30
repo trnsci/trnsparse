@@ -11,6 +11,7 @@ host.
 
 import importlib.util
 import itertools
+import re
 import subprocess
 import sys
 import types
@@ -39,7 +40,10 @@ KERNEL_OPS = {
     "attn_bwd_dq",
     "attn_bwd_dkdv",
 }
-AUTOGRAD_OPS = {"spmm_dense", "bsr_spmm", "screened_spmm"}
+# Static-structure kernel ops: structure passed as int lists (compile-time
+# constants), launched directly rather than through `_launch` / `_run`.
+STATIC_OPS = {"bsr_spmm_static", "attn_fwd_static", "attn_bwd_static"}
+AUTOGRAD_OPS = {"spmm_dense", "bsr_spmm", "screened_spmm", "bsr_spmm_static"}
 COMPOSITE_OPS = {"bsr_attn", "bsr_attn_bwd"}
 P = 128
 
@@ -156,6 +160,53 @@ def _ref_bsr_spmm(blocks_pad, b_gathered):
     return out.reshape(M_tiles * blocks_pad.shape[2], b_gathered.shape[-1])
 
 
+def _ref_bsr_spmm_static(blocks, b, row_ptrs, cols):
+    bs = blocks.shape[-1]
+    out = b.new_zeros(((len(row_ptrs) - 1) * bs, b.shape[1]))
+    for m in range(len(row_ptrs) - 1):
+        for idx in range(row_ptrs[m], row_ptrs[m + 1]):
+            j = cols[idx]
+            out[m * bs : (m + 1) * bs] += blocks[idx] @ b[j * bs : (j + 1) * bs]
+    return out
+
+
+def _ref_attn_fwd_static(q_t, k_t, v, row_ptrs, cols):
+    seq = v.shape[0]
+    out = v.new_zeros(v.shape)
+    rmax = v.new_zeros((seq, 1))
+    rden = v.new_ones((seq, 1))
+    for m in range(len(row_ptrs) - 1):
+        js = cols[row_ptrs[m] : row_ptrs[m + 1]]
+        if not js:
+            continue
+        rows = slice(m * P, (m + 1) * P)
+        kidx = torch.cat([torch.arange(j * P, (j + 1) * P) for j in js])
+        s = q_t[:, rows].T @ k_t[:, kidx]
+        mx = s.max(dim=1, keepdim=True).values
+        e = torch.exp(s - mx)
+        den = e.sum(dim=1, keepdim=True)
+        out[rows] = (e @ v[kidx]) / den
+        rmax[rows], rden[rows] = mx, den
+    return out, rmax, rden
+
+
+def _ref_attn_bwd_static(
+    q_t, k_t, v_t, do_t, q_s, k, do, rm_col, rinv_col, d_col, rm_row, rinv_row, d_row,
+    row_ptrs, cols, col_ptrs, rows, scale,
+):  # fmt: skip
+    dQ, dK, dV = torch.zeros_like(q_s), torch.zeros_like(q_s), torch.zeros_like(q_s)
+    for m in range(len(row_ptrs) - 1):
+        r = slice(m * P, (m + 1) * P)
+        for idx in range(row_ptrs[m], row_ptrs[m + 1]):
+            c = slice(cols[idx] * P, (cols[idx] + 1) * P)
+            p = torch.exp(q_s[r] @ k[c].T - rm_col[r]) * rinv_col[r]
+            ds = p * (do[r] @ v_t[:, c] - d_col[r])
+            dQ[r] += scale * ds @ k[c]
+            dK[c] += ds.T @ q_s[r]
+            dV[c] += p.T @ do[r]
+    return dQ, dK, dV
+
+
 def _ref_screened_spmm(a, q, threshold_sqrt, b):
     mask = (q * q.reshape(1, -1)) > threshold_sqrt.reshape(1, 1)
     return (a * mask.to(a.dtype)) @ b
@@ -178,6 +229,9 @@ def cpu_native(monkeypatch):
         ("_spmm_dense_kernel", _ref_spmm_dense),
         ("_bsr_spmm_kernel", _ref_bsr_spmm),
         ("_screened_spmm_kernel", _ref_screened_spmm),
+        ("_bsr_spmm_static_kernel", _ref_bsr_spmm_static),
+        ("_attn_fwd_static_kernel", _ref_attn_fwd_static),
+        ("_attn_bwd_static_kernel", _ref_attn_bwd_static),
     ):
         # `kernels` for the op bodies; `dispatch` because the host wrappers
         # name the kernel (only imported there when nki is installed).
@@ -433,8 +487,8 @@ class TestLazyRegistration:
 
         ops = dispatch._get_native_ops()
 
-        assert set(ops) == KERNEL_OPS | COMPOSITE_OPS
-        assert set(recorded) == {f"trnsparse::{name}" for name in KERNEL_OPS}
+        assert set(ops) == KERNEL_OPS | STATIC_OPS | COMPOSITE_OPS
+        assert set(recorded) == {f"trnsparse::{name}" for name in KERNEL_OPS | STATIC_OPS}
         assert all(r["mutates"] == {} for r in recorded.values())
         assert all(r["fake"] is not None for r in recorded.values())
         with_autograd = {n.split("::")[1] for n, r in recorded.items() if r["autograd"]}
@@ -456,11 +510,17 @@ class TestLazyRegistration:
             sys.modules, "torch_neuronx", _fake_native_torch_neuronx(recorded=recorded)
         )
         dispatch._get_native_ops()
-        assert len(recorded) == len(KERNEL_OPS)
+        assert len(recorded) == len(KERNEL_OPS | STATIC_OPS)
         for name, r in recorded.items():
             schema = torch.library.infer_schema(r["fn"], mutates_args=r["mutates"])
             ret = schema.split("->")[1].strip()
-            assert ret in ("Tensor", "(Tensor, Tensor)"), (name, schema)
+            assert ret in ("Tensor", "(Tensor, Tensor)", "(Tensor, Tensor, Tensor)"), (name, schema)
+            if name.split("::")[1] in STATIC_OPS:
+                # list[int] infers as SymInt[] (int[] on older torch).
+                assert re.search(r"(Sym)?[Ii]nt\[\] row_ptrs, (Sym)?[Ii]nt\[\] cols", schema), (
+                    name,
+                    schema,
+                )
             assert "Tensor" in schema.split("->")[0], (name, schema)
 
     @needs_custom_op
@@ -492,6 +552,14 @@ class TestLazyRegistration:
         dk_args = (m(2, P, 64), m(2, P, 64), m(2, 4, P, 64), m(2, 4, P, 64)) + (m(2, 4, P, 1),) * 3
         dK, dV = fake("attn_bwd_dkdv")(*dk_args)
         assert dK.shape == dV.shape == (2 * P, 64)
+        assert fake("bsr_spmm_static")(m(3, P, P), m(2 * P, 96), [0, 1, 1, 3], [0, 0, 1]).shape == (
+            3 * P,
+            96,
+        )
+        o, rm, rd = fake("attn_fwd_static")(
+            m(64, 2 * P), m(64, 2 * P), m(2 * P, 64), [0, 1, 3], [0, 0, 1]
+        )
+        assert o.shape == (2 * P, 64) and rm.shape == rd.shape == (2 * P, 1)
 
 
 class _Ctx:
@@ -535,6 +603,25 @@ class TestRegisteredBackwardFormulas:
         torch.manual_seed(1)
         inputs = (torch.randn(3, 2, P, P), torch.randn(3, 2, P, 40))
         self._check(native._bsr_spmm_backward, _ref_bsr_spmm, inputs, (True, True))
+
+    def test_bsr_spmm_static(self, native):
+        torch.manual_seed(3)
+        row_ptrs, cols = [0, 2, 2, 3], [0, 2, 2]  # empty middle row, column 2 reused
+        blocks, b = torch.randn(3, P, P), torch.randn(3 * P, 24)
+        for needs in ((True, True), (False, True), (True, False)):
+            leaves = [t.clone().requires_grad_(n) for t, n in zip((blocks, b), needs, strict=True)]
+            out = _ref_bsr_spmm_static(*leaves, row_ptrs, cols)
+            g = torch.randn_like(out)
+            out.backward(g)
+            ctx = _Ctx((blocks, b), needs + (False, False))
+            ctx.row_ptrs, ctx.cols = row_ptrs, cols
+            got = native._bsr_spmm_static_backward(ctx, g)
+            assert got[2] is None and got[3] is None
+            for leaf, grad, n in zip(leaves, got[:2], needs, strict=True):
+                if n:
+                    torch.testing.assert_close(grad, leaf.grad, atol=1e-4, rtol=1e-4)
+                else:
+                    assert grad is None
 
     def test_screened_spmm(self, native):
         torch.manual_seed(2)
@@ -686,6 +773,66 @@ class TestNativePathOnCpu:
         _bsr_spmm_pytorch(ref, B_ref).square().sum().backward()
         torch.testing.assert_close(A.blocks.grad, blocks_ref.grad, atol=1e-3, rtol=1e-4)
         torch.testing.assert_close(B.grad, B_ref.grad, atol=1e-3, rtol=1e-4)
+
+    def test_bsr_spmm_static_is_default_and_gather_path_still_works(self, cpu_native, monkeypatch):
+        g = torch.Generator().manual_seed(11)
+        dense = torch.randn(256, 384, generator=g)
+        dense[:128, 128:] = 0
+        A = trnsparse.BSRMatrix.from_dense(dense, block_size=P)
+        B = torch.randn(384, 600, generator=g)  # > 512 columns: padded to 1024
+        calls = []
+        real = dispatch._nki_bsr_spmm_static
+        monkeypatch.setattr(
+            dispatch, "_nki_bsr_spmm_static", lambda *a: calls.append(1) or real(*a)
+        )
+        C = trnsparse.bsr_spmm(A, B)
+        assert calls == [1]
+        torch.testing.assert_close(C, dense @ B, atol=1e-3, rtol=1e-4)
+        # Disabled (or over the unroll cap): the gather path, same result.
+        monkeypatch.setattr(dispatch, "_STATIC_STRUCTURE", False)
+        torch.testing.assert_close(trnsparse.bsr_spmm(A, B), C, atol=1e-3, rtol=1e-4)
+        assert calls == [1]
+
+    def test_csr_densify_on_device_matches_host(self):
+        dense, A = _random_csr(37, 53, 0.2, seed=4)
+        A.values.requires_grad_(True)
+        D = dispatch._csr_to_dense_on(A, "cpu")
+        torch.testing.assert_close(D, dense)
+        D.sum().backward()
+        torch.testing.assert_close(A.values.grad, torch.ones_like(A.values))
+
+    def test_attention_static_forward(self, cpu_native):
+        from trnsparse.ops import _block_sparse_attn_pytorch
+
+        torch.manual_seed(13)
+        seq_len, hd = 4 * P, 64
+        bm = torch.eye(4, dtype=torch.bool)
+        bm[:, 0] = True
+        bm[0, :] = True  # global-token row: 4 blocks, others 2
+        pattern = bm.repeat_interleave(P, 0).repeat_interleave(P, 1).float()
+        mask = trnsparse.BSRMatrix.from_dense(pattern, block_size=P)
+        Q, K, V = (torch.randn(seq_len, hd) for _ in range(3))
+        out, rm, rd = dispatch.nki_bsr_attn_tiled(Q, K, V, mask, return_stats=True)
+        ref, rm_ref, rd_ref = _block_sparse_attn_pytorch(Q, K, V, mask, hd**-0.5, return_stats=True)
+        torch.testing.assert_close(out, ref, atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(rm, rm_ref, atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(rd, rd_ref, atol=1e-3, rtol=1e-4)
+
+        from trnsparse.ops import _block_sparse_attn_backward
+
+        dO = torch.randn(seq_len, hd)
+        got = dispatch.nki_bsr_attn_bwd(Q, K, V, dO, out, mask, rm, rd)
+        want = _block_sparse_attn_backward(
+            Q, K, V, ref, dO, mask, hd**-0.5, row_max=rm_ref, row_denom=rd_ref
+        )
+        for g_, w_ in zip(got, want, strict=True):
+            torch.testing.assert_close(g_, w_, atol=1e-4, rtol=1e-4)
+
+    def test_column_structure(self):
+        assert dispatch._column_structure([0, 2, 2, 5], [0, 1, 0, 1, 2], 3) == (
+            [0, 2, 4, 5],
+            [0, 2, 0, 2, 2],
+        )
 
     def test_screened_spmm_forward_and_grad(self, cpu_native, monkeypatch):
         def boom(*a):
