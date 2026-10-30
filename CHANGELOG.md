@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+#### Native path: static kernels on both LNC=2 cores, bf16 operands (#30)
+
+- `bsr_spmm_static`, `attn_fwd_static` and `attn_bwd_static` split their
+  output tiles between the two physical cores of an LNC=2 logical core
+  (`program_id`), balanced by stored blocks; each output tile has one
+  writer. `TRNSPARSE_CORE_SPLIT=0` turns the split off.
+- bf16 inputs (all operands bf16) run bf16 matmuls with fp32 PSUM
+  accumulation; scores and softmax statistics stay fp32, and the attention
+  statistics returned by `trnsparse::bsr_attn` are fp32 for bf16 / fp16 Q.
+  Mixed fp32/bf16 operands run in fp32.
+- `benchmarks/bench_native_trn2.py`: `--dtype bf16` (matched-precision
+  dense aten baselines) and `--fast` (device columns only).
+
 #### Native path: static-structure kernels (#30)
 
 On TorchNeuron the sparse structure is host-resident, so the native path now
