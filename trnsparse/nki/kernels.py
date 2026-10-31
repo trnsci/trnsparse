@@ -1133,3 +1133,467 @@ if HAS_NKI:
             nl.store(dV[c0 : c0 + T, :], value=nl.copy(dv_ps, dtype=dt))
 
         return dQ, dK, dV
+
+
+# ── Fused, SBUF-resident conjugate gradient over static BSR (#22) ───────────
+#
+# One launch runs the whole solve: A's stored blocks are DMA'd into SBUF
+# once and stay there for every iteration; x, r, p (and z) live in SBUF in
+# a column layout (element t*128 + p of right-hand side c at [p, t*R + c]);
+# every dot product is a VectorE multiply-reduce along the free axis
+# followed by one TensorE all-ones matmul that sums over partitions and
+# broadcasts the result to all 128 partitions at once, in PSUM.
+# Convergence is checked on the device: an `nl.while_loop` runs
+# `check_every` CG steps per trip and re-tests ||r||^2 > tol^2 ||b||^2 (and
+# the iteration cap) through a sequencer register, so the host is never in
+# the iteration loop. Inside a trip the steps are masked: once a column has
+# converged (or hit the cap) its alpha = beta = 0 and its state stops
+# changing, so iteration counts and solutions are exact, not rounded up to a
+# multiple of `check_every`.
+#
+# R > 1 right-hand sides are R independent CG solves sharing A: each stored
+# block is one matmul with R moving columns. On Trn2 a 128x128 fp32
+# stationary block costs ~0.5 us to load whether 1 or 64 columns stream
+# through it, so up to ~64 right-hand sides cost little more than one.
+
+# SBUF bytes per partition the CG kernel may use for resident A blocks,
+# block-Jacobi inverses and (for R > 1) its vectors. Trn2 SBUF is 192 KiB
+# per partition; the rest holds stream buffers and compiler temporaries.
+_CG_SBUF_ENV = "TRNSPARSE_CG_SBUF_KIB"
+# Stored blocks per streaming DMA when A does not fit (8 KiB / partition).
+_CG_STREAM_BLOCKS = 16
+_CG_TINY = 1e-30
+# fp32 (128, R) vectors the multi-RHS kernel keeps in SBUF per block row.
+_CG_VECTORS = 8
+
+
+def _cg_sbuf_budget_bytes() -> int:
+    return int(float(os.environ.get(_CG_SBUF_ENV, "160")) * 1024)
+
+
+def cg_resident_blocks(
+    n_blocks: int,
+    n_tiles: int,
+    precond: bool,
+    n_rhs: int = 1,
+    itemsize: int = 4,
+    budget_kib: float | None = None,
+) -> int:
+    """How many of A's stored blocks the fused CG kernel keeps in SBUF.
+
+    Blocks past this count are streamed from HBM on every iteration (still
+    inside the one launch). The block-Jacobi inverses (one block per block
+    row) are always resident and come out of the same budget, as do the
+    vectors when there is more than one right-hand side.
+    """
+    per_block = _TILE_K * itemsize  # bytes per partition per 128x128 block
+    total = _cg_sbuf_budget_bytes() if budget_kib is None else int(budget_kib * 1024)
+    budget = total - (n_tiles * per_block if precond else 0)
+    if n_rhs > 1:
+        budget -= _CG_VECTORS * n_tiles * n_rhs * itemsize
+    return max(0, min(n_blocks, budget // per_block))
+
+
+def cg_core_rows(
+    row_ptrs, precond: bool, n_prog: int, enabled: bool | None = None
+) -> list[tuple[int, int]]:
+    """Contiguous block-row range of each physical core in the fused CG.
+
+    With two cores (LNC=2, core split on) the rows split where the stored
+    blocks (plus one block-Jacobi inverse per row) balance best; each core
+    then keeps only its rows' blocks in SBUF and computes their part of
+    every matvec and dot product. One core, or one block row, keeps all.
+    """
+    T = len(row_ptrs) - 1
+    if enabled is None:
+        enabled = _core_split_enabled()
+    if n_prog != 2 or T < 2 or not enabled:
+        return [(0, T)]
+    extra = 1 if precond else 0
+    cum = [row_ptrs[t] + extra * t for t in range(T + 1)]
+    total = cum[T]
+    s = min(range(1, T), key=lambda k: (abs(2 * cum[k] - total), k))
+    return [(0, s), (s, T)]
+
+
+if HAS_NKI:
+
+    def _cg_bsr_body(
+        blocks_t, minv_t, state, row_ptrs, cols, check_every, precond, sbuf_kib, core_split
+    ):
+        """Solve A X = B by (block-Jacobi preconditioned) CG in one launch.
+
+        Shapes (fp32), T = block rows, R = right-hand sides:
+            blocks_t: (128, n_blocks * 128)  A_idx^T side by side
+            minv_t:   (128, T * 128)         D_t^{-1 T} per block row (precond),
+                                             else any (128, 128) placeholder
+            state:    (128, 2 T R + 2)       [B | X0 | tol^2, max_iter]; vector
+                                             element t*128 + p of column c at
+                                             [p, t R + c]; the two parameters
+                                             replicated on every partition
+            row_ptrs, cols: static block structure (T + 1, n_blocks)
+            check_every: CG steps per device-side convergence check
+            precond:  1 = block-Jacobi z = D^{-1} r, 0 = plain CG
+            sbuf_kib: SBUF budget per partition for resident blocks (and,
+                      with R > 1, the vectors); the rest stream from HBM
+            core_split: 1 = split block rows between the physical cores
+                      at LNC=2 (see below), 0 = both run the whole solve
+        Residency and the split are kernel arguments (not read from the
+        environment at trace time) so they are part of the compile-cache key.
+        Returns:
+            out: (128, T R + 3 R + 1)
+                 [X | iterations (R) | ||r||^2 (R) | r.z (R) | trips]
+        One input and one output tensor, so a solve costs one host-to-device
+        and one device-to-host copy besides the (reusable) matrix operands.
+        The tolerance applies to columns scaled to ||b_c|| = 1.
+
+        Under LNC=2 the two physical cores split the block rows
+        (`cg_core_rows`): each holds its rows' blocks in SBUF, computes its
+        rows of A p and its share of each dot product, and the cores swap
+        the partial dot products and their halves of p with `sendrecv`
+        (three exchanges per step). Both cores add the two partial sums
+        (a + b == b + a exactly), so they agree bit for bit on every step
+        size and on when to stop, and run the same device-side loop, which
+        neuronx-cc requires of the per-core programs.
+        core_split=0 runs the whole solve on both cores instead (only core 0
+        stores).
+        """
+        P = _TILE_M
+        f32 = nl.float32
+        T = len(row_ptrs) - 1
+        R = (state.shape[1] - 2) // (2 * T)
+        TR = T * R
+
+        n_prog = int(nl.num_programs()) if nl.program_ndim() > 0 else 1
+        pid = int(nl.program_id(0)) if n_prog > 1 else 0
+        ranges = cg_core_rows(row_ptrs, bool(precond), n_prog, bool(core_split))
+        split = len(ranges) == 2
+        o0, o1 = ranges[pid] if split else ranges[0]
+        w0, w1 = ranges[1 - pid] if split else (0, 0)  # the other core's rows
+        b_lo = row_ptrs[o0]  # this core's stored blocks are b_lo .. b_hi - 1
+        b_hi = row_ptrs[o1]
+        # with R > 1 the vectors (full width on every core) share the budget
+        n_res = cg_resident_blocks(
+            b_hi - b_lo, T if R > 1 else o1 - o0, bool(precond), R, budget_kib=sbuf_kib
+        )
+
+        out = nl.ndarray((P, TR + 3 * R + 1), dtype=f32, buffer=nl.shared_hbm)
+
+        # ── resident operands ────────────────────────────────────────────
+        a_res = None
+        if n_res:
+            a_res = nl.ndarray((P, n_res * P), dtype=f32, buffer=nl.sbuf)
+            for c0 in range(0, n_res, _CG_STREAM_BLOCKS):
+                c1 = min(n_res, c0 + _CG_STREAM_BLOCKS)
+                nisa.dma_copy(
+                    dst=a_res[:, c0 * P : c1 * P],
+                    src=blocks_t[:, (b_lo + c0) * P : (b_lo + c1) * P],
+                )
+        m_res = None
+        if precond:
+            m_res = nl.ndarray((P, (o1 - o0) * P), dtype=f32, buffer=nl.sbuf)
+            for c0 in range(o0, o1, _CG_STREAM_BLOCKS):
+                c1 = min(o1, c0 + _CG_STREAM_BLOCKS)
+                nisa.dma_copy(
+                    dst=m_res[:, (c0 - o0) * P : (c1 - o0) * P], src=minv_t[:, c0 * P : c1 * P]
+                )
+
+        ones = nl.ndarray((P, P), dtype=f32, buffer=nl.sbuf)
+        nisa.memset(ones, 1.0)
+        st = nl.ndarray((P, 2 * TR + 2), dtype=f32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=st, src=state)
+        thr = st[:, 2 * TR : 2 * TR + 1]
+        cap = st[:, 2 * TR + 1 : 2 * TR + 2]
+
+        res = nl.ndarray((P, TR + 3 * R + 1), dtype=f32, buffer=nl.sbuf)
+        x = res[:, 0:TR]
+        nisa.tensor_copy(x, st[:, TR : 2 * TR])
+
+        def own(v):  # this core's block rows of a (P, T R) vector
+            return v[:, o0 * R : o1 * R]
+
+        bb = own(st)
+        W = (o1 - o0) * R  # own width
+
+        def vec(width=TR):
+            return nl.ndarray((P, width), dtype=f32, buffer=nl.sbuf)
+
+        r = vec(W)  # residual etc. only for own rows; p is full width
+        p = vec()
+        junk = vec(W)
+        tmp = vec(W) if R > 1 else None
+        q_sb = vec(W) if R > 1 else None
+        z_sb = vec(W) if (R > 1 and precond) else None
+        if split:
+            WX = max(o1 - o0, w1 - w0) * R
+            p_send = vec(WX)
+            p_recv = vec(WX)
+
+        def scal():  # one value per right-hand side, replicated on partitions
+            return nl.ndarray((P, R), dtype=f32, buffer=nl.sbuf)
+
+        rz = scal()
+        rr = scal()
+        cnt = scal()
+        act = scal()
+        trips = nl.ndarray((P, 1), dtype=f32, buffer=nl.sbuf)
+        nisa.memset(cnt, 0.0)
+        nisa.memset(trips, 0.0)
+        # (P, R) views of the replicated (P, 1) parameters
+        thr_r = thr if R == 1 else thr.broadcast(1, R)
+        cap_r = cap if R == 1 else cap.broadcast(1, R)
+        n_own = o1 - o0
+
+        def v3(v):
+            return v.reshape((P, n_own, R))
+
+        def bcast(s):  # (P, R) -> (P, n_own, R) view, no copy
+            return s.reshape((P, 1, R)).broadcast(1, n_own)
+
+        # Block rows per PSUM bank (2 KiB = 512 fp32 per partition).
+        rows_per_bank = max(1, min(n_own, _TILE_N // R))
+
+        def block_matvec(dst, src, mats, ptrs, cl):
+            """Own rows of M @ src (src full width) for a static block
+            structure; M's blocks come from `mats(idx)` (an SBUF (128,128)
+            view, A^T layout). With one right-hand side the product stays in
+            PSUM (and is returned) when dst is None: VectorE reads PSUM
+            operands directly, which saves a copy on the critical path.
+            With R > 1 it goes to `dst` in SBUF one PSUM bank at a time."""
+            if R == 1 and dst is None:
+                ps = nl.zeros((P, n_own), dtype=f32, buffer=nl.psum)
+                for m in range(o0, o1):
+                    for idx in range(ptrs[m], ptrs[m + 1]):
+                        j = cl[idx]
+                        nisa.nc_matmul(
+                            ps[:, m - o0 : m - o0 + 1],
+                            mats(idx),
+                            src[:, j : j + 1],
+                            accumulate=True,
+                        )
+                return ps
+            for m0 in range(o0, o1, rows_per_bank):
+                m1 = min(o1, m0 + rows_per_bank)
+                ps = nl.zeros((P, (m1 - m0) * R), dtype=f32, buffer=nl.psum)
+                for m in range(m0, m1):
+                    o = (m - m0) * R
+                    for idx in range(ptrs[m], ptrs[m + 1]):
+                        j = cl[idx]
+                        nisa.nc_matmul(
+                            ps[:, o : o + R],
+                            mats(idx),
+                            src[:, j * R : (j + 1) * R],
+                            accumulate=True,
+                        )
+                nisa.tensor_copy(dst[:, (m0 - o0) * R : (m1 - o0) * R], ps)
+            return dst
+
+        def a_matvec(dst, src):
+            chunk = {}
+
+            def mats(idx):
+                i = idx - b_lo
+                if i < n_res:
+                    return a_res[:, i * P : (i + 1) * P]
+                c0 = n_res + ((i - n_res) // _CG_STREAM_BLOCKS) * _CG_STREAM_BLOCKS
+                if chunk.get("c0") != c0:
+                    c1 = min(b_hi - b_lo, c0 + _CG_STREAM_BLOCKS)
+                    t = nl.ndarray((P, (c1 - c0) * P), dtype=f32, buffer=nl.sbuf)
+                    nisa.dma_copy(dst=t, src=blocks_t[:, (b_lo + c0) * P : (b_lo + c1) * P])
+                    chunk["c0"] = c0
+                    chunk["t"] = t
+                i0 = (i - c0) * P
+                return chunk["t"][:, i0 : i0 + P]
+
+            return block_matvec(dst, src, mats, row_ptrs, cols)
+
+        diag_ptrs = tuple(range(T + 1))
+        diag_cols = tuple(range(T))
+
+        def precondition():
+            """Own rows of z = D^{-1} r (PSUM for R = 1, SBUF otherwise), or r.
+
+            r holds only own rows, so the diagonal blocks address it with a
+            local column index."""
+            if not precond:
+                return r
+            return block_matvec(
+                z_sb,
+                r,
+                lambda t: m_res[:, (t - o0) * P : (t - o0 + 1) * P],
+                diag_ptrs,
+                tuple(c - o0 for c in diag_cols),
+            )
+
+        def exchange(src, dst):
+            nisa.sendrecv(src=src, dst=dst, send_to_rank=1 - pid, recv_from_rank=1 - pid, pipe_id=0)
+
+        def share_p():
+            """Swap this core's rows of p for the other core's."""
+            if not split:
+                return
+            wo = (o1 - o0) * R
+            wt = (w1 - w0) * R
+            nisa.tensor_copy(p_send[:, 0:wo], own(p))
+            if wo < WX:
+                nisa.memset(p_send[:, wo:WX], 0.0)
+            exchange(p_send, p_recv)
+            nisa.tensor_copy(p[:, w0 * R : w1 * R], p_recv[:, 0:wt])
+
+        def dots(pairs, dsts):
+            """dsts[i] = per-column sum(u_i * v_i) on every partition, one matmul
+            (plus one exchange of the partial sums when the rows are split).
+            A None dst gets the summed tile itself (returned)."""
+            k = len(pairs)
+            parts = nl.ndarray((P, k * R), dtype=f32, buffer=nl.sbuf)
+            for i, (u, v) in enumerate(pairs):
+                if R == 1:
+                    nisa.scalar_tensor_tensor(
+                        dst=junk,
+                        data=u,
+                        op0=nl.multiply,
+                        operand0=1.0,
+                        op1=nl.multiply,
+                        operand1=v,
+                        reduce_res=parts[:, i : i + 1],
+                    )
+                else:
+                    nisa.tensor_tensor(junk, u, v, op=nl.multiply)
+                    nisa.tensor_reduce(
+                        parts[:, i * R : (i + 1) * R], nl.add, v3(junk).permute((0, 2, 1)), axis=2
+                    )
+            ps = nl.zeros((P, k * R), dtype=f32, buffer=nl.psum)
+            nisa.nc_matmul(ps, ones, parts, accumulate=True)
+            tot = ps
+            if split:
+                mine = nl.ndarray((P, k * R), dtype=f32, buffer=nl.sbuf)
+                theirs = nl.ndarray((P, k * R), dtype=f32, buffer=nl.sbuf)
+                tot = nl.ndarray((P, k * R), dtype=f32, buffer=nl.sbuf)
+                nisa.tensor_copy(mine, ps)
+                exchange(mine, theirs)
+                nisa.tensor_tensor(tot, mine, theirs, op=nl.add)
+            for i, d in enumerate(dsts):
+                if d is not None:
+                    nisa.tensor_copy(d, tot[:, i * R : (i + 1) * R])
+            return tot
+
+        def update_active():
+            # act = (rr > thr) * (cnt < cap), as 1.0 / 0.0 per column
+            g = scal()
+            lt = scal()
+            nisa.tensor_tensor(g, rr, thr_r, op=nl.greater)
+            nisa.tensor_tensor(lt, cnt, cap_r, op=nl.less)
+            nisa.tensor_tensor(act, g, lt, op=nl.multiply)
+
+        def safe_ratio(dst, num, den):
+            # dst = act * num / max(den, tiny)   (reciprocal on VectorE)
+            dm = scal()
+            inv = scal()
+            nisa.tensor_scalar(dm, den, op0=nl.maximum, operand0=_CG_TINY)
+            nisa.reciprocal(inv, dm)
+            if R == 1:
+                nisa.scalar_tensor_tensor(
+                    dst=dst, data=inv, op0=nl.multiply, operand0=num, op1=nl.multiply, operand1=act
+                )
+            else:
+                nisa.tensor_tensor(dst, inv, num, op=nl.multiply)
+                nisa.tensor_tensor(dst, dst, act, op=nl.multiply)
+
+        def axpy(dst, a, xv, yv, op):
+            """dst = yv + a * xv (op=nl.add) or yv - a * xv (op=nl.subtract)."""
+            if R == 1:
+                nisa.scalar_tensor_tensor(
+                    dst=dst,
+                    data=xv,
+                    op0=nl.multiply,
+                    operand0=a,
+                    op1=op,
+                    operand1=yv,
+                    reverse1=op == nl.subtract,
+                )
+            else:
+                nisa.tensor_tensor(v3(tmp), v3(xv), bcast(a), op=nl.multiply)
+                nisa.tensor_tensor(v3(dst), v3(yv), v3(tmp), op=op)
+
+        # ── r0 = b - A x0, z0 = M r0, p0 = z0 ────────────────────────────
+        q0 = a_matvec(q_sb, x)
+        nisa.tensor_tensor(r, bb, q0, op=nl.subtract)
+        z0 = precondition()
+        nisa.tensor_copy(own(p), z0)
+        share_p()
+        if precond:
+            dots([(r, z0), (r, r)], [rz, rr])
+        else:
+            dots([(r, r)], [rr])
+            nisa.tensor_copy(rz, rr)
+        update_active()
+
+        def cg_step():
+            alpha = scal()
+            beta = scal()
+            rz_new = scal()
+            q = a_matvec(q_sb, p)
+            pq = dots([(own(p), q)], [None])
+            safe_ratio(alpha, rz, pq)
+            axpy(own(x), alpha, own(p), own(x), nl.add)  # x += alpha p
+            axpy(r, alpha, q, r, nl.subtract)  # r -= alpha q
+            z = precondition()
+            if precond:
+                dots([(r, z), (r, r)], [rz_new, rr])
+            else:
+                dots([(r, r)], [rz_new])
+            safe_ratio(beta, rz_new, rz)
+            axpy(own(p), beta, own(p), z, nl.add)  # p = z + beta p
+            share_p()
+            nisa.tensor_tensor(cnt, cnt, act, op=nl.add)
+            nisa.tensor_copy(rz, rz_new)
+            if not precond:
+                nisa.tensor_copy(rr, rz_new)
+            update_active()
+
+        def flag_register():
+            # continue while any column is active
+            anyact = act
+            if R > 1:
+                anyact = nl.ndarray((P, 1), dtype=f32, buffer=nl.sbuf)
+                nisa.tensor_reduce(anyact, nl.max, act, axis=1)
+            fi = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
+            nisa.tensor_copy(fi, anyact[0:1, 0:1])
+            reg = nisa.register_alloc()
+            nisa.register_load(reg, fi)
+            return reg
+
+        def trip(_r):
+            for _ in range(check_every):
+                cg_step()
+            nisa.tensor_scalar(trips, trips, op0=nl.add, operand0=1.0)
+            return flag_register()
+
+        nl.while_loop(flag_register(), trip)
+
+        nisa.tensor_copy(res[:, TR : TR + R], cnt)
+        nisa.tensor_copy(res[:, TR + R : TR + 2 * R], rr)
+        nisa.tensor_copy(res[:, TR + 2 * R : TR + 3 * R], rz)
+        nisa.tensor_copy(res[:, TR + 3 * R : TR + 3 * R + 1], trips)
+        if split:
+            nisa.dma_copy(dst=out[:, o0 * R : o1 * R], src=own(res))
+            if pid == 0:
+                nisa.dma_copy(dst=out[:, TR:], src=res[:, TR:])
+        elif pid == 0:
+            nisa.dma_copy(dst=out, src=res)
+        return out
+
+    @nki.jit
+    def _cg_bsr_keyed_kernel(
+        blocks_t, minv_t, state, key, check_every, precond, sbuf_kib, core_split
+    ):
+        return _cg_bsr_body(
+            blocks_t,
+            minv_t,
+            state,
+            *_STRUCTURES[key],
+            int(check_every),
+            int(precond),
+            int(sbuf_kib),
+            int(core_split),
+        )

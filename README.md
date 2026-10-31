@@ -98,6 +98,7 @@ stats = trnsparse.sparsity_stats(Q)
 | `sparse_scale` | B = αA |
 | `sparse_transpose` | Aᵀ |
 | `cg_bsr` | Conjugate Gradient on BSR matrix |
+| `cg_bsr_fused` / `prepare_cg_bsr` | One-launch CG / block-Jacobi PCG, A in SBUF, device-side convergence check, multi-RHS |
 | `chebyshev_bsr` | Fixed-K Chebyshev semi-iteration (no inner products) |
 | `richardson_bsr` | Fixed-K Richardson iteration |
 | `power_iteration_bsr` | Dominant eigenpair via power iteration |

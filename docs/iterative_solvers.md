@@ -2,8 +2,7 @@
 
 trnsparse v0.3.2 adds `cg_bsr` and `power_iteration_bsr` — Conjugate
 Gradient and power iteration on block-sparse row matrices. The API is
-stable; the architectural story below explains why there's a v0.4.0
-follow-up.
+stable. `cg_bsr_fused` (below) is the one-launch, SBUF-resident CG.
 
 ## Why this matters
 
@@ -43,60 +42,65 @@ round-trip per iteration. On CPU it's `torch.sparse`-backed and
 roughly on par with `scipy.sparse.linalg.cg` (benchmarked: 369 μs vs
 310 μs at 128×128 SPD, 1.19× slower).
 
-## v0.4.0 — fused kernel with SBUF-resident A
+## Fused CG: `cg_bsr_fused` (#22)
 
-The architectural claim from
-[#22](https://github.com/trnsci/trnsparse/issues/22): Trainium's 32 GB
-SBUF per NeuronCore fits a 5000×5000 BSR Hamiltonian on-chip. CG
-doesn't need to round-trip `A` to HBM at all — only `x`, `r`, and `p`.
-
-The shape of the v0.4.0 kernel:
+`cg_bsr_fused` runs the whole CG (or block-Jacobi PCG) solve in **one
+kernel launch**:
 
 ```python
-@nki.jit
-def _cg_spd_kernel(A_blocks, A_cols, A_row_ptrs, b, max_iter):
-    # Load A blocks once into SBUF at the top.
-    A_sbuf = nl.load(A_blocks)
-
-    # State: x, r, p in SBUF registers.
-    x = nl.zeros(...)
-    r = nl.copy(b)
-    p = nl.copy(r)
-    rr = nl.reduce(r * r)
-
-    for k in nl.affine_range(max_iter):
-        Ap = _bsr_matvec_sbuf(A_sbuf, A_cols, A_row_ptrs, p)  # all SBUF
-        pAp = nl.reduce(p * Ap)
-        alpha = rr / pAp
-        x = x + alpha * p
-        r = r - alpha * Ap
-        rr_new = nl.reduce(r * r)
-        beta = rr_new / rr
-        p = r + beta * p
-        rr = rr_new
-
-    return x, residual_norm_history
+op = trnsparse.prepare_cg_bsr(A, preconditioner="block_jacobi", device="neuron")
+x, iters, rel = trnsparse.cg_bsr_fused(op, b, tol=1e-5, max_iter=2000)
+X, iters, rel = trnsparse.cg_bsr_fused(op, B)  # B: (n, R), R independent solves
 ```
 
-Fixed `max_iter`, no early exit — returning the full residual history
-lets the host pick the convergence point post-hoc (standard
-NKI-inside-loop constraint: no dynamic control flow).
+What the kernel does on the NeuronCore:
 
-**Expected regime where this wins**: when
-`max_iter × dispatch_overhead > fused_kernel_cost + hbm_load_A_once`.
-For a 4000×4000 BSR Hamiltonian with ~100 iterations to convergence,
-that's roughly an order of magnitude of wall-time reduction.
+- **A's stored blocks are DMA'd into SBUF once** and every iteration
+  reads them from there. The budget is `TRNSPARSE_CG_SBUF_KIB` (default
+  160 of the 192 KiB per partition on Trn2, i.e. 20 MiB of the 24 MiB
+  SBUF), so about 320 fp32 128x128 blocks per physical core. Blocks
+  beyond the budget stream from HBM in 16-block DMAs on every iteration,
+  still inside the launch.
+- x, r, p (and z) stay in SBUF in a column layout (element `t*128 + p`
+  at `[p, t]`). The matvec is one `nc_matmul` per stored block into a
+  PSUM column; VectorE reads A p and z = D⁻¹ r straight from PSUM.
+- Each dot product is a VectorE multiply-reduce along the free axis and
+  one all-ones TensorE matmul that sums over the 128 partitions and
+  broadcasts the scalar to all of them at once.
+- **Convergence is checked on the device.** An `nl.while_loop` (NKI 0.7
+  dynamic control flow) runs `check_every` steps per trip and then
+  re-tests `||r||² > tol²` and the iteration cap through a sequencer
+  register. The host is not in the loop. Steps after convergence inside
+  a trip are masked (alpha = beta = 0), so iteration counts and
+  solutions are exact rather than rounded up to `check_every`.
+- **At LNC=2 the two physical cores split the block rows.** Each core
+  holds only its rows' blocks (so the SBUF capacity doubles), computes
+  its rows of A p and its half of every dot product, and the cores swap
+  partial sums and halves of p with `nisa.sendrecv`, three exchanges per
+  step. Both cores add the two partial sums in the same pair (a + b ==
+  b + a exactly), so they agree bit for bit on every step size and on
+  when to stop. That is what lets them run the same device-side loop:
+  neuronx-cc requires both per-core programs to have the same control
+  flow (`NCC_IXGM002`). `TRNSPARSE_CORE_SPLIT=0` runs the whole solve
+  on both cores instead.
+- **Several right-hand sides** `(n, R)` are R independent CG solves that
+  share every load of A: each stored block is one matmul with R moving
+  columns. On Trn2 a 128x128 fp32 stationary block costs about 0.5 µs
+  with 1 moving column and about 0.52 µs with 64, so up to about 64
+  right-hand sides cost little more than one.
 
-**What needs to land first**:
+The kernel is fp32 (PSUM accumulates in fp32). The host path (no
+`neuron` device, or `set_backend("pytorch")`) runs the same masked
+algorithm in PyTorch in b's dtype, so fp64 stays fp64.
 
-1. Simulator-iterated kernel skeleton (now tractable thanks to the
-   `nki-simulator` CI gate — see the NKI 0.3.0 migration in v0.3.1).
-2. SBUF sizing model for `A` — some workloads overflow 32 GB; then
-   fall back to the v0.3.2 plumbing.
-3. Dispatcher logic in `cg_bsr` that picks the fused kernel when
-   `max_iter * n` exceeds a threshold.
-
-Tracked in a dedicated sub-issue on `trnsci/trnsparse`.
+What limits it (measured on Trn2, see `benchmarks.md`): per iteration the
+cost is about 0.5 µs per stored block. That is the TensorE fp32
+stationary-weight load for a matvec with one moving column, and it is
+the same whether the block comes from SBUF or streams from HBM. 64 KiB
+per 0.5 µs is about 128 GB/s, which the DMA queues sustain inside the
+loop. So at one right-hand side, SBUF residency is not what makes this
+fast. The win is removing roughly ten host launches and a sync from
+every iteration.
 
 ## Why CG and power iteration, not GMRES / Lanczos / Davidson
 
@@ -110,6 +114,6 @@ v0.3.2 covers the two most common algorithm families:
 
 GMRES (general non-symmetric systems), Lanczos / Arnoldi (full
 spectrum), and Davidson (interior eigenvalues) are follow-ups when
-users ask for them. The v0.4.0 fused kernel's structure (load A once,
-iterate on-chip) generalizes trivially to those variants — it's the
-same architectural pattern.
+users ask for them. The fused kernel's structure (load A once, iterate
+on-chip, device-side `while` convergence test) carries over to those
+variants.

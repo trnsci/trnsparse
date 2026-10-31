@@ -342,3 +342,86 @@ def test_static_kernel_lnc2_neff_compiles(case, tmp_path):
     )
     driver._compile_bir_to_neff(bir, opts, inputs)
     assert (tmp_path / "file.neff").stat().st_size > 0
+
+
+# ── Fused SBUF-resident CG (#22) ─────────────────────────────────────────────
+#
+# Device-side while loop, PSUM dot products, both physical cores at LNC=2
+# (rows split between the cores, same control flow on each, as neuronx-cc
+# requires). "stream" shrinks the SBUF budget so most of A streams from HBM
+# inside the iteration; "rhs*" solve several right-hand sides at once;
+# "nosplit" runs the whole solve on both cores.
+
+
+def _cg_inputs(T: int, precond: int, check_every: int, R: int = 1, sbuf_kib=160, split=1):
+    from trnsparse.nki.kernels import register_structure
+
+    rp, cl = [0], []
+    for m in range(T):
+        cl += sorted({m, (m + 1) % T, (m - 1) % T})
+        rp.append(len(cl))
+    key = register_structure(rp, cl)
+    minv = _f32(_P, T * _P) if precond else _f32(_P, _P)
+    state = _f32(_P, 2 * T * R + 2)
+    return (_f32(_P, len(cl) * _P), minv, state, key, check_every, precond, sbuf_kib, split)
+
+
+_CG_CASES = {
+    "plain": (dict(T=3, precond=0, check_every=2),),
+    "bjacobi": (dict(T=3, precond=1, check_every=2),),
+    "stream": (dict(T=5, precond=1, check_every=1, sbuf_kib=2),),
+    "nosplit": (dict(T=4, precond=1, check_every=2, split=0),),
+    "one-tile": (dict(T=1, precond=0, check_every=3),),
+    "rhs4": (dict(T=3, precond=1, check_every=2, R=4),),
+    # 3 x 200 columns: the matvec spans two PSUM banks
+    "rhs200-stream": (dict(T=3, precond=0, check_every=1, R=200, sbuf_kib=2),),
+}
+
+
+@pytest.mark.parametrize("lnc", [1, 2])
+@pytest.mark.parametrize("case", sorted(_CG_CASES))
+def test_cg_kernel_lnc_mlir_verifies(case, lnc):
+    from trnsparse.nki import kernels
+
+    (kw,) = _CG_CASES[case]
+    result = source_to_mlir(
+        kernels._cg_bsr_keyed_kernel,
+        *_cg_inputs(**kw),
+        target="trn2",
+        lnc=lnc,
+        frontend=FrontendKind.TRACER,
+    )
+    result.verify()
+
+
+@pytest.mark.skipif(shutil.which("neuronx-cc") is None, reason="neuronx-cc not on PATH")
+@pytest.mark.parametrize("lnc", [1, 2])
+@pytest.mark.parametrize("case", ["plain", "bjacobi", "rhs4", "nosplit"])
+def test_cg_kernel_neff_compiles(case, lnc, tmp_path):
+    """Full CPU NEFF compile. At LNC=2 this is what rejects per-core programs
+    whose control flow differs (NCC_IXGM002), which MLIR verify does not see."""
+    try:
+        from nki.compiler import driver
+        from nki.compiler.frontend import TracerFrontend
+        from nki.compiler.ncc_driver import CompileOptions
+    except ImportError as e:
+        pytest.skip(f"nki compiler driver API not available: {e}")
+    if not hasattr(driver, "_compile_bir_to_neff"):
+        pytest.skip("nki.compiler.driver._compile_bir_to_neff not available in this nki")
+
+    from trnsparse.nki import kernels
+
+    fn = getattr(kernels._cg_bsr_keyed_kernel, "func", kernels._cg_bsr_keyed_kernel)
+    (kw,) = _CG_CASES[case]
+    inputs = dict(zip(inspect.signature(fn).parameters, _cg_inputs(**kw), strict=True))
+    opts = CompileOptions(
+        target="trn2",
+        lnc=lnc,
+        artifacts_dir=str(tmp_path),
+        output_path=str(tmp_path / "file.neff"),
+    )
+    bir = driver.compile_to_bir(
+        fn, frontend=TracerFrontend(), inputs=inputs, compile_opts=opts, enable_cache=False
+    )
+    driver._compile_bir_to_neff(bir, opts, inputs)
+    assert (tmp_path / "file.neff").stat().st_size > 0
