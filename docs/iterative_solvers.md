@@ -95,11 +95,14 @@ What the kernel does on the NeuronCore:
   neuronx-cc requires both per-core programs to have the same control
   flow (`NCC_IXGM002`). `TRNSPARSE_CORE_SPLIT=0` runs the whole solve
   on both cores instead.
-- **Row order.** Inside the kernel each core's block rows are reordered
-  (`cg_row_order`) so that the four concurrent TensorE column groups of
-  the column matvec get about the same number of stored blocks; the
-  matvec takes as long as its busiest group. b, x0 and x are permuted by
-  DMA on the way in and out.
+- **Row order.** When A is resident, each core's block rows are
+  reordered inside the kernel (`cg_row_order`) so that the four
+  concurrent TensorE column groups of the column matvec get about the
+  same number of stored blocks; the matvec takes as long as its busiest
+  group. b, x0 and x are permuted by DMA on the way in and out. When
+  blocks stream from HBM the stream sets the pace, and the original order
+  with chunks of at most 32 rows interleaves better with the stream DMAs,
+  so that is used instead.
 - **Several right-hand sides** `(n, R)` are R independent CG solves that
   share every matmul over a stored block (R stationary columns in the
   column matvec, R moving columns in the row matvec).
@@ -135,8 +138,8 @@ with a TensorE transpose (`nc_transpose`, bit-exact):
   at the block, c R zeros and the block, so its product lands at PSUM
   partitions `32 g + c R + k` of a single 128-column slot (the zeros add
   0 to the other slots' rows). A chunk of up to 4 G rows (G R <= 32, so
-  up to 128 rows for R = 1) needs one copy and one transpose. The zero
-  gaps are never written.
+  up to 128 rows for R = 1; 32 rows when blocks stream) needs one copy
+  and one transpose. The zero gaps are never written.
 
 Same fp32 products, different summation order. No relayout of the stored blocks is
 needed: the `Aᵀ` blocks the row form uses as stationary are exactly the

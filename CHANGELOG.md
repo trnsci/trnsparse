@@ -84,6 +84,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   CG iteration falls from about 11 µs to about 4 µs at LNC=2 and from about
   8 µs to about 3.5 µs at LNC=1.
 
+### Fixed
+
+- `cg_bsr_fused` / `power_iteration_bsr_fused` with a host `BSRMatrix` and
+  `b` (or `v0`) on the `neuron` device raised `ModuleNotFoundError:
+  torch_neuronx.pyhlo`: the kernel got host tensors and NKI fell back to
+  its torch-xla framework (#42). A `BSRMatrix` is now prepared on b's
+  device, and the fused kernel runs only for an operator on a `neuron`
+  device (a host operator takes the host path).
+
 ## [0.10.0] — 2026-10-31
 
 Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.

@@ -523,7 +523,10 @@ def prepare_cg_bsr(A: BSRMatrix, preconditioner: str | None = None, device=None)
     return FusedCGOperator(A, preconditioner, device)
 
 
-def _use_fused_kernel(op: FusedCGOperator, b: torch.Tensor) -> bool:
+def _use_fused_kernel(op: FusedCGOperator) -> bool:
+    """The fused kernel runs where the operator's data is: on a `neuron`
+    device (#42: a host operator with a device b used to reach the kernel
+    with host tensors and fail in NKI's torch-xla fallback)."""
     from .nki.dispatch import _native_path, _use_nki
 
     if not _use_nki():
@@ -532,8 +535,12 @@ def _use_fused_kernel(op: FusedCGOperator, b: torch.Tensor) -> bool:
         native = _native_path()
     except Exception:
         return False
-    on_neuron = op.device.type != "cpu" or b.device.type not in ("cpu",)
-    return native and on_neuron
+    return native and op.device.type != "cpu"
+
+
+def _accel_device(t: torch.Tensor | None):
+    """t's device when it is an accelerator (not the CPU), else None."""
+    return t.device if t is not None and t.device.type != "cpu" else None
 
 
 def cg_bsr_fused(
@@ -566,7 +573,10 @@ def cg_bsr_fused(
     step sizes, convergence test and iteration count.
 
     The kernel runs when the native TorchNeuron path is active, the NKI
-    backend is selected, and the operator (or b) is on a `neuron` device.
+    backend is selected, and the operator is on a `neuron` device. A
+    `BSRMatrix` A is prepared on b's device when b is on one; an operator
+    from `prepare_cg_bsr` runs where it was prepared (a host operator takes
+    the host path whatever b's device).
     Otherwise the same algorithm runs in PyTorch on the host, in b's dtype
     (fp64 stays fp64). The device kernel is fp32 throughout.
 
@@ -614,7 +624,11 @@ def cg_bsr_fused(
         `return_info`. rel_residual is the recursive ||r|| / ||b||. For a
         2-D b, iters and rel_residual are per-column tensors.
     """
-    op = A if isinstance(A, FusedCGOperator) else prepare_cg_bsr(A, preconditioner)
+    op = (
+        A
+        if isinstance(A, FusedCGOperator)
+        else prepare_cg_bsr(A, preconditioner, device=_accel_device(b))
+    )
     n, T = op.n, op.n_tiles
     vector = b.dim() == 1
     if b.dim() not in (1, 2) or b.shape[0] != n:
@@ -670,7 +684,7 @@ def cg_bsr_fused(
         out[:n] = v
         return out.reshape(T, _P, R)
 
-    if _use_fused_kernel(op, b):
+    if _use_fused_kernel(op):
         from .nki.dispatch import _get_native_ops
 
         bt, mt, key = op._device_operands(precision)
@@ -796,7 +810,7 @@ def power_iteration_bsr_fused(
         `(eigenvalue, eigenvector, iters)` like `power_iteration_bsr`, plus
         the info dict when `return_info`.
     """
-    op = A if isinstance(A, FusedCGOperator) else prepare_cg_bsr(A)
+    op = A if isinstance(A, FusedCGOperator) else prepare_cg_bsr(A, device=_accel_device(v0))
     n, T = op.n, op.n_tiles
     if matvec == "auto":
         matvec = "column"
@@ -831,7 +845,7 @@ def power_iteration_bsr_fused(
 
     vt = torch.zeros(T * _P, dtype=torch.float64)
     vt[:n] = v
-    if _use_fused_kernel(op, vt):
+    if _use_fused_kernel(op):
         from .nki.dispatch import _get_native_ops
 
         bt, _, key = op._device_operands(precision)

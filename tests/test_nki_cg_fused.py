@@ -256,3 +256,27 @@ def test_power_iteration_uneven_split():
     lam, v, k = trnsparse.power_iteration_bsr_fused(op, v0=v0, tol=1e-5, max_iter=2000)
     lh, _, kh = trnsparse.power_iteration_bsr_fused(bsr, v0=v0.float(), tol=1e-5, max_iter=2000)
     assert abs(k - kh) <= max(3, kh // 10) and abs(lam - lh) < 1e-5 * abs(lh)
+
+
+@pytest.mark.parametrize("R", [None, 8])
+def test_host_bsr_with_device_rhs(R):
+    # #42: a host BSRMatrix with b on the neuron device runs the fused kernel
+    # on b's device (it used to reach the kernel with host tensors and fail
+    # in NKI's torch-xla fallback). An operator prepared on the host takes
+    # the host path whatever b's device.
+    A = _spd(3, seed=23)
+    b = _rhs(A.shape[0], R=R, seed=24)
+    bsr = trnsparse.BSRMatrix.from_dense(A.float(), block_size=128)
+    x, k, rel, info = trnsparse.cg_bsr_fused(bsr, b.to(DEV), tol=1e-5, return_info=True)
+    assert info["path"] == "nki" and x.device.type == "neuron"
+    ref = trnsparse.cg_bsr_fused(
+        trnsparse.prepare_cg_bsr(bsr, device=DEV), b, tol=1e-5, return_info=True
+    )
+    torch.testing.assert_close(x.cpu(), ref[0].cpu())
+    host_op = trnsparse.prepare_cg_bsr(bsr)
+    xh, _, _, info_h = trnsparse.cg_bsr_fused(host_op, b.to(DEV), tol=1e-5, return_info=True)
+    assert info_h["path"] == "pytorch"
+    cols = [None] if R is None else range(R)
+    for c in cols:
+        bc, xc = (b, x) if c is None else (b[:, c], x[:, c])
+        assert _true_res(A, bc, xc.cpu()) < 3e-5
