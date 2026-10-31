@@ -234,3 +234,107 @@ class TestTorchCompile:
 
         out = f(A.values, A.col_indices, A.row_ptrs, B.to(DEV))
         torch.testing.assert_close(out.cpu(), dense @ B, atol=ATOL, rtol=RTOL)
+
+
+def _rel(x, ref):
+    x, ref = x.detach().cpu().double(), ref.detach().cpu().double()
+    return float((x - ref).norm() / ref.norm())
+
+
+def _skewed_bsr(n_rows, n_cols, seed):
+    """Block row 0 dense (a global-token row), the rest one or two blocks; a middle row empty."""
+    g = torch.Generator().manual_seed(seed)
+    bm = torch.zeros(n_rows, n_cols, dtype=torch.bool)
+    bm[0, :] = True
+    for i in range(1, n_rows):
+        bm[i, i % n_cols] = True
+        bm[i, (3 * i + 1) % n_cols] = True
+    if n_rows > 2:
+        bm[n_rows // 2, :] = False
+    dense = torch.randn(n_rows * P, n_cols * P, generator=g)
+    dense *= bm.repeat_interleave(P, 0).repeat_interleave(P, 1)
+    return dense, trnsparse.BSRMatrix.from_dense(dense, block_size=P)
+
+
+class TestTwoCoreAndBf16:
+    """Static kernels split across both physical cores (LNC=2), fp32 and bf16 (#30).
+
+    A core that skipped its share would leave whole output tiles unwritten,
+    so the fp32 cases use tight tolerances over every row and column tile.
+    """
+
+    @pytest.mark.parametrize(
+        "n_rows,n_cols,N",
+        [(6, 6, 128), (6, 4, 1024), (1, 3, 512), (1, 2, 128), (9, 5, 200)],
+    )
+    def test_bsr_static_fp32_every_tile(self, n_rows, n_cols, N):
+        dense, A = _skewed_bsr(n_rows, n_cols, seed=n_rows * 10 + N)
+        B = torch.randn(n_cols * P, N, generator=torch.Generator().manual_seed(1))
+        A.blocks = A.blocks.to(DEV)
+        C = trnsparse.bsr_spmm(A, B.to(DEV))
+        assert C.dtype == torch.float32
+        torch.testing.assert_close(C.cpu(), dense @ B, atol=ATOL, rtol=RTOL)
+
+    @pytest.mark.parametrize("n_rows,n_cols,N", [(6, 6, 128), (6, 4, 1024), (1, 3, 512)])
+    def test_bsr_static_bf16(self, n_rows, n_cols, N):
+        dense, A = _skewed_bsr(n_rows, n_cols, seed=n_rows * 10 + N)
+        B = torch.randn(n_cols * P, N, generator=torch.Generator().manual_seed(1))
+        A.blocks = A.blocks.to(DEV, torch.bfloat16)
+        Bh = B.to(DEV, torch.bfloat16)
+        C = trnsparse.bsr_spmm(A, Bh)
+        assert C.dtype == torch.bfloat16 and C.device.type == DEV
+        ref = dense.bfloat16().double() @ B.bfloat16().double()  # bf16 inputs, exact sum
+        assert _rel(C, ref) < 1e-2
+
+    def test_bsr_static_bf16_grad(self):
+        dense, A = _skewed_bsr(4, 4, seed=2)
+        B = torch.randn(4 * P, 64, generator=torch.Generator().manual_seed(2))
+        A.blocks = A.blocks.to(DEV, torch.bfloat16).requires_grad_(True)
+        Bd = B.to(DEV, torch.bfloat16).requires_grad_(True)
+        trnsparse.bsr_spmm(A, Bd).float().sum().backward()
+        ref = dense.bfloat16().double().T @ torch.ones(4 * P, 64, dtype=torch.float64)
+        assert Bd.grad.dtype == torch.bfloat16
+        assert _rel(Bd.grad, ref) < 1e-2
+
+    @pytest.mark.parametrize("dtype,tol", [(torch.float32, 1e-5), (torch.bfloat16, 3e-2)])
+    @pytest.mark.parametrize("hd", [64, 128])
+    def test_attention_static_two_core(self, dtype, tol, hd):
+        from trnsparse.ops import _block_sparse_attn_backward, _block_sparse_attn_pytorch
+
+        torch.manual_seed(7)
+        seq_len = 5 * P
+        # Global-token block row/column 0 plus a local band: skewed per-row cost.
+        nb = seq_len // P
+        bm = torch.zeros(nb, nb)
+        bm[0, :] = 1
+        bm[:, 0] = 1
+        for i in range(nb):
+            bm[i, max(0, i - 1) : i + 2] = 1
+        mask = trnsparse.BSRMatrix.from_dense(
+            bm.repeat_interleave(P, 0).repeat_interleave(P, 1), block_size=P
+        )
+        Q, K, V, dO = (torch.randn(seq_len, hd).to(dtype) for _ in range(4))
+        Qd, Kd, Vd = (t.to(DEV).requires_grad_(True) for t in (Q, K, V))
+        out = trnsparse.block_sparse_attention_tiled(Qd, Kd, Vd, mask)
+        assert out.dtype == dtype
+        q64, k64, v64, do64 = (t.double() for t in (Q, K, V, dO))
+        scale = hd**-0.5
+        ref, rm, rd = _block_sparse_attn_pytorch(q64, k64, v64, mask, scale, return_stats=True)
+        assert _rel(out, ref) < tol
+        out.backward(dO.to(DEV))
+        dQ, dK, dV = _block_sparse_attn_backward(
+            q64, k64, v64, ref, do64, mask, scale, row_max=rm, row_denom=rd
+        )
+        for got, exp in ((Qd.grad, dQ), (Kd.grad, dK), (Vd.grad, dV)):
+            assert got.dtype == dtype
+            assert _rel(got, exp) < tol
+
+    def test_attention_bf16_stats_are_fp32(self):
+        seq_len, hd = 2 * P, 64
+        mask = _block_causal_mask(seq_len)
+        Q, K, V = (torch.randn(seq_len, hd, dtype=torch.bfloat16).to(DEV) for _ in range(3))
+        out, rm, rd = torch.ops.trnsparse.bsr_attn(
+            Q, K, V, mask.block_col_indices, mask.block_row_ptrs, P
+        )
+        assert out.dtype == torch.bfloat16
+        assert rm.dtype == torch.float32 and rd.dtype == torch.float32

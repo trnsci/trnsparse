@@ -845,6 +845,59 @@ class TestNativePathOnCpu:
         for g_, w_ in zip(got, want, strict=True):
             torch.testing.assert_close(g_, w_, atol=1e-4, rtol=1e-4)
 
+    def test_static_kernels_bf16_operand_contract(self, cpu_native, monkeypatch):
+        """bf16 inputs reach the static kernels as bf16 operands; statistics stay fp32."""
+        seen = {}
+
+        def recorder(name, ref, out_dtype_of):
+            def run(*args):
+                seen[name] = [a.dtype for a in args if isinstance(a, torch.Tensor)]
+                f32 = [a.float() if isinstance(a, torch.Tensor) else a for a in args]
+                res = ref(*f32)
+                dt = out_dtype_of(args)
+                if isinstance(res, tuple):
+                    return (res[0].to(dt),) + tuple(
+                        r.to(dt if name == "bwd" else torch.float32) for r in res[1:]
+                    )
+                return res.to(dt)
+
+            return run
+
+        for attr, name, ref, odt in (
+            ("_bsr_spmm_static_kernel", "spmm", _ref_bsr_spmm_static, lambda a: a[1].dtype),
+            ("_attn_fwd_static_kernel", "fwd", _ref_attn_fwd_static, lambda a: a[2].dtype),
+            ("_attn_bwd_static_kernel", "bwd", _ref_attn_bwd_static, lambda a: a[4].dtype),
+        ):
+            fn = recorder(name, ref, odt)
+            monkeypatch.setattr(kernels, attr, fn, raising=False)
+            monkeypatch.setattr(dispatch, attr, fn, raising=False)
+
+        bf = torch.bfloat16
+        g = torch.Generator().manual_seed(21)
+        dense = torch.randn(256, 256, generator=g)
+        dense[:128, 128:] = 0
+        A = trnsparse.BSRMatrix.from_dense(dense, block_size=P)
+        A.blocks = A.blocks.to(bf)
+        C = trnsparse.bsr_spmm(A, torch.randn(256, 64, generator=g).to(bf))
+        assert C.dtype == bf and seen["spmm"] == [bf, bf]
+        # Mixed precision runs in fp32 and returns the promoted dtype.
+        C = trnsparse.bsr_spmm(A, torch.randn(256, 64, generator=g))
+        assert C.dtype == torch.float32 and seen["spmm"] == [torch.float32] * 2
+
+        seq_len, hd = 2 * P, 64
+        mask = trnsparse.BSRMatrix.from_dense(torch.ones(seq_len, seq_len), block_size=P)
+        Q, K, V, dO = (torch.randn(seq_len, hd, generator=g).to(bf) for _ in range(4))
+        out, rm, rd = dispatch.nki_bsr_attn_tiled(Q, K, V, mask, return_stats=True)
+        assert out.dtype == bf and seen["fwd"] == [bf] * 3
+        assert rm.dtype == torch.float32 and rd.dtype == torch.float32
+        o2, rm2, rd2 = torch.ops.trnsparse.bsr_attn(
+            Q, K, V, mask.block_col_indices, mask.block_row_ptrs, P
+        )
+        assert o2.dtype == bf and rm2.dtype == torch.float32 and rd2.dtype == torch.float32
+        dQ, dK, dV = dispatch.nki_bsr_attn_bwd(Q, K, V, dO, out, mask, rm, rd)
+        assert seen["bwd"] == [bf] * 7 + [torch.float32] * 6
+        assert {t.dtype for t in (dQ, dK, dV)} == {bf}
+
     def test_column_structure(self):
         assert dispatch._column_structure([0, 2, 2, 5], [0, 1, 0, 1, 2], 3) == (
             [0, 2, 4, 5],

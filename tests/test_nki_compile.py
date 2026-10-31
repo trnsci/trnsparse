@@ -183,3 +183,119 @@ def test_kernel_neff_compiles(case, target, tmp_path):
     )
     driver._compile_bir_to_neff(bir, opts, inputs)
     assert (tmp_path / "file.neff").stat().st_size > 0
+
+
+# ── Static kernels on both physical cores, fp32 and bf16 (#30) ───────────────
+#
+# Under LNC=2 the static kernels are traced once per physical core and split
+# their output tiles between the two traces. Verify both traces for every
+# kernel and input dtype, including structures with fewer units than cores
+# (one block row: the BSR kernel splits columns instead) and skewed rows.
+
+
+def _bf16(*shape):
+    import ml_dtypes
+
+    return _f32(*shape).astype(ml_dtypes.bfloat16)
+
+
+def _static_lnc2_cases():
+    cases = {}
+    for dtype, mk in (("f32", _f32), ("bf16", _bf16)):
+        cases[("_bsr_spmm_static_kernel", f"skew-n512-{dtype}")] = lambda mk=mk: (
+            mk(6, _P, _P),
+            mk(4 * _P, 512),
+            (0, 4, 4, 5, 6),
+            (0, 1, 2, 3, 0, 3),
+        )
+        cases[("_bsr_spmm_static_kernel", f"n1024-{dtype}")] = lambda mk=mk: (
+            mk(3, _P, _P),
+            mk(3 * _P, 1024),
+            (0, 2, 2, 3),
+            (0, 2, 2),
+        )
+        cases[("_bsr_spmm_static_kernel", f"onerow-n128-{dtype}")] = lambda mk=mk: (
+            mk(2, _P, _P),
+            mk(2 * _P, 128),
+            (0, 2),
+            (0, 1),
+        )
+        for hd in (64, 128):
+            cases[("_attn_fwd_static_kernel", f"hd{hd}-{dtype}")] = lambda hd=hd, mk=mk: (
+                mk(hd, 3 * _P),
+                mk(hd, 3 * _P),
+                mk(3 * _P, hd),
+                (0, 2, 2, 5),
+                (0, 1, 0, 1, 2),
+            )
+            cases[("_attn_bwd_static_kernel", f"hd{hd}-{dtype}")] = lambda hd=hd, mk=mk: (
+                mk(hd, 3 * _P),
+                mk(hd, 3 * _P),
+                mk(hd, 3 * _P),
+                mk(hd, 3 * _P),
+                mk(3 * _P, hd),
+                mk(3 * _P, hd),
+                mk(3 * _P, hd),
+                _f32(3 * _P, 1),
+                np.abs(_f32(3 * _P, 1)),
+                _f32(3 * _P, 1),
+                _f32(1, 3 * _P),
+                np.abs(_f32(1, 3 * _P)),
+                _f32(1, 3 * _P),
+                (0, 2, 2, 5),
+                (0, 1, 0, 1, 2),
+                (0, 2, 4, 5),
+                (0, 2, 0, 2, 2),
+                0.125,
+            )
+    return cases
+
+
+_STATIC_LNC2 = _static_lnc2_cases()
+
+
+@pytest.mark.parametrize("lnc", [1, 2])
+@pytest.mark.parametrize("case", sorted(_STATIC_LNC2), ids=lambda c: f"{c[0]}-{c[1]}")
+def test_static_kernel_lnc_mlir_verifies(case, lnc):
+    from trnsparse.nki import kernels
+
+    if case[1].endswith("bf16"):
+        pytest.importorskip("ml_dtypes")
+    kernel = getattr(kernels, case[0])
+    result = source_to_mlir(
+        kernel, *_STATIC_LNC2[case](), target="trn2", lnc=lnc, frontend=FrontendKind.TRACER
+    )
+    result.verify()
+
+
+@pytest.mark.skipif(shutil.which("neuronx-cc") is None, reason="neuronx-cc not on PATH")
+@pytest.mark.parametrize("case", sorted(_STATIC_LNC2), ids=lambda c: f"{c[0]}-{c[1]}")
+def test_static_kernel_lnc2_neff_compiles(case, tmp_path):
+    """Full CPU NEFF compile of both per-core traces (LNC=2, trn2)."""
+    try:
+        from nki.compiler import driver
+        from nki.compiler.frontend import TracerFrontend
+        from nki.compiler.ncc_driver import CompileOptions
+    except ImportError as e:
+        pytest.skip(f"nki compiler driver API not available: {e}")
+    if not hasattr(driver, "_compile_bir_to_neff"):
+        pytest.skip("nki.compiler.driver._compile_bir_to_neff not available in this nki")
+    if case[1].endswith("bf16"):
+        pytest.importorskip("ml_dtypes")
+
+    from trnsparse.nki import kernels
+
+    kernel = getattr(kernels, case[0])
+    fn = getattr(kernel, "func", kernel)
+    inputs = dict(zip(inspect.signature(fn).parameters, _STATIC_LNC2[case](), strict=True))
+    opts = CompileOptions(
+        target="trn2",
+        lnc=2,
+        artifacts_dir=str(tmp_path),
+        output_path=str(tmp_path / "file.neff"),
+    )
+    bir = driver.compile_to_bir(
+        fn, frontend=TracerFrontend(), inputs=inputs, compile_opts=opts, enable_cache=False
+    )
+    driver._compile_bir_to_neff(bir, opts, inputs)
+    assert (tmp_path / "file.neff").stat().st_size > 0

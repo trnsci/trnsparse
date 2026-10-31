@@ -298,6 +298,15 @@ def _kernel_input(t: torch.Tensor) -> torch.Tensor:
     return t.float() if t.dtype == torch.float64 else t
 
 
+def _kernel_dtype(*ts: torch.Tensor) -> torch.dtype:
+    """Common kernel operand dtype: bf16 only when every operand is bf16, else fp32.
+
+    The static kernels take fp32 or bf16 matmul operands (fp32 PSUM either
+    way) and need all operands of one call in the same dtype.
+    """
+    return torch.bfloat16 if all(t.dtype == torch.bfloat16 for t in ts) else torch.float32
+
+
 def _csr_to_dense_padded(A) -> torch.Tensor:
     """Materialize a CSRMatrix into a dense (M, K) tensor.
 
@@ -678,6 +687,10 @@ def _nki_bsr_spmm_static(A, B: torch.Tensor) -> torch.Tensor:
     when needed) and the kernel walks the stored blocks, addressing B by
     each block's column index. Autograd to `A.blocks` and B is registered
     on the op.
+
+    bf16 when both `A.blocks` and B are bf16 (fp32 PSUM accumulation, bf16
+    result); otherwise fp32. The kernel splits its output tiles across the
+    physical cores of the logical NeuronCore.
     """
     m, n = A.shape
     b = A.block_size
@@ -692,10 +705,12 @@ def _nki_bsr_spmm_static(A, B: torch.Tensor) -> torch.Tensor:
     # Kernel operands go to the neuron device (a no-op when they are already
     # there); the result returns to B's device.
     orig = B.device
-    blocks = _kernel_input(A.blocks.contiguous()).to(_NEURON_DEVICE)
-    b_dev = _kernel_input(B.contiguous()).to(_NEURON_DEVICE)
+    kdt = _kernel_dtype(A.blocks, B)
+    out_dtype = torch.promote_types(A.blocks.dtype, B.dtype)
+    blocks = A.blocks.contiguous().to(device=_NEURON_DEVICE, dtype=kdt)
+    b_dev = B.contiguous().to(device=_NEURON_DEVICE, dtype=kdt)
     out = _get_native_ops()["bsr_spmm_static"](blocks, b_dev, row_ptrs, cols)
-    return out[:m, :out_cols].to(device=orig, dtype=A.blocks.dtype)
+    return out[:m, :out_cols].to(device=orig, dtype=out_dtype)
 
 
 class _BlockView:
@@ -1085,13 +1100,19 @@ def _nki_attn_fwd_static(Q, K, V, mask_bsr, scale: float, return_stats: bool):
     no K/V gather, no host softmax reduction between two launches). Q and K
     are passed transposed (head_dim on partitions) so every load is a plain
     strided DMA.
+
+    bf16 when Q, K and V are all bf16 (fp32 scores, statistics and PSUM;
+    P rounded to bf16 for P @ V), otherwise fp32. The statistics come back
+    in fp32 either way.
     """
     seq_len, head_dim = Q.shape
     M_tiles = seq_len // mask_bsr.block_size
     row_ptrs, cols = _bsr_structure_lists(mask_bsr)
     orig, dtype = Q.device, Q.dtype
-    Qd, Kd, Vd = (_kernel_input(t).to(_NEURON_DEVICE) for t in (Q, K, V))
-    q_t = (Qd * scale).T.contiguous()
+    kdt = _kernel_dtype(Q, K, V)
+    Qd, Kd, Vd = (t.to(_NEURON_DEVICE) for t in (Q, K, V))
+    q_t = (Qd.float() * scale).to(kdt).T.contiguous()
+    Kd, Vd = Kd.to(kdt), Vd.to(kdt)
     out, row_max, row_denom = _get_native_ops()["attn_fwd_static"](
         q_t, Kd.T.contiguous(), Vd.contiguous(), row_ptrs, cols
     )
@@ -1121,25 +1142,29 @@ def _nki_attn_bwd_static(Q, K, V, dO, O, mask_bsr, row_max, row_denom, scale: fl
 
     One launch for dQ, dK and dV over exactly the stored blocks (row-first
     for dQ, column-first for dK / dV, both structures as kernel constants).
-    D = rowsum(dO * O) and 1 / row_denom are computed with device aten ops.
+    D = rowsum(dO * O) and 1 / row_denom are computed with device aten ops,
+    in fp32.
+
+    bf16 operands when Q, K, V and dO are all bf16 (fp32 statistics, scores
+    and PSUM), otherwise fp32.
     """
     seq_len, head_dim = Q.shape
     orig, dtype = Q.device, Q.dtype
     dev = _NEURON_DEVICE
     row_ptrs, cols = _bsr_structure_lists(mask_bsr)
     col_ptrs, rows = _column_structure(row_ptrs, cols, seq_len // mask_bsr.block_size)
-    f = _kernel_input
-    Q, K, V, dO, O = (f(t).to(dev) for t in (Q, K, V, dO, O))
-    q_s = (Q * scale).contiguous()
-    k = f(K.contiguous())
-    do = f(dO.contiguous())
-    rm = f(row_max.to(dev).reshape(seq_len, 1))
-    rinv = 1.0 / f(row_denom.to(dev).reshape(seq_len, 1))
-    d = f((dO * O).sum(dim=-1, keepdim=True))
+    kdt = _kernel_dtype(Q, K, V, dO)
+    Q, K, V, dO, O = (t.to(dev) for t in (Q, K, V, dO, O))
+    q_s = (Q.float() * scale).to(kdt).contiguous()
+    k = K.to(kdt).contiguous()
+    do = dO.to(kdt).contiguous()
+    rm = row_max.to(device=dev, dtype=torch.float32).reshape(seq_len, 1)
+    rinv = 1.0 / row_denom.to(device=dev, dtype=torch.float32).reshape(seq_len, 1)
+    d = (dO.float() * O.float()).sum(dim=-1, keepdim=True)
     dQ, dK, dV = _get_native_ops()["attn_bwd_static"](
         q_s.T.contiguous(),
         k.T.contiguous(),
-        f(V.T.contiguous()),
+        V.to(kdt).T.contiguous(),
         do.T.contiguous(),
         q_s,
         k,

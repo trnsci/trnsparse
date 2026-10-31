@@ -32,6 +32,15 @@ import torch
 from . import dispatch as _d
 
 
+def _stats_dtype(dtype: torch.dtype) -> torch.dtype:
+    """Softmax statistics dtype: fp32 for low-precision Q (bf16 / fp16), else Q's.
+
+    The backward recomputes P = exp(S - row_max) / row_denom; a bf16
+    row_max would scale every P of the row by up to exp(2^-9 · |row_max|).
+    """
+    return torch.float32 if dtype in (torch.bfloat16, torch.float16) else dtype
+
+
 def _pattern(block_col_indices, block_row_ptrs, seq_len, block_size):
     return _d._MaskPattern(block_col_indices, block_row_ptrs, (seq_len, seq_len), block_size)
 
@@ -47,17 +56,24 @@ def bsr_attn(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     mask = _pattern(block_col_indices, block_row_ptrs, Q.shape[0], block_size)
     out, row_max, row_denom = _d.nki_bsr_attn_tiled(Q, K, V, mask, return_stats=True)
-    # Fixed output contract (Q's dtype and device) to match the fake.
-    return tuple(t.to(device=Q.device, dtype=Q.dtype) for t in (out, row_max, row_denom))
+    # Fixed output contract (Q's device; out in Q's dtype, the statistics in
+    # `_stats_dtype`) to match the fake.
+    sdt = _stats_dtype(Q.dtype)
+    return (
+        out.to(device=Q.device, dtype=Q.dtype),
+        row_max.to(device=Q.device, dtype=sdt),
+        row_denom.to(device=Q.device, dtype=sdt),
+    )
 
 
 @bsr_attn.register_fake
 def _bsr_attn_fake(Q, K, V, block_col_indices, block_row_ptrs, block_size):
     M_tiles = Q.shape[0] // block_size
+    sdt = _stats_dtype(Q.dtype)
     return (
         torch.empty_like(Q),
-        Q.new_empty((M_tiles, block_size)),
-        Q.new_empty((M_tiles, block_size)),
+        Q.new_empty((M_tiles, block_size), dtype=sdt),
+        Q.new_empty((M_tiles, block_size), dtype=sdt),
     )
 
 
