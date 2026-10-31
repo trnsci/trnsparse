@@ -199,8 +199,8 @@ def test_sharded_bsr_grad_neuron(nki_backend, pretransposed):
     B = torch.randn(A.shape[1], 128)
     S = ShardedBSR(A, _cores(), pretransposed=pretransposed)
     reps = [b.requires_grad_() for b in S.replicate(B)]
-    outs = S.spmm(reps)
-    sum(o.sum() for o in outs).backward()
+    for o in S.spmm(reps):  # one backward per core (no cross-core ops)
+        o.sum().backward()
     got = sum(r.grad.cpu().double() for r in reps)
     ref = A.to_dense().double().T @ torch.ones(A.shape[0], 128, dtype=torch.float64)
     torch.testing.assert_close(got, ref, atol=1e-3, rtol=1e-4)
