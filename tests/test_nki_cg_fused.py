@@ -220,3 +220,39 @@ def test_power_iteration_fused(matvec):
         op, v0=v0, tol=0.0, max_iter=11, matvec=matvec
     )
     assert k_cap == 11
+
+
+@pytest.mark.parametrize("matvec", MATVECS)
+def test_chronopoulos_gear_matches_host_emulation(matvec):
+    # Opt-in Chronopoulos-Gear recurrence. 33 block rows split 16 / 17 at
+    # LNC=2, so the two cores' rows fill their PSUM chunks unevenly.
+    A = _spd(33, seed=19)
+    b = _rhs(A.shape[0], seed=20)
+    bsr = trnsparse.BSRMatrix.from_dense(A.float(), block_size=128)
+    op = trnsparse.prepare_cg_bsr(bsr, device=DEV)
+    x, k, rel, info = trnsparse.cg_bsr_fused(
+        op, b, tol=1e-5, matvec=matvec, recurrence="chronopoulos_gear", return_info=True
+    )
+    assert info["path"] == "nki" and info["recurrence"] == "chronopoulos_gear"
+    xh, kh, _ = trnsparse.cg_bsr_fused(bsr, b.float(), tol=1e-5, recurrence="chronopoulos_gear")
+    _, ks, _ = trnsparse.cg_bsr_fused(op, b, tol=1e-5, matvec=matvec)
+    assert abs(k - kh) <= 2 and abs(k - ks) <= 2 and rel <= 1e-5
+    assert _true_res(A, b, x) < 3e-5
+    for ce in (3, 4):  # odd and even check intervals; the cap stays exact
+        _, kc, _ = trnsparse.cg_bsr_fused(
+            op, b, tol=0.0, max_iter=13, check_every=ce, recurrence="chronopoulos_gear"
+        )
+        assert kc == 13
+
+
+def test_power_iteration_uneven_split():
+    # 33 block rows: the cores swap unequal halves of the iterate.
+    A = _spd(33, seed=21)
+    u = torch.ones(A.shape[0], dtype=torch.float64) / A.shape[0] ** 0.5
+    A = A + 4.0 * torch.outer(u, u)
+    bsr = trnsparse.BSRMatrix.from_dense(A.float(), block_size=128)
+    op = trnsparse.prepare_cg_bsr(bsr, device=DEV)
+    v0 = _rhs(A.shape[0], seed=22)
+    lam, v, k = trnsparse.power_iteration_bsr_fused(op, v0=v0, tol=1e-5, max_iter=2000)
+    lh, _, kh = trnsparse.power_iteration_bsr_fused(bsr, v0=v0.float(), tol=1e-5, max_iter=2000)
+    assert abs(k - kh) <= max(3, kh // 10) and abs(lam - lh) < 1e-5 * abs(lh)

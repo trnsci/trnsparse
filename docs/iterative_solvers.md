@@ -74,18 +74,32 @@ What the kernel does on the NeuronCore:
   a trip are masked (alpha = beta = 0), so iteration counts and
   solutions are exact rather than rounded up to `check_every`.
 - **At LNC=2 the two physical cores split the block rows.** Each core
-  holds only its rows' blocks (so the SBUF capacity doubles), computes
-  its rows of A p and its half of p.Ap, and the cores swap with
-  `nisa.sendrecv` twice per step: the partial p.Ap (both cores add the
-  same pair, and a + b == b + a exactly), and their rows of r (and z),
-  after which each core holds the full r and z and computes r.z, r.r and
-  p = z + beta p over the full width itself. Either way both cores agree
-  bit for bit on every step size and on when to stop. (#40 used three
-  exchanges: partial r.z / r.r and p separately.) That is what lets them
-  run the same device-side loop:
+  holds only its rows' blocks (so the SBUF capacity doubles) and computes
+  its rows of every matvec. Full-width vectors use a *segment* layout:
+  core 0's rows, zero padded, then core 1's, so each core's rows are one
+  contiguous segment and an exchange is a single `nisa.sendrecv` of the
+  own segment into the other one, with no copies. Exchanges of up to
+  1 KiB per partition go through GpSimd's SBUF-to-SBUF DMA
+  (`dma_engine=gpsimd_dma`): about 0.9 µs for a few columns against
+  2.4 µs on the default DMA path.
+  - Plain CG exchanges **once per step**: the cores swap their rows of
+    q = A p, and then both compute p.q, r -= alpha q, r.r and
+    p = r + beta p over the full width with the same instructions on the
+    same data.
+  - PCG exchanges twice: the partial p.q (a few columns; both cores add
+    the same pair, and a + b == b + a exactly), then their rows of
+    z = D⁻¹ r together with the partial r.z and r.r in the segment's
+    extra columns.
+  Either way both cores agree bit for bit on every step size and on when
+  to stop. That is what lets them run the same device-side loop:
   neuronx-cc requires both per-core programs to have the same control
   flow (`NCC_IXGM002`). `TRNSPARSE_CORE_SPLIT=0` runs the whole solve
   on both cores instead.
+- **Row order.** Inside the kernel each core's block rows are reordered
+  (`cg_row_order`) so that the four concurrent TensorE column groups of
+  the column matvec get about the same number of stored blocks; the
+  matvec takes as long as its busiest group. b, x0 and x are permuted by
+  DMA on the way in and out.
 - **Several right-hand sides** `(n, R)` are R independent CG solves that
   share every matmul over a stored block (R stationary columns in the
   column matvec, R moving columns in the row matvec).
@@ -108,12 +122,23 @@ moving column. In the column form the stationary operand is p_j and the
 block streams through as the moving operand, so the result is a row,
 `(A_idx p_j)ᵀ`. With column tiling (`tile_size=(128, 32)`) the PE array
 splits into four 32-column tiles that work concurrently. The kernel
-issues blocks round-robin over four row groups, so block row i of a
-16-row chunk lands at PSUM partition `32 (i % 4)`, free offset
-`128 ((i // 4) % 4)`. Each chunk is then copied to SBUF and put back in
-the column layout with one TensorE transpose per four block rows
-(`nc_transpose`, bit-exact; about 110 ns for 128x128 fp32). Same fp32
-products, different summation order. No relayout of the stored blocks is
+issues blocks round-robin over four row groups: row i = 4 c + g of a
+chunk goes to tile g. The result has to go back to the column layout
+with a TensorE transpose (`nc_transpose`, bit-exact):
+
+- In #41 row i landed at PSUM partition `32 g`, free offset `128 c`, so a
+  16-row chunk filled four 128-column slots: four PSUM-to-SBUF copies and
+  four transposes.
+- Now (fp32 A, R in 1, 2, 4, 8) the matvec's source vectors are kept
+  *spread*: each (128, R) block column sits after (G - 1) R zero columns.
+  The stationary operand for slot c is then the (c + 1) R columns ending
+  at the block, c R zeros and the block, so its product lands at PSUM
+  partitions `32 g + c R + k` of a single 128-column slot (the zeros add
+  0 to the other slots' rows). A chunk of up to 4 G rows (G R <= 32, so
+  up to 128 rows for R = 1) needs one copy and one transpose. The zero
+  gaps are never written.
+
+Same fp32 products, different summation order. No relayout of the stored blocks is
 needed: the `Aᵀ` blocks the row form uses as stationary are exactly the
 moving operand the column form needs. `"column"` takes R <= 32 (one
 32-column tile). `"auto"` (the default) picks it for R <= 32 and `"row"`
@@ -142,16 +167,50 @@ The kernel is fp32 (PSUM accumulates in fp32). The host path (no
 `neuron` device, or `set_backend("pytorch")`) runs the same masked
 algorithm in PyTorch in b's dtype, so fp64 stays fp64.
 
-What limits it (measured on Trn2, see `benchmarks.md`): with the row
-matvec (#40), each iteration costs about 0.5 µs per stored block (the
-fp32 weight load), resident or streamed alike. The column matvec brings
-that to about 0.05 µs per resident block. Now three other costs set the
-time per iteration: a fixed cost of about 8 µs (LNC=1) or 11 µs (LNC=2,
-two exchanges) for the chain of small VectorE / TensorE steps and the
-`sendrecv`s; the TensorE transposes (one per four block rows); and, for
-blocks past the SBUF budget, the HBM stream (64 KiB per fp32 block). So
-residency matters again: at n = 8192 with 1024 blocks, the 384 streamed
-blocks set the pace.
+### Chronopoulos–Gear recurrence (`recurrence=`, opt-in)
+
+`recurrence="chronopoulos_gear"` (plain CG only) runs the
+Chronopoulos–Gear form of CG: the matvec is applied to r, s = A p is
+updated by recurrence, and
+
+    r' = r - alpha s;  p = r + beta p;  x += alpha p
+    w = A r';  gamma' = r'.r';  delta = w.r'
+    beta' = gamma' / gamma;  alpha' = gamma' / (delta - beta' gamma' / alpha)
+    s' = w + beta' s
+
+so both dot products of a step form one reduction phase, and r'.r' is
+ready while the matvec runs: only one dot product (delta) sits between
+the matvec and the next r update, against two in standard CG. In exact
+arithmetic it is CG. In floating point the recurrence for s drifts from
+A p, so the recursive residual can drift further from b - A x and the
+attainable accuracy is somewhat worse; on the benchmark matrices (κ up
+to 1e5, tol 1e-5) the true residual and the iteration counts match
+standard CG (`benchmarks.md`), but it stays opt-in. The host path runs
+the same recurrence.
+
+### What limits it
+
+Measured on Trn2 (see `benchmarks.md`):
+
+- With the row matvec (#40) each iteration costs about 0.5 µs per stored
+  block (the fp32 weight load), resident or streamed alike.
+- The column matvec costs one fp32 pass of 128 moving columns per block,
+  about 270 ns, on each of four concurrent column groups: about 70 ns per
+  block when the groups are balanced (hence the row order).
+- The fixed cost per iteration, the chain of small VectorE / TensorE steps
+  and the exchanges, is now about 4 µs at LNC=2 and 3.5 µs at LNC=1 for
+  plain CG (#41: 11 and 8 µs). It is about 20 dependent instructions of
+  150–300 ns each: the PSUM copy, transpose and copy that finish each
+  matvec, the exchange, two dot products (multiply-reduce on VectorE, sum
+  over partitions on TensorE), the step sizes, and the r and p updates.
+  The Chronopoulos–Gear recurrence takes about 1 µs more off.
+- Blocks past the SBUF budget stream from HBM (64 KiB per fp32 block), so
+  residency matters: at n = 8192 with 1024 blocks, the streamed blocks set
+  the pace.
+
+The kernel's PSUM tiles (four per scope) are allocated once per trip of
+the device loop and re-zeroed, so NKI's allocator no longer runs out of
+PSUM and falls back to neuronx-cc allocation and scheduling.
 
 ## Fused power iteration: `power_iteration_bsr_fused`
 

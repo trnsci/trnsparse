@@ -152,6 +152,11 @@ def main():
         default="auto",
         help="fused variants, comma-separated matvec[:precision], e.g. row,column,column:bf16",
     )
+    ap.add_argument(
+        "--recurrence",
+        default="standard",
+        help="fused CG recurrence: standard or chronopoulos_gear (plain CG only)",
+    )
     args = ap.parse_args()
     methods = args.methods.split(",")
     preconds = [None if p == "none" else p for p in args.precond.split(",")]
@@ -209,6 +214,8 @@ def main():
 
     for pc in preconds:
         op_dev = prepare_cg_bsr(bsr, preconditioner=pc, device=dev)
+        # Chronopoulos-Gear is plain CG only
+        rec = args.recurrence if pc is None else "standard"
         for spec in args.matvec.split(",") if "fused" in methods else []:
             mv, _, prec = spec.partition(":")
             prec = prec or "fp32"
@@ -221,6 +228,7 @@ def main():
                 return_info=True,
                 matvec=mv,
                 precision=prec,
+                recurrence=rec,
             )
             tc = time.time()
             op_dev._device_operands(prec)
@@ -231,7 +239,7 @@ def main():
             # fixed cost: same launch with max_iter=0 (A load, r0, transfers)
             secs0, _ = timed(
                 lambda: trnsparse.cg_bsr_fused(
-                    op_dev, b, tol=args.tol, max_iter=0, matvec=mv, precision=prec
+                    op_dev, b, tol=args.tol, max_iter=0, matvec=mv, precision=prec, recurrence=rec
                 ),
                 args.reps,
             )
@@ -244,6 +252,7 @@ def main():
                 dict(
                     matvec=info["matvec"],
                     precision=prec,
+                    recurrence=rec,
                     resident_blocks=info["resident_blocks"],
                     trips=info["trips"],
                     ms_fixed=round(secs0 * 1e3, 3),

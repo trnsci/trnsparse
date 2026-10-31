@@ -277,7 +277,17 @@ def attn_bwd_dkdv(
 
 
 def _fake_cg_bsr_keyed(
-    blocks_t, minv_t, state, key, check_every, precond, sbuf_kib, core_split, matvec, precision
+    blocks_t,
+    minv_t,
+    state,
+    key,
+    check_every,
+    precond,
+    sbuf_kib,
+    core_split,
+    matvec,
+    precision,
+    variant=0,
 ):
     T = len(_k._STRUCTURES[key][0]) - 1
     R = (state.shape[1] - 2) // (2 * T)
@@ -296,8 +306,10 @@ def cg_bsr_keyed(
     core_split: int,
     matvec: int,
     precision: int,
+    variant: int = 0,
 ) -> torch.Tensor:
     # Fused SBUF-resident CG (#22); no autograd (a solver, not a layer).
+    # variant: 0 = standard CG, 1 = Chronopoulos-Gear recurrence (opt-in).
     return _k._cg_bsr_keyed_kernel(
         blocks_t,
         minv_t,
@@ -309,6 +321,7 @@ def cg_bsr_keyed(
         int(core_split),
         int(matvec),
         int(precision),
+        int(variant),
     )
 
 

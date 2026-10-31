@@ -364,6 +364,8 @@ _MATVEC_MODES = {"row": 0, "column": 1}
 _COL_MAX_RHS = 32
 # Storage of A in the column matvec: kernel code, stored parts per block.
 _PRECISIONS = {"fp32": (0, 1), "bf16": (1, 1), "bf16x2": (2, 2)}
+# CG recurrence of the fused kernel: kernel `variant` argument.
+_RECURRENCES = {"standard": 0, "chronopoulos_gear": 1}
 _LOWP_MAX_RHS = 16
 
 
@@ -545,6 +547,7 @@ def cg_bsr_fused(
     return_info: bool = False,
     matvec: str = "auto",
     precision: str = "fp32",
+    recurrence: str = "standard",
 ):
     """CG for SPD BSR A in one launch, with A resident in SBUF (#22).
 
@@ -595,6 +598,16 @@ def cg_bsr_fused(
             system, and the true residual stalls near 1e-3. "bf16x2": A as
             bf16 hi + lo (~2^-17 relative, the same bytes as fp32, two
             matmuls per block). The host path emulates both.
+        recurrence: "standard" (default): Hestenes-Stiefel CG, two
+            reductions (p.Ap, then r.r) per step. "chronopoulos_gear"
+            (opt-in, no preconditioner): the Chronopoulos-Gear recurrence,
+            with s = A p updated by recurrence and the matvec applied to r,
+            so the two dot products r.r and (A r).r form one reduction phase
+            and only one of them waits for the matvec. In exact arithmetic it
+            is CG; in floating point the recursive residual drifts further
+            from b - A x, so the attainable accuracy can be slightly worse
+            (see docs/iterative_solvers.md). The host path runs the same
+            recurrence.
 
     Returns:
         `(x, iters, rel_residual)` like `cg_bsr`, plus the info dict when
@@ -617,6 +630,10 @@ def cg_bsr_fused(
         raise ValueError(f"matvec must be auto, row or column, got {matvec!r}")
     if precision not in _PRECISIONS:
         raise ValueError(f"precision must be one of {sorted(_PRECISIONS)}, got {precision!r}")
+    if recurrence not in _RECURRENCES:
+        raise ValueError(f"recurrence must be one of {sorted(_RECURRENCES)}, got {recurrence!r}")
+    if recurrence != "standard" and op.preconditioner:
+        raise ValueError(f"recurrence={recurrence!r} supports plain CG only (no preconditioner)")
     if precision != "fp32" and (matvec != "column" or R > _LOWP_MAX_RHS):
         raise ValueError(
             f"precision={precision!r} needs matvec='column' and at most "
@@ -637,6 +654,7 @@ def cg_bsr_fused(
         "n_rhs": R,
         "matvec": matvec if (matvec == "row" or R <= _COL_MAX_RHS) else "row",
         "precision": precision,
+        "recurrence": recurrence,
     }
 
     def finish(x, iters, rel, trips, path):
@@ -676,6 +694,7 @@ def cg_bsr_fused(
             1 if op.core_split else 0,
             _MATVEC_MODES[info["matvec"]],
             _PRECISIONS[precision][0],
+            _RECURRENCES[recurrence],
         ).cpu()
         xt = out[:, :TR].double().reshape(_P, T, R).permute(1, 0, 2).reshape(T * _P, R)
         x = (xt[:n] * scale).to(device=b.device, dtype=out_dtype)
@@ -692,12 +711,39 @@ def cg_bsr_fused(
         return (u * v).sum(dim=(0, 1))
 
     r = bv - op._matvec(xv, precision)
+    thr = tol * tol
+    cnt = torch.zeros(R, dtype=torch.long)
+    if recurrence == "chronopoulos_gear":
+        # The kernel's masked Chronopoulos-Gear recurrence (see cgcg_step).
+        tiny = 1e-30
+        w = op._matvec(r, precision)
+        rr = dot(r, r)
+        a = ((rr > thr) & (cnt < max_iter)).to(dt)
+        alpha = a * rr / dot(w, r).clamp_min(tiny)
+        beta = torch.zeros_like(rr)
+        s, p = w.clone(), torch.zeros_like(r)
+        while bool(a.any()):
+            r_new = r - alpha * s
+            p = r + beta * p
+            xv = xv + alpha * p
+            r = r_new
+            w = op._matvec(r, precision)
+            g = dot(r, r)
+            cnt += a.long()
+            a = ((g > thr) & (cnt < max_iter)).to(dt)
+            beta = a * g / rr.clamp_min(tiny)
+            c = beta * g / alpha.clamp_min(tiny)
+            alpha = (1.0 / (dot(w, r) - c)).clamp_max(1 / tiny) * (g * a)
+            s = w + beta * s
+            rr = g
+        x = (xv.reshape(T * _P, R)[:n] * scale.to(dt)).to(device=b.device, dtype=out_dtype)
+        rel = rr.clamp_min(0).sqrt().double()
+        trips = -(-int(cnt.max()) // check_every) if R else 0
+        return finish(x, cnt, rel, trips, "pytorch")
     z = op._precond(r)
     p = z.clone()
     rz = dot(r, z)
     rr = dot(r, r)
-    thr = tol * tol
-    cnt = torch.zeros(R, dtype=torch.long)
     while True:
         act = (rr > thr) & (cnt < max_iter)
         if not bool(act.any()):
