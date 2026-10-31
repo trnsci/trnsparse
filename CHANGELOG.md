@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] — 2026-10-31
+
+Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
+
+Headline: pre-transposed static BSR SpMM beats dense aten up to ~82–98% block density on one core (was 26–49%), plus `ShardedBSR`/`ShardedAttention` across logical NeuronCores (#38).
+
 ### Added
 
 #### Static BSR SpMM and block-sparse attention across logical NeuronCores (#30)
