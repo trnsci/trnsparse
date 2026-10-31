@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] — 2026-10-30
+
+Native TorchNeuron dispatch (Trn2/Trn3) alongside the PyTorch/XLA path (Trn1, maintenance); validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0) — see trnsci/trnsci#35.
+
+Headline performance: static-structure BSR SpMM, 6.8× faster than dense aten `matmul` at 1% block density, n=8192 (#34).
+
 ### Changed
 
 #### Native path: static kernels on both LNC=2 cores, bf16 operands (#30)
