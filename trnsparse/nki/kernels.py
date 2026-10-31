@@ -1346,14 +1346,24 @@ if HAS_NKI:
         parts = 2 if int(precision) == 2 else 1  # stored parts per block of A
         adt = nl.bfloat16 if lowp else f32
         BW = parts * P  # columns per stored block in blocks_t
-        n_res = cg_resident_blocks(
-            b_hi - b_lo,
-            T if R > 1 else o1 - o0,
-            bool(precond),
-            R,
-            budget_kib=sbuf_kib,
-            block_bytes=BW * (2 if lowp else 4),
-        )
+
+        def resident(a0, a1):
+            return cg_resident_blocks(
+                row_ptrs[a1] - row_ptrs[a0],
+                T if R > 1 else a1 - a0,
+                bool(precond),
+                R,
+                budget_kib=sbuf_kib,
+                block_bytes=BW * (2 if lowp else 4),
+            )
+
+        n_res = resident(o0, o1)
+        # Does either core stream blocks from HBM? Then the matvec is paced
+        # by the stream: the rows keep their order and the column matvec
+        # works in chunks of at most 32 rows, which interleave with the
+        # stream DMAs better (measured: n = 8192, 512 blocks, one core). Both cores
+        # must agree, since they share the vector layout.
+        streams = any(resident(a0, a1) < row_ptrs[a1] - row_ptrs[a0] for a0, a1 in ranges)
 
         out = nl.ndarray((P, TR + 3 * R + 1), dtype=f32, buffer=nl.shared_hbm)
 
@@ -1389,7 +1399,7 @@ if HAS_NKI:
         # run of consecutive rows), alongside the loads of A.
         lay = []
         for a0, a1 in ranges:
-            lay += cg_row_order(row_ptrs, a0, a1)
+            lay += list(range(a0, a1)) if streams else cg_row_order(row_ptrs, a0, a1)
         pos = [0] * T
         for i, m in enumerate(lay):
             pos[m] = i
@@ -1483,7 +1493,8 @@ if HAS_NKI:
         if SPREAD:
             SX = 4
             while (
-                4 * SX < WXr  # the longer core's rows: both cores use one layout
+                (not streams or SX < 8)
+                and 4 * SX < WXr  # the longer core's rows: both cores use one layout
                 and 2 * SX * R <= 32
                 and 2 * SX * FW * 4 <= _CG_SPREAD_BYTES
             ):
