@@ -9,12 +9,15 @@ __version__ = "0.10.0"
 
 from .formats import BSRMatrix, COOMatrix, CSRMatrix, eye_sparse, from_dense, from_scipy
 from .iterative import (
+    FusedCGOperator,
     bsr_diagonal,
     cg_bsr,
+    cg_bsr_fused,
     chebyshev_bsr,
     chebyshev_coeffs,
     jacobi_preconditioner_bsr,
     power_iteration_bsr,
+    prepare_cg_bsr,
     richardson_bsr,
 )
 from .nki import HAS_NKI, get_backend, set_backend
@@ -54,6 +57,9 @@ __all__ = [
     "density_screen",
     "sparsity_stats",
     "cg_bsr",
+    "cg_bsr_fused",
+    "prepare_cg_bsr",
+    "FusedCGOperator",
     "chebyshev_bsr",
     "chebyshev_coeffs",
     "richardson_bsr",

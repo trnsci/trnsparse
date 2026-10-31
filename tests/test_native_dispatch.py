@@ -44,7 +44,7 @@ KERNEL_OPS = {
 # constants), launched directly rather than through `_launch` / `_run`.
 STATIC_OPS = {"bsr_spmm_static", "attn_fwd_static", "attn_bwd_static", "bsr_spmm_static_t"}
 # Keyed variants: the structure is one registered int key (kernels.register_structure).
-KEYED_OPS = {"bsr_spmm_keyed", "bsr_spmm_t_keyed", "attn_fwd_keyed"}
+KEYED_OPS = {"bsr_spmm_keyed", "bsr_spmm_t_keyed", "attn_fwd_keyed", "cg_bsr_keyed"}
 STATIC_OPS |= KEYED_OPS
 AUTOGRAD_OPS = {
     "spmm_dense",
@@ -548,7 +548,7 @@ class TestLazyRegistration:
             ret = schema.split("->")[1].strip()
             assert ret in ("Tensor", "(Tensor, Tensor)", "(Tensor, Tensor, Tensor)"), (name, schema)
             if name.split("::")[1] in KEYED_OPS:
-                assert re.search(r"(Sym)?[Ii]nt key\)", schema), (name, schema)
+                assert re.search(r"(Sym)?[Ii]nt key[,)]", schema), (name, schema)
             elif name.split("::")[1] in STATIC_OPS:
                 # list[int] infers as SymInt[] (int[] on older torch).
                 assert re.search(r"(Sym)?[Ii]nt\[\] row_ptrs, (Sym)?[Ii]nt\[\] cols", schema), (
@@ -594,6 +594,10 @@ class TestLazyRegistration:
             m(64, 2 * P), m(64, 2 * P), m(2 * P, 64), [0, 1, 3], [0, 0, 1]
         )
         assert o.shape == (2 * P, 64) and rm.shape == rd.shape == (2 * P, 1)
+        # fused CG: T = 3 block rows, R = 4 right-hand sides
+        key = kernels.register_structure([0, 1, 2, 3], [0, 1, 2])
+        out = fake("cg_bsr_keyed")(m(P, 3 * P), m(P, P), m(P, 2 * 3 * 4 + 2), key, 8, 0, 160, 1)
+        assert out.shape == (P, 3 * 4 + 3 * 4 + 1)
 
 
 class _Ctx:

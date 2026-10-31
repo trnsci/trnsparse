@@ -451,3 +451,167 @@ CPUs.
   - The 25% dilated mask loses at both lengths.
   - Core scaling is 1.1–2.1×, held back by about 10–20 host-issued aten
     ops per head on the public path.
+
+## Trn2: fused SBUF-resident CG (`cg_bsr_fused`, #22)
+
+trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron, one logical NeuronCore
+(LNC=2: two physical cores) unless noted. Host threads pinned to 2 CPUs
+(`taskset`, `OMP_NUM_THREADS=2`) for every column, CPU baselines included.
+Wall time from the host call to the solution on the host, warm median of 3,
+tolerance 1e-5 on ||r|| / ||b||. Reproduce with
+`benchmarks/bench_cg_fused_trn2.py --tiles T --density d`.
+
+Matrices: the synthetic block-screened overlap matrix of normalised
+s-type Gaussians on a synthetic molecular cluster, one 128-function
+fragment per block row, with blocks between distant fragments dropped
+to hit the block density and a level shift setting κ exactly. A is built
+in fp64. The device and the fp32 columns get its fp32 rounding. "true res"
+is ||b − A x|| / ||b|| with the fp64 A, and "err" is against an fp64
+direct solve.
+
+Columns: `fused` = `cg_bsr_fused` (one launch). `host_bsr` = CG over the
+keyed pre-transposed BSR SpMM op with device tensors, synced every 8 steps.
+`cg_bsr` = the shipped Python loop (one `.item()` per dot). `dense_aten` =
+CG with `torch.mv` on a dense fp32 A on the device, synced every 8 steps.
+`scipy` = `scipy.sparse.linalg.cg` on fp64 BSR. `torch fp64/fp32` = the
+`cg_bsr_fused` host path (block `bmm`). "resident" = blocks held in SBUF
+(summed over the two physical cores); the rest stream from HBM inside the
+launch. "µs/iter" = (fused − fused with max_iter=0) / iterations.
+
+#### Plain CG (ms to tol 1e-5, warm median)
+
+| n | blocks | density | κ | resident | fused | host_bsr | cg_bsr | dense_aten | scipy | torch fp64 | torch fp32 | iters | µs/iter | true res | err vs fp64 | vs best CPU | vs host_bsr |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1024 | 16 | 0.250 | 1e+03 | 16 | 2.5 | 145.9 | 159.2 | 140.0 | 12.1 | 18.2 | 22.5 | 118 | 15 | 1.6e-05 | 3.6e-06 | 4.8x | 58x |
+| 1024 | 32 | 0.500 | 1e+03 | 32 | 1.3 | 49.0 | 49.4 | 48.8 | 6.9 | 5.6 | 11.2 | 36 | 20 | 8.8e-06 | 3.9e-06 | 4.3x | 38x |
+| 1024 | 64 | 1.000 | 1e+03 | 64 | 3.6 | 147.3 | 157.5 | 151.4 | 37.8 | 26.8 | 33.8 | 118 | 26 | 1.3e-05 | 3.5e-06 | 7.5x | 41x |
+| 2048 | 32 | 0.125 | 1e+03 | 32 | 1.2 | 34.9 | 33.0 | 34.2 | 5.6 | 4.5 | 6.4 | 25 | 23 | 5.4e-06 | 1.6e-06 | 3.8x | 30x |
+| 2048 | 64 | 0.250 | 1e+03 | 64 | 1.7 | 43.2 | 44.2 | 41.4 | 12.8 | 18.9 | 16.5 | 33 | 34 | 7.2e-06 | 2.9e-06 | 7.6x | 26x |
+| 2048 | 128 | 0.500 | 1e+03 | 128 | 3.2 | 70.7 | 84.6 | 67.0 | 41.1 | 26.1 | 27.3 | 62 | 41 | 7.5e-06 | 5.2e-06 | 8.2x | 22x |
+| 2048 | 256 | 1.000 | 1e+03 | 256 | 10.9 | 169.6 | 177.3 | 163.8 | 168.1 | 95.8 | 150.5 | 130 | 69 | 1.8e-05 | 3.3e-06 | 8.8x | 16x |
+| 4096 | 64 | 0.062 | 1e+03 | 64 | 1.3 | 45.9 | 47.7 | 37.4 | 11.9 | 17.8 | 6.9 | 29 | 25 | 9.0e-06 | 5.2e-06 | 5.2x | 34x |
+| 4096 | 128 | 0.125 | 1e+03 | 128 | 2.7 | 70.8 | 70.3 | 67.3 | 39.7 | 25.0 | 33.4 | 54 | 40 | 7.0e-06 | 5.4e-06 | 9.2x | 26x |
+| 4096 | 256 | 0.250 | 1e+03 | 256 | 6.0 | 92.9 | 114.3 | 85.5 | 95.8 | 57.1 | 46.1 | 66 | 61 | 8.1e-06 | 5.1e-06 | 7.7x | 15x |
+| 4096 | 512 | 0.500 | 1e+03 | 512 | 16.5 | 151.8 | 215.2 | 143.9 | 332.5 | 192.5 | 166.1 | 118 | 124 | 1.0e-05 | 3.9e-06 | 10.1x | 9x |
+| 8192 | 122 | 0.030 | 1e+03 | 122 | 2.1 | 49.1 | 45.3 | 65.8 | 25.7 | 16.6 | 14.0 | 34 | 42 | 6.4e-06 | 3.5e-06 | 6.8x | 24x |
+| 8192 | 256 | 0.062 | 1e+03 | 256 | 4.1 | 55.4 | 86.7 | 77.9 | 71.8 | 44.6 | 32.1 | 48 | 48 | 6.8e-06 | 8.4e-06 | 7.9x | 14x |
+| 8192 | 512 | 0.125 | 1e+03 | 512 | 11.2 | 104.5 | 162.0 | 135.0 | 262.8 | 159.7 | 119.5 | 75 | 136 | 9.2e-06 | 1.1e-05 | 10.7x | 9x |
+| 8192 | 1024 | 0.250 | 1e+03 | 640 | 30.6 | 167.3 | 239.5 | 193.6 | 1334.2 | 667.1 | 322.1 | 115 | 252 | 9.1e-06 | 1.1e-05 | 10.5x | 5x |
+| 2048 | 64 | 0.250 | 1e+05 | 64 | 2.0 | 54.2 | 71.8 | 51.8 | 15.1 | 10.5 | 18.6 | 43 | 24 | 4.1e-05 | 1.7e-04 | 5.2x | 27x |
+| 4096 | 128 | 0.125 | 1e+05 | 128 | 3.6 | 79.3 | 87.1 | 81.8 | 48.4 | 31.1 | 26.4 | 67 | 44 | 2.0e-05 | 1.3e-04 | 7.3x | 22x |
+| 8192 | 256 | 0.062 | 1e+05 | 256 | 12.4 | 80.0 | 82.8 | 105.6 | 93.1 | 54.8 | 43.6 | 60 | 178 | 1.3e-05 | 3.1e-04 | 3.5x | 6x |
+
+#### Block-Jacobi PCG (ms to tol 1e-5, warm median)
+
+| n | blocks | density | κ | resident | fused | host_bsr | scipy | torch fp64 | torch fp32 | iters | µs/iter | true res | err vs fp64 | vs best CPU | vs host_bsr |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1024 | 16 | 0.250 | 1e+03 | 16 | 2.5 | 134.5 | 16.0 | 12.9 | 23.2 | 98 | 19 | 1.1e-05 | 6.3e-06 | 5.3x | 55x |
+| 1024 | 32 | 0.500 | 1e+03 | 32 | 1.3 | 41.6 | 7.2 | 12.0 | 10.5 | 26 | 26 | 9.5e-06 | 5.3e-06 | 5.6x | 33x |
+| 1024 | 64 | 1.000 | 1e+03 | 64 | 4.3 | 158.2 | 46.6 | 34.3 | 35.9 | 114 | 21 | 9.5e-06 | 5.9e-06 | 8.0x | 37x |
+| 2048 | 32 | 0.125 | 1e+03 | 32 | 1.1 | 29.2 | 6.7 | 11.8 | 7.4 | 21 | 28 | 7.2e-06 | 1.6e-06 | 6.0x | 26x |
+| 2048 | 64 | 0.250 | 1e+03 | 64 | 1.9 | 38.9 | 13.2 | 10.0 | 16.8 | 27 | 37 | 3.6e-06 | 2.7e-06 | 5.3x | 21x |
+| 2048 | 128 | 0.500 | 1e+03 | 128 | 3.1 | 71.0 | 41.9 | 26.3 | 28.5 | 51 | 50 | 9.5e-06 | 4.3e-06 | 8.4x | 23x |
+| 2048 | 256 | 1.000 | 1e+03 | 256 | 13.4 | 238.7 | 235.1 | 142.7 | 199.4 | 158 | 76 | 1.8e-05 | 5.1e-06 | 10.6x | 18x |
+| 4096 | 64 | 0.062 | 1e+03 | 64 | 1.4 | 37.1 | 14.5 | 11.1 | 17.8 | 24 | 34 | 4.7e-06 | 2.5e-06 | 7.9x | 26x |
+| 4096 | 128 | 0.125 | 1e+03 | 128 | 2.9 | 66.7 | 40.6 | 28.0 | 33.3 | 44 | 52 | 7.2e-06 | 3.3e-06 | 9.7x | 23x |
+| 4096 | 256 | 0.250 | 1e+03 | 256 | 5.6 | 82.1 | 83.0 | 51.2 | 40.1 | 50 | 97 | 6.0e-06 | 4.1e-06 | 7.2x | 15x |
+| 4096 | 512 | 0.500 | 1e+03 | 512 | 13.5 | 129.1 | 284.8 | 164.0 | 124.9 | 82 | 143 | 9.1e-06 | 6.4e-06 | 9.2x | 10x |
+| 8192 | 122 | 0.030 | 1e+03 | 122 | 2.3 | 47.0 | 31.7 | 22.6 | 18.3 | 30 | 55 | 6.0e-06 | 4.1e-06 | 8.0x | 20x |
+| 8192 | 256 | 0.062 | 1e+03 | 256 | 5.6 | 62.5 | 77.4 | 49.3 | 36.6 | 42 | 101 | 8.0e-06 | 1.4e-05 | 6.5x | 11x |
+| 8192 | 512 | 0.125 | 1e+03 | 512 | 10.7 | 99.5 | 259.9 | 186.3 | 116.0 | 61 | 145 | 7.8e-06 | 8.7e-06 | 10.8x | 9x |
+| 8192 | 1024 | 0.250 | 1e+03 | 576 | 21.0 | 131.8 | 986.7 | 483.1 | 217.6 | 74 | 253 | 8.9e-06 | 1.3e-05 | 10.3x | 6x |
+| 2048 | 64 | 0.250 | 1e+05 | 64 | 2.2 | 48.7 | 16.4 | 12.1 | 18.9 | 33 | 41 | 3.5e-05 | 1.0e-04 | 5.6x | 23x |
+| 4096 | 128 | 0.125 | 1e+05 | 128 | 3.2 | 67.4 | 48.0 | 34.3 | 26.0 | 54 | 39 | 1.7e-05 | 3.6e-05 | 8.2x | 21x |
+| 8192 | 256 | 0.062 | 1e+05 | 256 | 5.9 | 72.9 | 108.6 | 66.0 | 49.5 | 53 | 85 | 1.5e-05 | 3.2e-04 | 8.3x | 12x |
+
+#### LNC=2 row split vs whole solve on one physical core (fused, plain CG, µs/iter)
+
+| n | blocks | split (LNC=2) | no split (LNC=2) | LNC=1 | split speedup |
+|---:|---:|---:|---:|---:|---:|
+| 2048 | 256 | 69 | 114 | 119 | 1.66x |
+| 4096 | 256 | 61 | 130 | 139 | 2.12x |
+| 4096 | 512 | 124 | 232 | 230 | 1.87x |
+| 8192 | 512 | 136 | 241 | 244 | 1.77x |
+| 8192 | 1024 | 252 | 460 | 461 | 1.82x |
+
+#### Check interval (n=4096, 256 blocks, fused, ms)
+
+| check_every | plain | PCG |
+|---:|---:|---:|
+| 1 | 5.9 | 5.1 |
+| 4 | 5.4 | 4.8 |
+| 8 | 6.0 | 5.6 |
+| 32 | 8.5 | 5.4 |
+
+#### Several right-hand sides (ms per right-hand side, warm median)
+
+| n (256 blocks) | precond | R | fused total ms | fused | host_bsr | dense_aten | scipy | torch fp64 | torch fp32 | fused vs best CPU |
+|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 2048 | block_jacobi | 1 | 13.4 | 13.43 | 238.68 | - | 235.07 | 142.72 | 199.45 | 11x |
+| 2048 | block_jacobi | 64 | 18.9 | 0.30 | 3.23 | - | 234.57 | 32.81 | 12.85 | 44x |
+| 2048 | none | 1 | 10.9 | 10.90 | 169.61 | 163.79 | 168.07 | 95.80 | 150.50 | 9x |
+| 2048 | none | 64 | 28.6 | 0.45 | 2.44 | 2.40 | 166.45 | 20.72 | 10.22 | 23x |
+| 4096 | block_jacobi | 1 | 5.6 | 5.59 | 82.14 | - | 82.96 | 51.20 | 40.10 | 7x |
+| 4096 | block_jacobi | 4 | 9.8 | 2.44 | 17.34 | - | 93.92 | 15.04 | 11.88 | 5x |
+| 4096 | block_jacobi | 16 | 9.8 | 0.61 | 4.24 | - | 88.37 | 5.70 | 3.72 | 6x |
+| 4096 | block_jacobi | 64 | 11.5 | 0.18 | 1.12 | - | 86.64 | 12.34 | 2.63 | 15x |
+| 4096 | block_jacobi | 128 | 12.5 | 0.10 | - | - | - | 11.73 | 6.40 | 66x |
+| 4096 | none | 1 | 6.0 | 6.00 | 92.92 | 85.49 | 95.81 | 57.12 | 46.10 | 8x |
+| 4096 | none | 4 | 10.5 | 2.63 | 20.31 | 23.74 | 95.09 | 16.47 | 13.20 | 5x |
+| 4096 | none | 16 | 25.9 | 1.62 | 5.27 | 5.81 | 98.70 | 7.00 | 4.25 | 3x |
+| 4096 | none | 64 | 12.2 | 0.19 | 1.28 | 1.38 | 115.96 | 13.96 | 3.20 | 17x |
+| 4096 | none | 128 | 12.7 | 0.10 | - | - | - | 14.57 | 7.54 | 76x |
+
+### Reading the CG tables
+
+- **The win is removing the host from the iteration loop.** The fused
+  solve is 3.5–11x faster than the best 2-thread CPU solver at every size
+  and density here. It is 5–58x faster than the same CG driven from the
+  host over the already fast BSR SpMM op: that loop costs about 1–1.5 ms
+  per iteration in launches and syncs, against 15–250 µs on the device.
+- **A matvec costs about 0.5 µs per stored block per physical core**,
+  whether the block is resident or streamed. That is the TensorE load of
+  a 128x128 fp32 stationary block for one moving column (a
+  microbenchmark gives 497 ns per matmul at 1 column, 524 ns at 64,
+  985 ns at 512; bf16 is 100 ns). The DMA queues keep up streaming
+  64 KiB blocks from HBM at that rate (about 128 GB/s), so at n = 8192
+  with 1024 blocks, the 384 non-resident blocks did not cost extra time
+  per block. **SBUF residency stops fitting at 320 fp32 blocks per
+  physical core (640 per logical core with the split), but past that
+  point nothing falls off a cliff.** Residency matters only when the
+  per-block compute gets cheaper than the DMA (bf16, or many more moving
+  columns).
+- **The LNC=2 row split is 1.7–2.1x per iteration** over running the
+  whole solve on one physical core. LNC=1 matches the unsplit LNC=2
+  kernel.
+- **Several right-hand sides are nearly free.** R columns share each
+  stationary load: 128 right-hand sides take 12.7 ms against 6.0 ms for
+  one (n = 4096), i.e. 0.10 ms per solve. The best CPU per-solve time
+  here is 2.6 ms (block `bmm`, R = 64), so that is about 26x.
+- **Checking convergence on the device every 1–8 steps costs little.**
+  The device-side `while` test adds about 3 µs per check.
+- **Precision is fp32.** The recursive residual reaches tol. The true
+  residual against the fp64 A lands at 0.5–2x tol for κ = 1e3, and the
+  error against fp64 is 1e-6 to 1e-5. At κ = 1e5 the error grows to
+  1e-4 to 3e-4 (fp32 rounding of A times κ), where the fp64 CPU solvers
+  do not have that floor. fp32 CG also takes about 5–25% more iterations
+  than fp64 CG.
+
+#### Independent solves, one process per logical core (whole chip)
+
+n = 4096, 256 blocks, plain CG, 40 solves per process, every process
+pinned to the same 2 host CPUs (driver script posted on #22). The rate
+is solves / the slowest process's solve-loop time.
+
+| logical cores | solves/s | scaling | per solve (ms) |
+|---:|---:|---:|---:|
+| 1 | 148 | 1.00x | 6.8 |
+| 2 | 333 | 2.25x | 6.0 |
+| 4 | 356 | 2.41x | 11.2 |
+
+For reference, the same solve on the 2 host CPUs takes 46 ms in torch
+fp32 (22 solves/s) and 57 ms in torch fp64 (block `bmm`, both threads
+busy). Going from 2 to 4 cores is limited by the 2 host CPUs that four
+processes share (per-solve host packing and copies) and by cores slowing
+each other. On these 2 CPUs, batching right-hand sides into one launch
+(above) is the better way to raise throughput.

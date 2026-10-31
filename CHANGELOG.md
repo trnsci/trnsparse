@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+#### Fused SBUF-resident CG (#22)
+
+- `cg_bsr_fused(A, b, ...)` and `prepare_cg_bsr(A, preconditioner=None |
+  "block_jacobi", device=...)` (a reusable `FusedCGOperator`): the whole
+  CG or block-Jacobi PCG solve runs in one NKI launch
+  (`trnsparse::cg_bsr_keyed`). A's blocks are loaded into SBUF once
+  (`TRNSPARSE_CG_SBUF_KIB`, default 160 KiB per partition; any overflow
+  streams from HBM inside the loop). Vectors stay in SBUF, dot products
+  reduce through PSUM, and an `nl.while_loop` checks convergence on the
+  device every `check_every` steps, with masked steps so the iteration
+  count is exact. At LNC=2 the two physical cores split the block rows
+  and exchange partial dots and halves of p with `sendrecv`. `b` may be
+  `(n, R)`: R independent solves share each matmul.
+- Host fallback with the same algorithm (fp64 stays fp64), CPU tests,
+  MLIR verify and NEFF compile at LNC=1/2, and hardware tests
+  (`tests/test_nki_cg_fused.py`).
+- `benchmarks/bench_cg_fused_trn2.py`: time to tolerance against a
+  host-driven loop over the BSR SpMM op, `cg_bsr`, dense aten CG on the
+  device, scipy and torch on the CPU, on synthetic block-screened
+  Gaussian-overlap matrices.
+
 ## [0.10.0] — 2026-10-31
 
 Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
