@@ -98,10 +98,11 @@ stats = trnsparse.sparsity_stats(Q)
 | `sparse_scale` | B = αA |
 | `sparse_transpose` | Aᵀ |
 | `cg_bsr` | Conjugate Gradient on BSR matrix |
-| `cg_bsr_fused` / `prepare_cg_bsr` | One-launch CG / block-Jacobi PCG, A in SBUF, device-side convergence check, multi-RHS |
+| `cg_bsr_fused` / `prepare_cg_bsr` | One-launch CG / block-Jacobi PCG, A in SBUF, vector-stationary TensorE matvec, device-side convergence check, multi-RHS, opt-in bf16 A |
 | `chebyshev_bsr` | Fixed-K Chebyshev semi-iteration (no inner products) |
 | `richardson_bsr` | Fixed-K Richardson iteration |
 | `power_iteration_bsr` | Dominant eigenpair via power iteration |
+| `power_iteration_bsr_fused` | Power iteration in one launch (the fused CG kernel's machinery) |
 | `jacobi_preconditioner_bsr` | Diagonal preconditioner for `cg_bsr` |
 | `bsr_diagonal` | Extract main diagonal from BSR matrix |
 | `block_sparse_attention_tiled` | Two-pass sparse attention, no O(seq²) intermediate |

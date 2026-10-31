@@ -276,7 +276,9 @@ def attn_bwd_dkdv(
     )
 
 
-def _fake_cg_bsr_keyed(blocks_t, minv_t, state, key, check_every, precond, sbuf_kib, core_split):
+def _fake_cg_bsr_keyed(
+    blocks_t, minv_t, state, key, check_every, precond, sbuf_kib, core_split, matvec, precision
+):
     T = len(_k._STRUCTURES[key][0]) - 1
     R = (state.shape[1] - 2) // (2 * T)
     return state.new_empty((_P, T * R + 3 * R + 1))
@@ -292,6 +294,8 @@ def cg_bsr_keyed(
     precond: int,
     sbuf_kib: int,
     core_split: int,
+    matvec: int,
+    precision: int,
 ) -> torch.Tensor:
     # Fused SBUF-resident CG (#22); no autograd (a solver, not a layer).
     return _k._cg_bsr_keyed_kernel(
@@ -303,6 +307,39 @@ def cg_bsr_keyed(
         int(precond),
         int(sbuf_kib),
         int(core_split),
+        int(matvec),
+        int(precision),
+    )
+
+
+def _fake_power_bsr_keyed(
+    blocks_t, state, key, check_every, sbuf_kib, core_split, matvec, precision
+):
+    T = len(_k._STRUCTURES[key][0]) - 1
+    return state.new_empty((_P, T + 4))
+
+
+@nki_op("trnsparse::power_bsr_keyed", mutates_args={}, fake_fn=_fake_power_bsr_keyed)
+def power_bsr_keyed(
+    blocks_t: torch.Tensor,
+    state: torch.Tensor,
+    key: int,
+    check_every: int,
+    sbuf_kib: int,
+    core_split: int,
+    matvec: int,
+    precision: int,
+) -> torch.Tensor:
+    # Fused power iteration (#22): the CG kernel's machinery, algo=1.
+    return _k._power_bsr_keyed_kernel(
+        blocks_t,
+        state,
+        int(key),
+        int(check_every),
+        int(sbuf_kib),
+        int(core_split),
+        int(matvec),
+        int(precision),
     )
 
 
@@ -433,6 +470,7 @@ OPS = {
     "bsr_spmm_t_keyed": bsr_spmm_t_keyed,
     "attn_fwd_keyed": attn_fwd_keyed,
     "cg_bsr_keyed": cg_bsr_keyed,
+    "power_bsr_keyed": power_bsr_keyed,
     "attn_fwd_static": attn_fwd_static,
     "attn_bwd_static": attn_bwd_static,
     "screened_spmm": screened_spmm,

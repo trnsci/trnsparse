@@ -390,3 +390,82 @@ class TestCgBsrFused:
             trnsparse.cg_bsr_fused(sq, torch.ones(128, 513))
         with pytest.raises(ValueError, match="shape"):
             trnsparse.cg_bsr_fused(sq, torch.ones(128, 2, 2))
+
+    def test_matvec_and_precision_options(self):
+        A = _block_spd(2, seed=15)
+        bsr = trnsparse.BSRMatrix.from_dense(A, block_size=128)
+        b = torch.randn(256, dtype=torch.float64, generator=torch.Generator().manual_seed(16))
+        _, _, _, info = trnsparse.cg_bsr_fused(bsr, b, return_info=True)
+        assert info["matvec"] == "column" and info["precision"] == "fp32"
+        _, _, _, info = trnsparse.cg_bsr_fused(bsr, b[:, None].repeat(1, 33), return_info=True)
+        assert info["matvec"] == "row"  # "auto": more than 32 right-hand sides
+        with pytest.raises(ValueError, match="matvec"):
+            trnsparse.cg_bsr_fused(bsr, b, matvec="diagonal")
+        with pytest.raises(ValueError, match="precision"):
+            trnsparse.cg_bsr_fused(bsr, b, precision="fp16")
+        with pytest.raises(ValueError, match="column"):
+            trnsparse.cg_bsr_fused(bsr, b, matvec="row", precision="bf16")
+        with pytest.raises(ValueError, match="right-hand sides"):
+            trnsparse.cg_bsr_fused(bsr, b[:, None].repeat(1, 17), precision="bf16x2")
+
+    def test_bf16_emulation_solves_the_rounded_system(self):
+        # The host path emulates the bf16 column matvec: CG converges for the
+        # bf16-rounded A, so the residual against A itself stalls near the
+        # rounding (~2^-9), and bf16 hi + lo (~2^-17) lands close to fp32.
+        from trnsparse.iterative import _bf16_parts
+
+        A = _block_spd(2, seed=17, shift=5.0)
+        bsr = trnsparse.BSRMatrix.from_dense(A, block_size=128)
+        b = torch.randn(256, dtype=torch.float64, generator=torch.Generator().manual_seed(18))
+        op = trnsparse.prepare_cg_bsr(bsr)
+
+        def true_res(x):
+            return float(torch.linalg.norm(b - A @ x) / torch.linalg.norm(b))
+
+        x32, _, _ = trnsparse.cg_bsr_fused(op, b, tol=1e-10, max_iter=500)
+        x16, _, rel16 = trnsparse.cg_bsr_fused(op, b, tol=1e-10, max_iter=500, precision="bf16")
+        x2, _, _ = trnsparse.cg_bsr_fused(op, b, tol=1e-10, max_iter=500, precision="bf16x2")
+        assert rel16 < 1e-6  # the recursive residual converges ...
+        assert 1e-5 < true_res(x16) < 3e-2  # ... to the bf16-rounded system
+        assert true_res(x2) < 1e-4 and true_res(x32) < 1e-9
+        hi, lo = _bf16_parts(op._blocks64, 2)
+        assert hi.dtype == lo.dtype == torch.bfloat16
+        err = (hi.double() + lo.double() - op._blocks64).abs().max()
+        assert err <= 2.0**-15 * op._blocks64.abs().max()
+
+    def test_resident_blocks_bf16(self):
+        from trnsparse.nki.kernels import cg_resident_blocks
+
+        # bf16 A takes 256 B per block per partition: twice the blocks
+        assert cg_resident_blocks(1000, 32, False, block_bytes=256) == 640
+        assert cg_resident_blocks(1000, 32, True, block_bytes=256) == 576
+        assert cg_resident_blocks(1000, 32, False, block_bytes=512) == 320
+
+
+class TestPowerIterationFused:
+    def test_matches_power_iteration_bsr(self):
+        A = _block_spd(3, seed=20)
+        bsr = trnsparse.BSRMatrix.from_dense(A, block_size=128)
+        v0 = torch.randn(
+            A.shape[0], dtype=torch.float64, generator=torch.Generator().manual_seed(21)
+        )
+        lam, v, k = trnsparse.power_iteration_bsr_fused(bsr, v0=v0, tol=1e-10, max_iter=3000)
+        lam_ref, _, k_ref = trnsparse.power_iteration_bsr(bsr, v0=v0, tol=1e-10, max_iter=3000)
+        assert abs(lam - lam_ref) < 1e-8 * abs(lam_ref) and abs(k - k_ref) <= 1
+        top = float(torch.linalg.eigvalsh(A)[-1])
+        assert abs(lam - top) < 1e-4 * top
+        assert v.dtype == torch.float64 and abs(float(torch.linalg.norm(v)) - 1) < 1e-12
+
+    def test_cap_padding_and_info(self):
+        A = _block_spd(2, n=200, seed=22)
+        bsr = trnsparse.BSRMatrix.from_dense(A, block_size=128)
+        v0 = torch.ones(200, dtype=torch.float64)
+        lam, v, k, info = trnsparse.power_iteration_bsr_fused(
+            bsr, v0=v0, tol=0.0, max_iter=7, check_every=4, return_info=True
+        )
+        assert k == 7 and v.shape == (200,) and info["path"] == "pytorch"
+        assert info["matvec"] == "column" and info["trips"] == 2
+        with pytest.raises(ValueError, match="v0"):
+            trnsparse.power_iteration_bsr_fused(bsr, v0=torch.ones(10))
+        with pytest.raises(ValueError, match="column"):
+            trnsparse.power_iteration_bsr_fused(bsr, matvec="row", precision="bf16")

@@ -20,7 +20,8 @@ Methods (each row reports wall time to tolerance, iterations, and the true
 residual ||b - A x|| / ||b|| and the error against an fp64 direct solve):
 
     fused        cg_bsr_fused: one launch, A's blocks in SBUF, device-side
-                 convergence check every --check-every steps
+                 convergence check every --check-every steps; one row per
+                 --matvec variant (row, column, column:bf16, column:bf16x2)
     host_bsr     host-driven CG over the keyed pre-transposed BSR SpMM op,
                  device tensors, no host sync except every --check-every
                  steps
@@ -146,6 +147,11 @@ def main():
     ap.add_argument("--out", default="cg_fused.jsonl")
     ap.add_argument("--tag", default="")
     ap.add_argument("--rhs", type=int, default=1, help="right-hand sides solved together")
+    ap.add_argument(
+        "--matvec",
+        default="auto",
+        help="fused variants, comma-separated matvec[:precision], e.g. row,column,column:bf16",
+    )
     args = ap.parse_args()
     methods = args.methods.split(",")
     preconds = [None if p == "none" else p for p in args.precond.split(",")]
@@ -203,7 +209,9 @@ def main():
 
     for pc in preconds:
         op_dev = prepare_cg_bsr(bsr, preconditioner=pc, device=dev)
-        if "fused" in methods:
+        for spec in args.matvec.split(",") if "fused" in methods else []:
+            mv, _, prec = spec.partition(":")
+            prec = prec or "fp32"
             fn = lambda: trnsparse.cg_bsr_fused(  # noqa: E731
                 op_dev,
                 b,
@@ -211,16 +219,21 @@ def main():
                 max_iter=args.max_iter,
                 check_every=args.check_every,
                 return_info=True,
+                matvec=mv,
+                precision=prec,
             )
             tc = time.time()
-            op_dev._device_operands()
+            op_dev._device_operands(prec)
             fn()
             compile_s = time.time() - tc
             secs, (x, it, rel, info) = timed(fn, args.reps)
             it = int(torch.as_tensor(it).max())
             # fixed cost: same launch with max_iter=0 (A load, r0, transfers)
             secs0, _ = timed(
-                lambda: trnsparse.cg_bsr_fused(op_dev, b, tol=args.tol, max_iter=0), args.reps
+                lambda: trnsparse.cg_bsr_fused(
+                    op_dev, b, tol=args.tol, max_iter=0, matvec=mv, precision=prec
+                ),
+                args.reps,
             )
             emit(
                 "fused",
@@ -229,6 +242,8 @@ def main():
                 x,
                 it,
                 dict(
+                    matvec=info["matvec"],
+                    precision=prec,
                     resident_blocks=info["resident_blocks"],
                     trips=info["trips"],
                     ms_fixed=round(secs0 * 1e3, 3),

@@ -44,7 +44,13 @@ KERNEL_OPS = {
 # constants), launched directly rather than through `_launch` / `_run`.
 STATIC_OPS = {"bsr_spmm_static", "attn_fwd_static", "attn_bwd_static", "bsr_spmm_static_t"}
 # Keyed variants: the structure is one registered int key (kernels.register_structure).
-KEYED_OPS = {"bsr_spmm_keyed", "bsr_spmm_t_keyed", "attn_fwd_keyed", "cg_bsr_keyed"}
+KEYED_OPS = {
+    "bsr_spmm_keyed",
+    "bsr_spmm_t_keyed",
+    "attn_fwd_keyed",
+    "cg_bsr_keyed",
+    "power_bsr_keyed",
+}
 STATIC_OPS |= KEYED_OPS
 AUTOGRAD_OPS = {
     "spmm_dense",
@@ -596,8 +602,13 @@ class TestLazyRegistration:
         assert o.shape == (2 * P, 64) and rm.shape == rd.shape == (2 * P, 1)
         # fused CG: T = 3 block rows, R = 4 right-hand sides
         key = kernels.register_structure([0, 1, 2, 3], [0, 1, 2])
-        out = fake("cg_bsr_keyed")(m(P, 3 * P), m(P, P), m(P, 2 * 3 * 4 + 2), key, 8, 0, 160, 1)
+        out = fake("cg_bsr_keyed")(
+            m(P, 3 * P), m(P, P), m(P, 2 * 3 * 4 + 2), key, 8, 0, 160, 1, 1, 0
+        )
         assert out.shape == (P, 3 * 4 + 3 * 4 + 1)
+        # fused power iteration: T = 3, one vector
+        out = fake("power_bsr_keyed")(m(P, 3 * P), m(P, 2 * 3 + 2), key, 8, 160, 1, 1, 0)
+        assert out.shape == (P, 3 + 4)
 
 
 class _Ctx:

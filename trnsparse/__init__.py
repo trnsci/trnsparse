@@ -17,6 +17,7 @@ from .iterative import (
     chebyshev_coeffs,
     jacobi_preconditioner_bsr,
     power_iteration_bsr,
+    power_iteration_bsr_fused,
     prepare_cg_bsr,
     richardson_bsr,
 )
@@ -64,6 +65,7 @@ __all__ = [
     "chebyshev_coeffs",
     "richardson_bsr",
     "power_iteration_bsr",
+    "power_iteration_bsr_fused",
     "jacobi_preconditioner_bsr",
     "bsr_diagonal",
     "HAS_NKI",

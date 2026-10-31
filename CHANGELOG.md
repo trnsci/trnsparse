@@ -30,6 +30,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   device, scipy and torch on the CPU, on synthetic block-screened
   Gaussian-overlap matrices.
 
+#### Fused CG follow-ups (#22): column matvec, bf16 A, fused power iteration
+
+- `cg_bsr_fused(..., matvec="auto" | "row" | "column")`: the
+  **vector-stationary ("column") matvec** is the new default for up to 32
+  right-hand sides. The vector is the TensorE stationary operand, the
+  stored block streams through as the moving operand, and four 32-column
+  PE tiles work in turn. Each 16 block rows are then transposed back to
+  the column layout on TensorE (bit-exact). That is about 50 ns per
+  resident fp32 block against 425 ns for the row form, with the same
+  fp32 arithmetic in a different summation order. It needs no relayout
+  of the stored blocks. More than 32 right-hand sides keep `"row"`.
+- Two `sendrecv` exchanges per CG step at LNC=2 instead of three. The
+  cores swap their rows of r (and z) and then compute r.z, r.r and
+  p = z + beta p over the full width, bit-identically on both cores.
+  This replaces separate exchanges of the partial dots and of p.
+- `precision="bf16" | "bf16x2"` (opt-in, column matvec, R <= 16): bf16 A,
+  or bf16 hi + lo A, with fp32 vectors (split into bf16 hi + lo on the
+  device) and fp32 accumulation. The host path emulates both.
+- `power_iteration_bsr_fused(A, v0, max_iter, tol, ...)`
+  (`trnsparse::power_bsr_keyed`): power iteration in one launch on the
+  same kernel (Rayleigh quotient, device-side stop on |Δλ| < tol, LNC=2
+  row split).
+- `benchmarks/bench_cg_fused_trn2.py --matvec row,column,column:bf16,...`
+  and `benchmarks/bench_power_fused_trn2.py`.
+
 ## [0.10.0] — 2026-10-31
 
 Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.

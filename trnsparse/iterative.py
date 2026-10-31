@@ -359,6 +359,26 @@ _P = 128
 # block each) per device-side convergence check; cap the unrolled matmul
 # count so trace / compile time stays bounded.
 _FUSED_MAX_UNROLL = 8192
+# Device matvec orientations of the fused kernel (see `cg_bsr_fused`).
+_MATVEC_MODES = {"row": 0, "column": 1}
+_COL_MAX_RHS = 32
+# Storage of A in the column matvec: kernel code, stored parts per block.
+_PRECISIONS = {"fp32": (0, 1), "bf16": (1, 1), "bf16x2": (2, 2)}
+_LOWP_MAX_RHS = 16
+
+
+def _bf16_parts(blocks64: torch.Tensor, parts: int) -> list[torch.Tensor]:
+    """hi (, lo) bf16 parts of fp64 blocks: hi = bf16(A), lo = bf16(A - hi)."""
+    hi = blocks64.to(torch.bfloat16)
+    if parts == 1:
+        return [hi]
+    return [hi, (blocks64 - hi.double()).to(torch.bfloat16)]
+
+
+def _bf16_split_vec(v: torch.Tensor) -> torch.Tensor:
+    """v rounded the way the kernel's stationary operand sees it: bf16 hi + lo."""
+    hi = v.to(torch.bfloat16).to(v.dtype)
+    return hi + (v - hi).to(torch.bfloat16).to(v.dtype)
 
 
 class FusedCGOperator:
@@ -438,13 +458,16 @@ class FusedCGOperator:
         self._dev = None  # device operands, built on first device solve
         self._host_cache: dict = {}
 
-    def _device_operands(self):
+    def _device_operands(self, precision: str = "fp32"):
+        """(blocks, block-Jacobi inverses, structure key) on the device. The
+        blocks are A_idx^T side by side, in fp32 or (for the bf16 column
+        matvec) as bf16 hi (, lo) parts, block idx's parts adjacent."""
+        from .nki.kernels import register_structure
+
+        def side_by_side(blk):  # (k, 128, 128) -> (128, k*128) of A_idx^T
+            return blk.permute(2, 0, 1).reshape(_P, -1)
+
         if self._dev is None:
-            from .nki.kernels import register_structure
-
-            def side_by_side(blk):  # (k, 128, 128) -> (128, k*128) of A_idx^T
-                return blk.permute(2, 0, 1).reshape(_P, -1)
-
             bt = side_by_side(self._blocks64).to(torch.float32).contiguous()
             if self._minv64 is not None:
                 mt = side_by_side(self._minv64).to(torch.float32).contiguous()
@@ -452,7 +475,15 @@ class FusedCGOperator:
                 mt = torch.zeros(_P, _P, dtype=torch.float32)
             key = register_structure(self.row_ptrs, self.cols)
             self._dev = (bt.to(self.device), mt.to(self.device), key)
-        return self._dev
+            self._dev_lowp = {}
+        if precision == "fp32":
+            return self._dev
+        if precision not in self._dev_lowp:
+            parts = _bf16_parts(self._blocks64, _PRECISIONS[precision][1])
+            # (P, k, parts, P): block idx's parts at columns (idx*parts + part)*P
+            bt = torch.stack([side_by_side(t).reshape(_P, -1, _P) for t in parts], dim=2)
+            self._dev_lowp[precision] = bt.reshape(_P, -1).contiguous().to(self.device)
+        return (self._dev_lowp[precision], self._dev[1], self._dev[2])
 
     # CPU path helpers on (T, 128, R) tiles
     def _cast(self, name: str, dtype: torch.dtype) -> torch.Tensor:
@@ -461,8 +492,18 @@ class FusedCGOperator:
             self._host_cache[key] = getattr(self, name).to(dtype)
         return self._host_cache[key]
 
-    def _matvec(self, x: torch.Tensor) -> torch.Tensor:  # x: (T, 128, R)
-        blk = self._cast("_blocks64", x.dtype)
+    def _matvec(self, x: torch.Tensor, precision: str = "fp32") -> torch.Tensor:
+        # x: (T, 128, R). Low precision emulates the device's bf16 column
+        # matvec: A's bf16 parts summed, x split into bf16 hi + lo.
+        if precision == "fp32":
+            blk = self._cast("_blocks64", x.dtype)
+        else:
+            key = ("lowp", precision, x.dtype)
+            if key not in self._host_cache:
+                parts = _bf16_parts(self._blocks64, _PRECISIONS[precision][1])
+                self._host_cache[key] = sum(t.double() for t in parts).to(x.dtype)
+            blk = self._host_cache[key]
+            x = _bf16_split_vec(x)
         return torch.zeros_like(x).index_add_(0, self._rows, torch.bmm(blk, x[self._cols]))
 
     def _precond(self, r: torch.Tensor) -> torch.Tensor:
@@ -502,6 +543,8 @@ def cg_bsr_fused(
     preconditioner: str | None = None,
     check_every: int = 8,
     return_info: bool = False,
+    matvec: str = "auto",
+    precision: str = "fp32",
 ):
     """CG for SPD BSR A in one launch, with A resident in SBUF (#22).
 
@@ -534,6 +577,24 @@ def cg_bsr_fused(
             128x128 diagonal blocks; ignored when A is an operator).
         check_every: CG steps between convergence checks (device only).
         return_info: also return a dict (resident_blocks, trips, path).
+        matvec: TensorE orientation of the device matvec. "row": each
+            stored block is the stationary operand, about 0.43 us per fp32
+            block on Trn2 (the 128x128 weight load). "column": the vector
+            is stationary and the block streams through four concurrent
+            32-column PE tiles, then each 16 block rows are transposed back
+            on TensorE (bit-exact); about 0.05 us per block. Same fp32
+            arithmetic, different summation order. "column" takes up to 32
+            right-hand sides. "auto" (default): "column" for R <= 32, else
+            "row". Ignored on the host path.
+        precision: storage of A in the device matvec (opt-in; needs the
+            column matvec and R <= 16). "fp32" (default). "bf16": A rounded
+            to bf16 (half the SBUF / HBM bytes per block, so twice the
+            resident blocks); the vector is split into bf16 hi + lo on the
+            device and products accumulate in fp32, so the only loss is A's
+            bf16 rounding (~2^-9 relative): CG then solves that rounded
+            system, and the true residual stalls near 1e-3. "bf16x2": A as
+            bf16 hi + lo (~2^-17 relative, the same bytes as fp32, two
+            matmuls per block). The host path emulates both.
 
     Returns:
         `(x, iters, rel_residual)` like `cg_bsr`, plus the info dict when
@@ -550,8 +611,19 @@ def cg_bsr_fused(
     if not 1 <= R <= 512:
         raise ValueError(f"cg_bsr_fused takes 1..512 right-hand sides, got {R}")
     X0 = None if x0 is None else x0.reshape(n, R)
+    if matvec == "auto":
+        matvec = "column" if R <= _COL_MAX_RHS else "row"
+    if matvec not in _MATVEC_MODES:
+        raise ValueError(f"matvec must be auto, row or column, got {matvec!r}")
+    if precision not in _PRECISIONS:
+        raise ValueError(f"precision must be one of {sorted(_PRECISIONS)}, got {precision!r}")
+    if precision != "fp32" and (matvec != "column" or R > _LOWP_MAX_RHS):
+        raise ValueError(
+            f"precision={precision!r} needs matvec='column' and at most "
+            f"{_LOWP_MAX_RHS} right-hand sides"
+        )
     check_every = max(1, int(check_every))
-    per_step = op.n_blocks + (T if op.preconditioner else 0)
+    per_step = op.n_blocks * _PRECISIONS[precision][1] + (T if op.preconditioner else 0)
     if check_every * per_step > _FUSED_MAX_UNROLL:
         check_every = max(1, _FUSED_MAX_UNROLL // per_step)
     out_dtype = b.dtype
@@ -559,10 +631,12 @@ def cg_bsr_fused(
     norms = torch.linalg.norm(B.detach().to("cpu", torch.float64), dim=0)
     scale = torch.where(norms > 1e-300, norms, torch.ones_like(norms))
     info = {
-        "resident_blocks": cg_resident_blocks_for(op, R),
+        "resident_blocks": cg_resident_blocks_for(op, R, precision=precision),
         "n_blocks": op.n_blocks,
         "check_every": check_every,
         "n_rhs": R,
+        "matvec": matvec if (matvec == "row" or R <= _COL_MAX_RHS) else "row",
+        "precision": precision,
     }
 
     def finish(x, iters, rel, trips, path):
@@ -581,7 +655,7 @@ def cg_bsr_fused(
     if _use_fused_kernel(op, b):
         from .nki.dispatch import _get_native_ops
 
-        bt, mt, key = op._device_operands()
+        bt, mt, key = op._device_operands(precision)
         TR = T * R
         # Pack [B | X0 | tol^2, max_iter] on the host: one copy each way.
         # Column t*R + c of a (128, T R) block holds rows t*128.. of column c.
@@ -600,6 +674,8 @@ def cg_bsr_fused(
             1 if op.preconditioner else 0,
             op.sbuf_kib,
             1 if op.core_split else 0,
+            _MATVEC_MODES[info["matvec"]],
+            _PRECISIONS[precision][0],
         ).cpu()
         xt = out[:, :TR].double().reshape(_P, T, R).permute(1, 0, 2).reshape(T * _P, R)
         x = (xt[:n] * scale).to(device=b.device, dtype=out_dtype)
@@ -615,7 +691,7 @@ def cg_bsr_fused(
     def dot(u, v):
         return (u * v).sum(dim=(0, 1))
 
-    r = bv - op._matvec(xv)
+    r = bv - op._matvec(xv, precision)
     z = op._precond(r)
     p = z.clone()
     rz = dot(r, z)
@@ -627,7 +703,7 @@ def cg_bsr_fused(
         if not bool(act.any()):
             break
         a = act.to(dt)
-        q = op._matvec(p)
+        q = op._matvec(p, precision)
         alpha = a * rz / dot(p, q).clamp_min(1e-30)
         xv = xv + alpha * p
         r = r - alpha * q
@@ -643,7 +719,116 @@ def cg_bsr_fused(
     return finish(x, cnt, rel, trips, "pytorch")
 
 
-def cg_resident_blocks_for(op: FusedCGOperator, n_rhs: int = 1, lnc: int | None = None) -> int:
+def power_iteration_bsr_fused(
+    A: BSRMatrix | FusedCGOperator,
+    v0: torch.Tensor | None = None,
+    max_iter: int = 100,
+    tol: float = 1e-6,
+    check_every: int = 8,
+    matvec: str = "auto",
+    precision: str = "fp32",
+    return_info: bool = False,
+):
+    """Power iteration for the dominant eigenpair of a BSR matrix in one launch.
+
+    The same fused kernel as `cg_bsr_fused` (A resident in SBUF, column
+    matvec, PSUM dot products, the LNC=2 row split, a device-side `while`
+    loop) iterates v <- A v / ||A v|| with the Rayleigh quotient
+    lam = v.Av / v.v, and stops when |lam_k - lam_{k-1}| < tol (as
+    `power_iteration_bsr`, whose first change is measured from 0) or after
+    `max_iter` steps. The device is fp32: lam settles to about 1e-7 |lam|,
+    so a much smaller `tol` runs to `max_iter`.
+
+    Args:
+        A: square BSR matrix (block_size 128), or a `prepare_cg_bsr` operator
+            (which need not be SPD for power iteration).
+        v0: initial vector (default: random). tol: absolute change of lam.
+        check_every, matvec, precision: as for `cg_bsr_fused`.
+        return_info: also return a dict (trips, path, ...).
+
+    Returns:
+        `(eigenvalue, eigenvector, iters)` like `power_iteration_bsr`, plus
+        the info dict when `return_info`.
+    """
+    op = A if isinstance(A, FusedCGOperator) else prepare_cg_bsr(A)
+    n, T = op.n, op.n_tiles
+    if matvec == "auto":
+        matvec = "column"
+    if matvec not in _MATVEC_MODES:
+        raise ValueError(f"matvec must be auto, row or column, got {matvec!r}")
+    if precision not in _PRECISIONS:
+        raise ValueError(f"precision must be one of {sorted(_PRECISIONS)}, got {precision!r}")
+    if precision != "fp32" and matvec != "column":
+        raise ValueError(f"precision={precision!r} needs matvec='column'")
+    v = v0.detach().clone() if v0 is not None else torch.randn(n, dtype=op.dtype)
+    if v.shape != (n,):
+        raise ValueError(f"v0 must have shape ({n},), got {tuple(v.shape)}")
+    out_dtype = v.dtype
+    v = v.to("cpu", torch.float64)
+    v = v / torch.linalg.norm(v).clamp_min(1e-300)
+    check_every = max(1, int(check_every))
+    per_step = op.n_blocks * _PRECISIONS[precision][1]
+    if check_every * per_step > _FUSED_MAX_UNROLL:
+        check_every = max(1, _FUSED_MAX_UNROLL // per_step)
+    info = {
+        "resident_blocks": cg_resident_blocks_for(op, 1, precision=precision),
+        "n_blocks": op.n_blocks,
+        "check_every": check_every,
+        "matvec": matvec,
+        "precision": precision,
+    }
+
+    def finish(lam, vec, iters, trips, path):
+        info.update(trips=trips, path=path)
+        vec = vec[:n].to(dtype=out_dtype)
+        return (lam, vec, iters, info) if return_info else (lam, vec, iters)
+
+    vt = torch.zeros(T * _P, dtype=torch.float64)
+    vt[:n] = v
+    if _use_fused_kernel(op, vt):
+        from .nki.dispatch import _get_native_ops
+
+        bt, _, key = op._device_operands(precision)
+        state = torch.zeros(_P, 2 * T + 2, dtype=torch.float32)
+        state[:, :T] = vt.reshape(T, _P).T
+        state[:, 2 * T] = tol * tol
+        state[:, 2 * T + 1] = float(max_iter)
+        out = _get_native_ops()["power_bsr_keyed"](
+            bt,
+            state.to(bt.device),
+            key,
+            check_every,
+            op.sbuf_kib,
+            1 if op.core_split else 0,
+            _MATVEC_MODES[matvec],
+            _PRECISIONS[precision][0],
+        ).cpu()
+        vec = out[:, :T].double().T.reshape(-1)
+        vec = vec / torch.linalg.norm(vec).clamp_min(1e-300)
+        iters = int(round(float(out[0, T])))
+        return finish(float(out[0, T + 2]), vec, iters, int(out[0, T + 3].item()), "nki")
+
+    # Host path: the same masked iteration (fp64 for fp64 v0, else fp32).
+    dt = out_dtype if out_dtype == torch.float64 else torch.float32
+    x = vt.to(dt).reshape(T, _P, 1)
+    lam_prev, k = 0.0, 0
+    while k < max_iter:
+        q = op._matvec(x, precision)
+        lam = float((x * q).sum() / (x * x).sum())
+        nq = float(torch.linalg.norm(q))
+        k += 1
+        if nq < 1e-30:
+            return finish(0.0, x.reshape(-1).double(), k, -(-k // check_every), "pytorch")
+        x = q / nq
+        if abs(lam - lam_prev) < tol:
+            break
+        lam_prev = lam
+    return finish(lam, x.reshape(-1).double(), k, -(-k // check_every), "pytorch")
+
+
+def cg_resident_blocks_for(
+    op: FusedCGOperator, n_rhs: int = 1, lnc: int | None = None, precision: str = "fp32"
+) -> int:
     """Stored blocks of `op` the fused kernel keeps in SBUF (summed over the
     physical cores, which split the block rows at LNC=2)."""
     import os
@@ -657,5 +842,7 @@ def cg_resident_blocks_for(op: FusedCGOperator, n_rhs: int = 1, lnc: int | None 
     for o0, o1 in cg_core_rows(op.row_ptrs, pc, lnc, op.core_split):
         nb = op.row_ptrs[o1] - op.row_ptrs[o0]
         w = op.n_tiles if n_rhs > 1 else o1 - o0
-        total += cg_resident_blocks(nb, w, pc, n_rhs, budget_kib=op.sbuf_kib)
+        parts = _PRECISIONS[precision][1]
+        bb = None if precision == "fp32" else _P * 2 * parts
+        total += cg_resident_blocks(nb, w, pc, n_rhs, budget_kib=op.sbuf_kib, block_bytes=bb)
     return total
