@@ -89,6 +89,50 @@ def bsr_spmm_static(
     return _k._bsr_spmm_static_kernel(blocks, b, tuple(row_ptrs), tuple(cols))
 
 
+def _fake_bsr_spmm_static_t(blocks_t, b, row_ptrs, cols):
+    return b.new_empty(((len(row_ptrs) - 1) * _P, b.shape[1]))
+
+
+@nki_op("trnsparse::bsr_spmm_static_t", mutates_args={}, fake_fn=_fake_bsr_spmm_static_t)
+def bsr_spmm_static_t(
+    blocks_t: torch.Tensor, b: torch.Tensor, row_ptrs: list[int], cols: list[int]
+) -> torch.Tensor:
+    # blocks_t: (128, n_blocks * 128), block idx's transpose in columns idx*128..
+    return _k._bsr_spmm_static_t_kernel(blocks_t, b, tuple(row_ptrs), tuple(cols))
+
+
+def _fake_keyed_spmm(blocks, b, key):
+    return b.new_empty(((len(_k._STRUCTURES[key][0]) - 1) * _P, b.shape[1]))
+
+
+# Keyed variants: the structure is registered once (`kernels.register_structure`)
+# and crosses the op boundary as one int, so a launch's host cost does not
+# grow with the number of stored blocks.
+
+
+@nki_op("trnsparse::bsr_spmm_keyed", mutates_args={}, fake_fn=_fake_keyed_spmm)
+def bsr_spmm_keyed(blocks: torch.Tensor, b: torch.Tensor, key: int) -> torch.Tensor:
+    return _k._bsr_spmm_keyed_kernel(blocks, b, int(key))
+
+
+@nki_op("trnsparse::bsr_spmm_t_keyed", mutates_args={}, fake_fn=_fake_keyed_spmm)
+def bsr_spmm_t_keyed(blocks_t: torch.Tensor, b: torch.Tensor, key: int) -> torch.Tensor:
+    return _k._bsr_spmm_t_keyed_kernel(blocks_t, b, int(key))
+
+
+def _fake_attn_fwd_keyed(q_t, k_t, v, key):
+    seq = q_t.shape[1]
+    hd = v.shape[1]
+    return v.new_empty((seq, hd)), v.new_empty((seq, 1)), v.new_empty((seq, 1))
+
+
+@nki_op("trnsparse::attn_fwd_keyed", mutates_args={}, fake_fn=_fake_attn_fwd_keyed)
+def attn_fwd_keyed(
+    q_t: torch.Tensor, k_t: torch.Tensor, v: torch.Tensor, key: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return _k._attn_fwd_keyed_kernel(q_t, k_t, v, int(key))
+
+
 def _fake_attn_fwd_static(q_t, k_t, v, row_ptrs, cols):
     seq = v.shape[0]
     return v.new_empty(v.shape), v.new_empty((seq, 1)), v.new_empty((seq, 1))
@@ -306,6 +350,40 @@ spmm_dense.register_autograd(_spmm_dense_backward, setup_context=_save_inputs)
 bsr_spmm.register_autograd(_bsr_spmm_backward, setup_context=_save_inputs)
 screened_spmm.register_autograd(_screened_spmm_backward, setup_context=_save_inputs)
 bsr_spmm_static.register_autograd(_bsr_spmm_static_backward, setup_context=_save_static)
+
+
+def _save_keyed(ctx, inputs, output):
+    blocks, b, key = inputs
+    ctx.save_for_backward(blocks, b)
+    ctx.row_ptrs, ctx.cols = _k._STRUCTURES[key]
+
+
+def _bsr_spmm_keyed_backward(ctx, grad):
+    grad_blocks, grad_b, _, _ = _bsr_spmm_static_backward(ctx, grad)
+    return grad_blocks, grad_b, None
+
+
+bsr_spmm_keyed.register_autograd(_bsr_spmm_keyed_backward, setup_context=_save_keyed)
+
+
+def _save_t_keyed(ctx, inputs, output):
+    # blocks_t (bs, n_blocks * bs) holds block idx's transpose in columns
+    # idx*bs..; the backward works on the (n_blocks, bs, bs) blocks.
+    blocks_t, b, key = inputs
+    bs = blocks_t.shape[0]
+    ctx.save_for_backward(blocks_t.reshape(bs, -1, bs).permute(1, 2, 0), b)
+    ctx.row_ptrs, ctx.cols = _k._STRUCTURES[key]
+
+
+def _bsr_spmm_t_keyed_backward(ctx, grad):
+    grad_blocks, grad_b, _, _ = _bsr_spmm_static_backward(ctx, grad)
+    grad_t = None
+    if grad_blocks is not None:
+        grad_t = grad_blocks.permute(2, 0, 1).reshape(grad_blocks.shape[-1], -1)
+    return grad_t, grad_b, None
+
+
+bsr_spmm_t_keyed.register_autograd(_bsr_spmm_t_keyed_backward, setup_context=_save_t_keyed)
 # attn_fwd_static / attn_bwd_static have no register_autograd of their own:
 # they run inside the composite trnsparse::bsr_attn / bsr_attn_bwd ops, whose
 # autograd link is attached in _native_attn.
@@ -320,6 +398,10 @@ OPS = {
     "spmm_dense": spmm_dense,
     "bsr_spmm": bsr_spmm,
     "bsr_spmm_static": bsr_spmm_static,
+    "bsr_spmm_static_t": bsr_spmm_static_t,
+    "bsr_spmm_keyed": bsr_spmm_keyed,
+    "bsr_spmm_t_keyed": bsr_spmm_t_keyed,
+    "attn_fwd_keyed": attn_fwd_keyed,
     "attn_fwd_static": attn_fwd_static,
     "attn_bwd_static": attn_bwd_static,
     "screened_spmm": screened_spmm,

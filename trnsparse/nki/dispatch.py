@@ -30,6 +30,7 @@ import warnings
 import numpy as np
 import torch
 
+from . import kernels as _kernels
 from .kernels import _TILE_K, _TILE_M, _TILE_N, HAS_NKI
 
 if HAS_NKI:
@@ -232,15 +233,41 @@ def _native_path() -> bool:
     return HAS_NKI and not _use_simulator() and _get_dispatch_path() == "native"
 
 
+def _kernel_device(*tensors: torch.Tensor) -> torch.device:
+    """The `neuron` device a native kernel launch runs on.
+
+    The logical NeuronCore of the operands that already live on a `neuron`
+    device (`neuron:k`, any k), else the default `neuron` device. Host
+    operands follow. Operands on two different logical cores are an error:
+    TorchNeuron does not move tensors between logical cores (a
+    `neuron:0 -> neuron:1` `.to()` returns the tensor still on core 0), so
+    route such data through the host explicitly (`trnsparse.multicore`).
+    """
+    kind = torch.device(_NEURON_DEVICE).type
+    found = None
+    for t in tensors:
+        if t.device.type == kind:
+            if found is None:
+                found = t.device
+            elif t.device != found:
+                raise ValueError(
+                    f"kernel operands are on two logical NeuronCores ({found} and "
+                    f"{t.device}); place them on one core, or use trnsparse.multicore"
+                )
+    return found if found is not None else torch.device(_NEURON_DEVICE)
+
+
 def _to_device(*tensors: torch.Tensor):
     """Move kernel operands to the device of the selected dispatch path.
 
-    Returns `(device_tensors, orig_device)`. The XLA (and "cpu") path is
-    `_to_xla` unchanged.
+    Returns `(device_tensors, orig_device)`. On the native path that is the
+    logical NeuronCore of the operands already on `neuron` (`_kernel_device`).
+    The XLA (and "cpu") path is `_to_xla` unchanged.
     """
     if _get_dispatch_path() == "native":
         orig = tensors[0].device
-        return [t.to(_NEURON_DEVICE) for t in tensors], orig
+        dev = _kernel_device(*tensors)
+        return [t.to(dev) for t in tensors], orig
     return _to_xla(*tensors)
 
 
@@ -707,9 +734,11 @@ def _nki_bsr_spmm_static(A, B: torch.Tensor) -> torch.Tensor:
     orig = B.device
     kdt = _kernel_dtype(A.blocks, B)
     out_dtype = torch.promote_types(A.blocks.dtype, B.dtype)
-    blocks = A.blocks.contiguous().to(device=_NEURON_DEVICE, dtype=kdt)
-    b_dev = B.contiguous().to(device=_NEURON_DEVICE, dtype=kdt)
-    out = _get_native_ops()["bsr_spmm_static"](blocks, b_dev, row_ptrs, cols)
+    dev = _kernel_device(B, A.blocks)
+    blocks = A.blocks.contiguous().to(device=dev, dtype=kdt)
+    b_dev = B.contiguous().to(device=dev, dtype=kdt)
+    key = _kernels.register_structure(row_ptrs, cols)
+    out = _get_native_ops()["bsr_spmm_keyed"](blocks, b_dev, key)
     return out[:m, :out_cols].to(device=orig, dtype=out_dtype)
 
 
@@ -1110,11 +1139,13 @@ def _nki_attn_fwd_static(Q, K, V, mask_bsr, scale: float, return_stats: bool):
     row_ptrs, cols = _bsr_structure_lists(mask_bsr)
     orig, dtype = Q.device, Q.dtype
     kdt = _kernel_dtype(Q, K, V)
-    Qd, Kd, Vd = (t.to(_NEURON_DEVICE) for t in (Q, K, V))
+    dev = _kernel_device(Q, K, V)
+    Qd, Kd, Vd = (t.to(dev) for t in (Q, K, V))
     q_t = (Qd.float() * scale).to(kdt).T.contiguous()
     Kd, Vd = Kd.to(kdt), Vd.to(kdt)
-    out, row_max, row_denom = _get_native_ops()["attn_fwd_static"](
-        q_t, Kd.T.contiguous(), Vd.contiguous(), row_ptrs, cols
+    key = _kernels.register_structure(row_ptrs, cols)
+    out, row_max, row_denom = _get_native_ops()["attn_fwd_keyed"](
+        q_t, Kd.T.contiguous(), Vd.contiguous(), key
     )
     out, row_max, row_denom = (t.to(orig) for t in (out, row_max, row_denom))
     out = out.to(dtype)
@@ -1150,7 +1181,7 @@ def _nki_attn_bwd_static(Q, K, V, dO, O, mask_bsr, row_max, row_denom, scale: fl
     """
     seq_len, head_dim = Q.shape
     orig, dtype = Q.device, Q.dtype
-    dev = _NEURON_DEVICE
+    dev = _kernel_device(Q, K, V, dO, O)
     row_ptrs, cols = _bsr_structure_lists(mask_bsr)
     col_ptrs, rows = _column_structure(row_ptrs, cols, seq_len // mask_bsr.block_size)
     kdt = _kernel_dtype(Q, K, V, dO)

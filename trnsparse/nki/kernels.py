@@ -28,6 +28,7 @@ except ImportError:
     HAS_NKI = False
 
 
+import hashlib
 import os
 
 _TILE_M = 128
@@ -43,6 +44,15 @@ _CORE_SPLIT_ENV = "TRNSPARSE_CORE_SPLIT"
 
 def _core_split_enabled() -> bool:
     return os.environ.get(_CORE_SPLIT_ENV, "1").lower() not in ("0", "false", "no")
+
+
+# Block rows per group in the pre-transposed BSR kernel (one PSUM tile each;
+# 8 fills the eight 2 KiB PSUM banks at 512 fp32 columns). 1 = no grouping.
+_ROW_GROUP_ENV = "TRNSPARSE_ROW_GROUP"
+
+
+def _row_group() -> int:
+    return max(1, min(8, int(os.environ.get(_ROW_GROUP_ENV, "8"))))
 
 
 def _assign_units(costs, n_prog: int, pid: int) -> list[int]:
@@ -69,6 +79,25 @@ def _assign_units(costs, n_prog: int, pid: int) -> list[int]:
 
 def _row_block_counts(ptrs) -> list[int]:
     return [ptrs[i + 1] - ptrs[i] for i in range(len(ptrs) - 1)]
+
+
+# Registered static structures, keyed by content hash (`register_structure`).
+_STRUCTURES: dict[int, tuple[tuple[int, ...], tuple[int, ...]]] = {}
+
+
+def register_structure(row_ptrs, cols) -> int:
+    """Key for a block structure, for the `*_keyed_kernel`s.
+
+    The key is the first 62 bits of the SHA-256 of the structure, so equal
+    structures share a key in every process (safe under a persistent NKI
+    compile cache) and different structures get different kernels.
+    """
+    rp = tuple(int(x) for x in row_ptrs)
+    cl = tuple(int(x) for x in cols)
+    digest = hashlib.sha256(repr((rp, cl)).encode()).digest()
+    key = int.from_bytes(digest[:8], "big") >> 2
+    _STRUCTURES.setdefault(key, (rp, cl))
+    return key
 
 
 # Relative cost of a unit with no stored blocks (it only stores a zero tile).
@@ -667,8 +696,7 @@ if HAS_NKI:
         """`t` as `dtype`, or `t` itself when it already has that dtype."""
         return t if dtype == like_dtype else nl.copy(t, dtype=dtype)
 
-    @nki.jit
-    def _bsr_spmm_static_kernel(blocks, b, row_ptrs, cols):
+    def _bsr_spmm_static_body(blocks, b, row_ptrs, cols):
         """C = A @ B for a BSR A whose structure is static.
 
         Shapes:
@@ -724,8 +752,123 @@ if HAS_NKI:
 
         return out
 
-    @nki.jit
-    def _attn_fwd_static_kernel(q_t, k_t, v, row_ptrs, cols):
+    # Stored blocks per row loaded by one DMA in the pre-transposed kernel
+    # (16 x 128 x 4 B = 8 KiB per partition in fp32).
+    _BLOCKS_PER_DMA = 16
+    # Stored blocks of a row group held in SBUF at once (64 KiB per
+    # partition in fp32).
+    _GROUP_MAX_BLOCKS = 128
+
+    def _bsr_spmm_static_t_body(blocks_t, b, row_ptrs, cols):
+        """C = A @ B for a static-structure BSR A with pre-transposed blocks.
+
+        Same work split and accumulation as `_bsr_spmm_static_kernel`, with
+        the per-block overheads cut (#30):
+
+        - The blocks arrive transposed, side by side, as one (128,
+          n_blocks * 128) array: block idx's A^T is columns
+          [idx * 128, (idx + 1) * 128). The stationary operand is a plain
+          load, with no `load_transpose2d`.
+        - A block row's stored blocks are contiguous there, so they arrive
+          in one DMA per up to `_BLOCKS_PER_DMA` blocks rather than one each.
+        - Block rows are processed in groups (up to 8, one PSUM tile each):
+          each B tile is loaded once per group and multiplied into every
+          row of the group that stores a block in its column.
+        - The PSUM tile is read out by one copy (in b's dtype) instead of
+          two activations and a subtract.
+
+        Shapes:
+            blocks_t: (128, n_blocks * 128)  A_idx^T side by side
+            b:        (n_pad, N)             N <= 512 or a multiple of 512
+            row_ptrs, cols: as in `_bsr_spmm_static_kernel`
+        Returns:
+            out:      (M_tiles * 128, N), b's dtype
+        """
+        _, N = b.shape
+        M_tiles = len(row_ptrs) - 1
+        TILE_N = N if N <= _TILE_N else _TILE_N
+        n_prog, pid = _program_split()
+        if M_tiles * (N // TILE_N) < n_prog and TILE_N % (n_prog * 64) == 0:
+            TILE_N //= n_prog
+        n_nt = N // TILE_N
+        counts = _row_block_counts(row_ptrs)
+        units = [(m, nt) for m in range(M_tiles) for nt in range(n_nt)]
+        costs = [counts[m] if counts[m] else _EMPTY_UNIT_COST for m, _ in units]
+
+        out = nl.ndarray((M_tiles * _TILE_M, N), dtype=b.dtype, buffer=nl.shared_hbm)
+
+        # Row groups: up to `_row_group()` block rows (one PSUM tile each) and
+        # `_GROUP_MAX_BLOCKS` stored blocks, same column tile. Within a group
+        # each B tile is loaded once and applied to every row that stores a
+        # block in that column, so B traffic drops by the column overlap.
+        G = _row_group()
+        groups = []
+        cur, cur_blocks, cur_nt = [], 0, None
+        for u in _assign_units(costs, n_prog, pid):
+            m, nt = units[u]
+            if counts[m] == 0:
+                nl.store(
+                    out[m * _TILE_M : (m + 1) * _TILE_M, nt * TILE_N : (nt + 1) * TILE_N],
+                    value=nl.zeros((_TILE_M, TILE_N), dtype=b.dtype),
+                )
+                continue
+            if cur and (
+                nt != cur_nt or len(cur) == G or cur_blocks + counts[m] > _GROUP_MAX_BLOCKS
+            ):
+                groups.append((cur_nt, cur))
+                cur, cur_blocks = [], 0
+            cur.append(m)
+            cur_blocks += counts[m]
+            cur_nt = nt
+        if cur:
+            groups.append((cur_nt, cur))
+
+        for nt, rows in groups:
+            n0 = nt * TILE_N
+            if len(rows) == 1:
+                # A row alone (no reuse to gain, possibly more blocks than
+                # fit in SBUF at once): stream its blocks chunk by chunk.
+                m = rows[0]
+                psum = nl.zeros((_TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
+                for c0 in range(row_ptrs[m], row_ptrs[m + 1], _BLOCKS_PER_DMA):
+                    c1 = min(row_ptrs[m + 1], c0 + _BLOCKS_PER_DMA)
+                    a_all = nl.load(blocks_t[:, c0 * _TILE_K : c1 * _TILE_K])
+                    for idx in range(c0, c1):
+                        j = cols[idx]
+                        i0 = (idx - c0) * _TILE_K
+                        b_tile = nl.load(b[j * _TILE_K : (j + 1) * _TILE_K, n0 : n0 + TILE_N])
+                        nisa.nc_matmul(psum, a_all[:, i0 : i0 + _TILE_K], b_tile, accumulate=True)
+                nl.store(
+                    out[m * _TILE_M : (m + 1) * _TILE_M, n0 : n0 + TILE_N],
+                    value=nl.copy(psum, dtype=b.dtype),
+                )
+                continue
+            psums = [nl.zeros((_TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum) for _ in rows]
+            a_of = {}
+            by_col = {}
+            for r, m in enumerate(rows):
+                lo = row_ptrs[m]
+                hi = row_ptrs[m + 1]
+                for c0 in range(lo, hi, _BLOCKS_PER_DMA):
+                    c1 = min(hi, c0 + _BLOCKS_PER_DMA)
+                    a_all = nl.load(blocks_t[:, c0 * _TILE_K : c1 * _TILE_K])
+                    for idx in range(c0, c1):
+                        a_of[idx] = (a_all, (idx - c0) * _TILE_K)
+                        by_col.setdefault(cols[idx], []).append((r, idx))
+            for j in sorted(by_col):
+                b_tile = nl.load(b[j * _TILE_K : (j + 1) * _TILE_K, n0 : n0 + TILE_N])
+                for r, idx in by_col[j]:
+                    a_all, i0 = a_of[idx]
+                    nisa.nc_matmul(psums[r], a_all[:, i0 : i0 + _TILE_K], b_tile, accumulate=True)
+            for r, m in enumerate(rows):
+                nl.store(
+                    out[m * _TILE_M : (m + 1) * _TILE_M, n0 : n0 + TILE_N],
+                    value=nl.copy(psums[r], dtype=b.dtype),
+                )
+
+        return out
+
+    def _attn_fwd_static_body(q_t, k_t, v, row_ptrs, cols):
         """Block-sparse attention forward, one launch, static mask structure.
 
         Per block-row m (128 queries), over exactly the row's stored blocks:
@@ -737,8 +880,10 @@ if HAS_NKI:
                 broadcast over partitions; P^T is directly the stationary
                 operand of out += P @ V_j. No score round trip through HBM
                 and no PE transpose per block.
-        out = acc * (1 / denom), the reciprocal as rsqrt^2 (the hardware
-        reciprocal alone is ~1e-3).
+        out = acc * (1 / denom), the reciprocal as rsqrt^2. (`nl.reciprocal`
+        on ScalarE is accurate to ~1.5e-6 relative, but only within roughly
+        |x| in [2^-42, 2^41]: outside it silently returns 1e7 or 0.
+        `nisa.reciprocal` on VectorE is correctly rounded over all of fp32.)
 
         Block rows are split between the physical cores by stored-block
         count. q_t, k_t and v share a dtype (fp32 or bf16); S and the
@@ -822,6 +967,40 @@ if HAS_NKI:
 
         return out, rmax_o, rden_o
 
+    # ── jit entry points ─────────────────────────────────────────────────────
+    #
+    # Each static kernel takes its structure either as tuples (`*_kernel`)
+    # or as a registered structure key (`*_keyed_kernel`, see
+    # `register_structure`). The key is a content hash, so it is just as
+    # much a compile-time constant as the tuples, but it crosses the
+    # PyTorch custom-op boundary as one int: the host cost of a launch no
+    # longer grows with the number of stored blocks (Trn2: 0.13 ms at 41
+    # blocks, 0.67 ms at 2048 with the tuples).
+
+    @nki.jit
+    def _bsr_spmm_static_kernel(blocks, b, row_ptrs, cols):
+        return _bsr_spmm_static_body(blocks, b, row_ptrs, cols)
+
+    @nki.jit
+    def _bsr_spmm_static_t_kernel(blocks_t, b, row_ptrs, cols):
+        return _bsr_spmm_static_t_body(blocks_t, b, row_ptrs, cols)
+
+    @nki.jit
+    def _attn_fwd_static_kernel(q_t, k_t, v, row_ptrs, cols):
+        return _attn_fwd_static_body(q_t, k_t, v, row_ptrs, cols)
+
+    @nki.jit
+    def _bsr_spmm_keyed_kernel(blocks, b, key):
+        return _bsr_spmm_static_body(blocks, b, *_STRUCTURES[key])
+
+    @nki.jit
+    def _bsr_spmm_t_keyed_kernel(blocks_t, b, key):
+        return _bsr_spmm_static_t_body(blocks_t, b, *_STRUCTURES[key])
+
+    @nki.jit
+    def _attn_fwd_keyed_kernel(q_t, k_t, v, key):
+        return _attn_fwd_static_body(q_t, k_t, v, *_STRUCTURES[key])
+
     @nki.jit
     def _attn_bwd_static_kernel(
         q_t,
@@ -857,8 +1036,8 @@ if HAS_NKI:
         The row-first loop works in the transposed (keys-on-partitions)
         frame, so its per-query statistics come in as (1, seq) rows broadcast
         over partitions; the column-first loop uses (seq, 1) columns.
-        `rinv` is 1 / row_denom computed by the caller (exact division on
-        the device, not the ~1e-3 hardware reciprocal).
+        `rinv` is 1 / row_denom computed by the caller (an aten division
+        on the device).
 
         The dQ block rows and the dK/dV block columns form one pool of
         output tiles, split between the physical cores by matmul count

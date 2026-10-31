@@ -214,6 +214,18 @@ def _static_lnc2_cases():
             (0, 2, 2, 3),
             (0, 2, 2),
         )
+        cases[("_bsr_spmm_static_t_kernel", f"skew-n512-{dtype}")] = lambda mk=mk: (
+            mk(_P, 6 * _P),
+            mk(4 * _P, 512),
+            (0, 4, 4, 5, 6),
+            (0, 1, 2, 3, 0, 3),
+        )
+        cases[("_bsr_spmm_static_t_kernel", f"long-row-n128-{dtype}")] = lambda mk=mk: (
+            mk(_P, 20 * _P),
+            mk(20 * _P, 128),
+            (0, 20, 20),
+            tuple(range(20)),
+        )
         cases[("_bsr_spmm_static_kernel", f"onerow-n128-{dtype}")] = lambda mk=mk: (
             mk(2, _P, _P),
             mk(2 * _P, 128),
@@ -248,6 +260,37 @@ def _static_lnc2_cases():
                 (0, 2, 0, 2, 2),
                 0.125,
             )
+    # Keyed entry points: the structure is a registered key (an int constant).
+    from trnsparse.nki.kernels import register_structure
+
+    for dtype, mk in (("f32", _f32), ("bf16", _bf16)):
+        key = register_structure((0, 4, 4, 5, 6), (0, 1, 2, 3, 0, 3))
+        cases[("_bsr_spmm_keyed_kernel", f"skew-n512-{dtype}")] = lambda mk=mk, key=key: (
+            mk(6, _P, _P),
+            mk(4 * _P, 512),
+            key,
+        )
+        cases[("_bsr_spmm_t_keyed_kernel", f"skew-n512-{dtype}")] = lambda mk=mk, key=key: (
+            mk(_P, 6 * _P),
+            mk(4 * _P, 512),
+            key,
+        )
+        # 10 rows sharing columns: two row groups, B-tile reuse within each.
+        g_rows = [sorted({m % 8, (m + 1) % 8, 0, 3, 5, 7}) for m in range(10)]
+        gp = tuple([0] + list(np.cumsum([len(r) for r in g_rows])))
+        gc = tuple(c for r in g_rows for c in r)
+        gkey = register_structure(gp, gc)
+        for w in (128, 512):
+            cases[("_bsr_spmm_t_keyed_kernel", f"groups-n{w}-{dtype}")] = (
+                lambda mk=mk, gkey=gkey, w=w, nb=len(gc): (mk(_P, nb * _P), mk(8 * _P, w), gkey)
+            )
+        akey = register_structure((0, 2, 2, 5), (0, 1, 0, 1, 2))
+        cases[("_attn_fwd_keyed_kernel", f"hd64-{dtype}")] = lambda mk=mk, akey=akey: (
+            mk(64, 3 * _P),
+            mk(64, 3 * _P),
+            mk(3 * _P, 64),
+            akey,
+        )
     return cases
 
 

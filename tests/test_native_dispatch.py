@@ -42,8 +42,18 @@ KERNEL_OPS = {
 }
 # Static-structure kernel ops: structure passed as int lists (compile-time
 # constants), launched directly rather than through `_launch` / `_run`.
-STATIC_OPS = {"bsr_spmm_static", "attn_fwd_static", "attn_bwd_static"}
-AUTOGRAD_OPS = {"spmm_dense", "bsr_spmm", "screened_spmm", "bsr_spmm_static"}
+STATIC_OPS = {"bsr_spmm_static", "attn_fwd_static", "attn_bwd_static", "bsr_spmm_static_t"}
+# Keyed variants: the structure is one registered int key (kernels.register_structure).
+KEYED_OPS = {"bsr_spmm_keyed", "bsr_spmm_t_keyed", "attn_fwd_keyed"}
+STATIC_OPS |= KEYED_OPS
+AUTOGRAD_OPS = {
+    "spmm_dense",
+    "bsr_spmm",
+    "screened_spmm",
+    "bsr_spmm_static",
+    "bsr_spmm_keyed",
+    "bsr_spmm_t_keyed",
+}
 COMPOSITE_OPS = {"bsr_attn", "bsr_attn_bwd"}
 P = 128
 
@@ -190,6 +200,24 @@ def _ref_attn_fwd_static(q_t, k_t, v, row_ptrs, cols):
     return out, rmax, rden
 
 
+def _ref_bsr_spmm_static_t(blocks_t, b, row_ptrs, cols):
+    bs = blocks_t.shape[0]
+    blocks = blocks_t.reshape(bs, -1, bs).permute(1, 2, 0)  # back to (n_blocks, bs, bs)
+    return _ref_bsr_spmm_static(blocks, b, row_ptrs, cols)
+
+
+def _ref_bsr_spmm_keyed(blocks, b, key):
+    return _ref_bsr_spmm_static(blocks, b, *kernels._STRUCTURES[key])
+
+
+def _ref_bsr_spmm_t_keyed(blocks_t, b, key):
+    return _ref_bsr_spmm_static_t(blocks_t, b, *kernels._STRUCTURES[key])
+
+
+def _ref_attn_fwd_keyed(q_t, k_t, v, key):
+    return _ref_attn_fwd_static(q_t, k_t, v, *kernels._STRUCTURES[key])
+
+
 def _ref_attn_bwd_static(
     q_t, k_t, v_t, do_t, q_s, k, do, rm_col, rinv_col, d_col, rm_row, rinv_row, d_row,
     row_ptrs, cols, col_ptrs, rows, scale,
@@ -232,6 +260,10 @@ def cpu_native(monkeypatch):
         ("_bsr_spmm_static_kernel", _ref_bsr_spmm_static),
         ("_attn_fwd_static_kernel", _ref_attn_fwd_static),
         ("_attn_bwd_static_kernel", _ref_attn_bwd_static),
+        ("_bsr_spmm_static_t_kernel", _ref_bsr_spmm_static_t),
+        ("_bsr_spmm_keyed_kernel", _ref_bsr_spmm_keyed),
+        ("_bsr_spmm_t_keyed_kernel", _ref_bsr_spmm_t_keyed),
+        ("_attn_fwd_keyed_kernel", _ref_attn_fwd_keyed),
     ):
         # `kernels` for the op bodies; `dispatch` because the host wrappers
         # name the kernel (only imported there when nki is installed).
@@ -515,7 +547,9 @@ class TestLazyRegistration:
             schema = torch.library.infer_schema(r["fn"], mutates_args=r["mutates"])
             ret = schema.split("->")[1].strip()
             assert ret in ("Tensor", "(Tensor, Tensor)", "(Tensor, Tensor, Tensor)"), (name, schema)
-            if name.split("::")[1] in STATIC_OPS:
+            if name.split("::")[1] in KEYED_OPS:
+                assert re.search(r"(Sym)?[Ii]nt key\)", schema), (name, schema)
+            elif name.split("::")[1] in STATIC_OPS:
                 # list[int] infers as SymInt[] (int[] on older torch).
                 assert re.search(r"(Sym)?[Ii]nt\[\] row_ptrs, (Sym)?[Ii]nt\[\] cols", schema), (
                     name,
@@ -622,6 +656,24 @@ class TestRegisteredBackwardFormulas:
                     torch.testing.assert_close(grad, leaf.grad, atol=1e-4, rtol=1e-4)
                 else:
                     assert grad is None
+
+    def test_bsr_spmm_t_keyed(self, native):
+        # Pre-transposed layout: grads come back in the (bs, n_blocks * bs) layout.
+        torch.manual_seed(4)
+        row_ptrs, cols = [0, 2, 2, 3], [0, 2, 2]
+        key = kernels.register_structure(row_ptrs, cols)
+        blocks_t, b = torch.randn(P, 3 * P), torch.randn(3 * P, 24)
+        leaves = [t.clone().requires_grad_() for t in (blocks_t, b)]
+        out = _ref_bsr_spmm_t_keyed(*leaves, key)
+        g = torch.randn_like(out)
+        out.backward(g)
+        ctx = _Ctx((), (True, True, False))
+        ctx.save_for_backward = lambda *t: setattr(ctx, "saved_tensors", t)
+        native._save_t_keyed(ctx, (blocks_t, b, key), out)
+        got = native._bsr_spmm_t_keyed_backward(ctx, g)
+        assert got[2] is None
+        for leaf, grad in zip(leaves, got[:2], strict=True):
+            torch.testing.assert_close(grad, leaf.grad, atol=1e-4, rtol=1e-4)
 
     def test_screened_spmm(self, native):
         torch.manual_seed(2)
@@ -864,8 +916,8 @@ class TestNativePathOnCpu:
             return run
 
         for attr, name, ref, odt in (
-            ("_bsr_spmm_static_kernel", "spmm", _ref_bsr_spmm_static, lambda a: a[1].dtype),
-            ("_attn_fwd_static_kernel", "fwd", _ref_attn_fwd_static, lambda a: a[2].dtype),
+            ("_bsr_spmm_keyed_kernel", "spmm", _ref_bsr_spmm_keyed, lambda a: a[1].dtype),
+            ("_attn_fwd_keyed_kernel", "fwd", _ref_attn_fwd_keyed, lambda a: a[2].dtype),
             ("_attn_bwd_static_kernel", "bwd", _ref_attn_bwd_static, lambda a: a[4].dtype),
         ):
             fn = recorder(name, ref, odt)

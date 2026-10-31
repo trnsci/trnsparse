@@ -50,3 +50,34 @@ lineages, detected on the first kernel launch (force with
 on the host; dense operands and BSR `blocks` may be on `neuron`; results are
 on the dense operand's device. See
 [Installation](installation.md#placement-sparse-structure-on-the-host).
+
+## Multi-core (`trnsparse.multicore`, native path)
+
+A Trn2 chip at LNC=2 has four logical NeuronCores, which TorchNeuron
+exposes as `neuron:0` … `neuron:3` (`NEURON_RT_VISIBLE_CORES=0-3`). Each
+static kernel already splits its work across the two physical cores of one
+logical core; these classes split it across logical cores.
+
+- `logical_cores(n=None)`: the visible logical cores as devices.
+- `partition_block_rows(row_ptrs, n_parts)`: block rows split into groups
+  balanced by stored blocks (the same greedy as the in-kernel split).
+- `ShardedBSR(A, devices=None, pretransposed=True)`: A split by block rows,
+  with each core's blocks resident on that core.
+  - `.replicate(B)` copies B to every core.
+  - `.spmm(B_replicas)` returns one output per core, issuing one kernel
+    launch per core without waiting.
+  - `.gather(outs)` assembles C on the host.
+  - `pretransposed=True` runs the pre-transposed kernel (no in-kernel
+    transpose, fewer DMAs, and B tiles shared by groups of up to 8 block
+    rows). Gradients reach each core's B replica and block copy.
+- `ShardedAttention(mask, devices=None)`: a single-head block-sparse
+  attention forward, split by query block rows. Use `.shard_rows(Q)`,
+  `.replicate_kv(K, V)`, `.forward(Qts, KVs)` and `.gather(outs)`. It is
+  forward only. For several heads, put whole heads on different cores and
+  call `block_sparse_attention_tiled` there; that path has autograd.
+
+TorchNeuron does not copy tensors between logical cores. A `neuron:0`
+tensor's `.to("neuron:1")` comes back still on core 0, and `copy_` across
+cores raises. So per-core operands are built on the host and copied once,
+and results return through the host. The kernel ops run on the logical core
+of their operands, and operands on two different cores are an error.
