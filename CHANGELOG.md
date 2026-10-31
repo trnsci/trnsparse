@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+#### Static BSR SpMM and block-sparse attention across logical NeuronCores (#30)
+
+- `trnsparse.multicore`: `ShardedBSR` (block rows split across the logical
+  cores of a Trn2 chip, balanced by stored blocks), `ShardedAttention`
+  (single-head attention forward split by query block rows),
+  `partition_block_rows` and `logical_cores`. Per-core operands are built
+  on the host and stay resident; one kernel launch per core, issued
+  without waiting.
+- Pre-transposed BSR kernel (`bsr_spmm_t_keyed`, the `ShardedBSR`
+  default). The blocks are stored transposed, side by side, so the kernel
+  needs no in-kernel `load_transpose2d`. It loads up to 16 of a row's
+  blocks per DMA, reads PSUM out with one copy, and shares each B tile
+  across groups of up to 8 block rows, one PSUM bank each
+  (`TRNSPARSE_ROW_GROUP`). The kernel has autograd.
+- `benchmarks/bench_multicore_trn2.py` (1, 2 and 4 logical cores, against
+  dense aten on 1 core and split across cores) and
+  `benchmarks/bench_multiproc_trn2.py` (one process per core).
+
+### Changed
+
+- The static kernels take their structure as a registered key, a content
+  hash (`kernels.register_structure`), instead of int lists. The key
+  crosses the custom-op boundary as one int, so the host cost of a launch
+  no longer grows with the stored-block count: on Trn2 it was 0.13 ms at
+  41 blocks and 0.67 ms at 2048, and is now about 0.12 ms at any size. The
+  public `bsr_spmm` and attention-forward paths use the keyed ops.
+- Native kernels run on the logical core that holds their operands
+  (`neuron:k`) instead of always on the default `neuron` device. Operands
+  spread over two cores raise an error. TorchNeuron does not copy between
+  logical cores: `.to()` returns the tensor still on its old core.
+- Kernel docstrings now give the measured `nl.reciprocal` behaviour:
+  about 1.5e-6 relative error in range, but it silently returns 1e7 or 0
+  outside roughly |x| in [2^-42, 2^41].
+
 ## [0.9.0] — 2026-10-30
 
 Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron; LNC=1 and LNC=2) — see trnsci/trnsci#35.

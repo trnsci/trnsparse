@@ -292,3 +292,162 @@ interpolation between measured densities):
   (device scatter of nnz triplets instead of a full dense H2D copy), but
   stays far behind `torch.sparse` on CPU at low density and behind dense
   aten when A is already dense on the device. On Trainium, use BSR.
+
+
+## Trn2: across the logical NeuronCores of one chip (#30)
+
+**Setup.**
+- Hardware: `trn2.3xlarge` at LNC=2, all four logical NeuronCores visible
+  to one process (`NEURON_RT_VISIBLE_CORES=0-3`), with the whole chip
+  reserved for these runs.
+- Software: Neuron SDK 2.33 venv with `torch` 2.14.0, `torch-neuronx`
+  2.14.3, `nki` 0.7.0 and `neuronx-cc` 2.28. fp32 throughout.
+- Host: `taskset -c 8,9`, `OMP_NUM_THREADS=2`.
+- Script: `benchmarks/bench_multicore_trn2.py`.
+- Operands are built on the host and copied once to every core that
+  uses them. The time covers issuing one launch per core from one Python
+  thread and synchronizing every core used; host gathers are excluded.
+- **Dense baselines are split too:** "dense kc" is aten `A @ B` with A's
+  rows split over k cores and B on each. SDPA "4c" splits the query rows
+  (one head) or the heads (four heads) the same way.
+- "API 1c" is the public one-core `bsr_spmm`, the path from #36, now with
+  keyed ops. "plain" is `ShardedBSR(..., pretransposed=False)`, the #36
+  kernel. "pre-T" is the new pre-transposed, row-grouped kernel.
+- Rounds: BSR and single-head attention show the lower of two rounds'
+  warm medians (15 calls each). The four-head runs are one round.
+  Sub-millisecond cells carry about ±0.1–0.2 ms of noise. The crossovers
+  interpolate linearly between the measured densities.
+
+**Crossover density vs dense aten** (BSR 128×128):
+
+| n | width | API 1c vs dense 1c (#36 path) | pre-T 1c vs dense 1c | best of pre-T 1/2/4c vs dense 1c | pre-T 4c vs dense 4c | best sparse (any cores) vs best dense (any cores) |
+|---|---|---|---|---|---|---|
+| 8192 | 128 | ~33% | ~82% | ~96% | ~20% | ~62% |
+| 8192 | 512 | ~65% | >100% | >100% | ~69% | ~69% |
+| 16384 | 128 | ~69% | ~97% | >100% | ~74% | ~77% |
+| 16384 | 512 | ~69% | ~98% | >100% | ~50% | ~50% |
+
+### BSR SpMM (fp32, ms)
+
+| n | width | dens. | blocks | dense 1c | dense 2c | dense 4c | API 1c (#36) | plain 1c | plain 4c | **pre-T 1c** | **pre-T 2c** | **pre-T 4c** | pre-T 4c issue | pre-T 1c->4c | dense 1c / best sparse | dense 4c / pre-T 4c | CPU dense | rel err |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 8192 | 128 | 1% | 41 | 0.85 | 0.60 | 0.63 | 0.28 | 0.24 | 0.50 | **0.24** | **0.36** | **0.53** | 0.43 | 0.45x | 3.57x | 1.21x | 56.36 | 1e-07 |
+| 8192 | 128 | 5% | 205 | 0.85 | 0.60 | 0.63 | 0.36 | 0.32 | 0.55 | **0.27** | **0.37** | **0.54** | 0.45 | 0.49x | 3.19x | 1.17x | 56.36 | 1e-07 |
+| 8192 | 128 | 10% | 410 | 0.85 | 0.60 | 0.63 | 0.44 | 0.42 | 0.63 | **0.29** | **0.36** | **0.57** | 0.35 | 0.51x | 2.91x | 1.11x | 56.36 | 1e-07 |
+| 8192 | 128 | 25% | 1024 | 0.85 | 0.60 | 0.63 | 0.70 | 0.81 | 0.90 | **0.37** | **0.39** | **0.68** | 0.39 | 0.55x | 2.28x | 0.94x | 56.36 | 2e-07 |
+| 8192 | 128 | 50% | 2048 | 0.85 | 0.60 | 0.63 | 1.58 | 1.30 | 0.94 | **0.58** | **0.51** | **0.76** | 0.38 | 0.76x | 1.66x | 0.83x | 56.36 | 2e-07 |
+| 8192 | 128 | 75% | 3072 | 0.85 | 0.58 | 0.48 | 1.84 | - | - | **0.74** | **0.59** | **0.81** | 0.38 | 0.91x | 1.44x | 0.59x | - | 2e-07 |
+| 8192 | 128 | 100% | 4096 | 0.85 | 0.58 | 0.48 | 2.35 | - | - | **1.44** | **0.94** | **1.04** | 0.59 | 1.39x | 0.91x | 0.46x | - | 2e-07 |
+| 8192 | 512 | 1% | 41 | 2.69 | 1.53 | 1.46 | 0.32 | 0.29 | 0.51 | **0.25** | **0.31** | **0.50** | 0.37 | 0.50x | 10.75x | 2.93x | 185.06 | 1e-07 |
+| 8192 | 512 | 5% | 205 | 2.69 | 1.53 | 1.46 | 0.50 | 0.72 | 0.58 | **0.31** | **0.35** | **0.53** | 0.39 | 0.58x | 8.79x | 2.75x | 185.06 | 1e-07 |
+| 8192 | 512 | 10% | 410 | 2.69 | 1.53 | 1.46 | 0.60 | 0.99 | 0.93 | **0.39** | **0.56** | **0.56** | 0.37 | 0.69x | 6.95x | 2.60x | 185.06 | 1e-07 |
+| 8192 | 512 | 25% | 1024 | 2.69 | 1.53 | 1.46 | 1.41 | 1.41 | 0.96 | **1.04** | **0.81** | **0.89** | 0.42 | 1.17x | 3.32x | 1.64x | 185.06 | 2e-07 |
+| 8192 | 512 | 50% | 2048 | 2.69 | 1.53 | 1.46 | 2.28 | 1.97 | 1.30 | **1.50** | **1.14** | **1.08** | 0.38 | 1.39x | 2.50x | 1.36x | 185.06 | 2e-07 |
+| 8192 | 512 | 75% | 3072 | 2.65 | 1.48 | 1.14 | 2.99 | - | - | **2.07** | **1.48** | **1.30** | 0.59 | 1.59x | 2.04x | 0.87x | - | 2e-07 |
+| 8192 | 512 | 100% | 4096 | 2.65 | 1.48 | 1.14 | 3.73 | - | - | **2.59** | **1.78** | **1.71** | 0.48 | 1.51x | 1.55x | 0.66x | - | 2e-07 |
+| 16384 | 128 | 1% | 164 | 5.79 | 2.37 | 1.92 | 0.38 | 0.57 | 0.64 | **0.31** | **0.41** | **0.65** | 0.42 | 0.47x | 18.87x | 2.95x | 228.78 | 1e-07 |
+| 16384 | 128 | 5% | 819 | 5.79 | 2.37 | 1.92 | 0.66 | 0.71 | 0.80 | **0.41** | **0.43** | **0.61** | 0.41 | 0.67x | 14.09x | 3.12x | 228.78 | 1e-07 |
+| 16384 | 128 | 10% | 1638 | 5.79 | 2.37 | 1.92 | 1.03 | 1.01 | 1.02 | **0.54** | **0.47** | **0.71** | 0.54 | 0.76x | 12.28x | 2.70x | 228.78 | 2e-07 |
+| 16384 | 128 | 25% | 4096 | 5.79 | 2.37 | 1.92 | 2.67 | 2.21 | 1.18 | **1.19** | **1.00** | **0.85** | 0.41 | 1.40x | 6.79x | 2.25x | 228.78 | 2e-07 |
+| 16384 | 128 | 50% | 8192 | 5.79 | 2.37 | 1.92 | 4.46 | 3.58 | 2.24 | **3.39** | **1.48** | **1.47** | 0.62 | 2.30x | 3.93x | 1.30x | 228.78 | 2e-07 |
+| 16384 | 128 | 75% | 12288 | 5.76 | 2.29 | 1.83 | 6.38 | - | - | **3.29** | **1.79** | **1.85** | 0.58 | 1.78x | 3.22x | 0.99x | - | 3e-07 |
+| 16384 | 128 | 100% | 16384 | 5.76 | 2.29 | 1.83 | 8.27 | - | - | **6.47** | **3.65** | **2.90** | 0.67 | 2.24x | 1.99x | 0.63x | - | 3e-07 |
+| 16384 | 512 | 1% | 164 | 10.64 | 5.54 | 2.90 | 0.48 | 0.68 | 0.60 | **0.33** | **0.39** | **0.55** | 0.38 | 0.61x | 31.88x | 5.28x | 746.80 | 1e-07 |
+| 16384 | 512 | 5% | 819 | 10.64 | 5.54 | 2.90 | 1.03 | 1.06 | 0.88 | **0.95** | **0.71** | **0.71** | 0.57 | 1.33x | 15.00x | 4.07x | 746.80 | 1e-07 |
+| 16384 | 512 | 10% | 1638 | 10.64 | 5.54 | 2.90 | 2.12 | 1.96 | 1.20 | **1.08** | **0.96** | **0.95** | 0.42 | 1.14x | 11.19x | 3.05x | 746.80 | 2e-07 |
+| 16384 | 512 | 25% | 4096 | 10.64 | 5.54 | 2.90 | 4.00 | 3.57 | 2.27 | **2.73** | **1.66** | **1.70** | 0.60 | 1.61x | 6.42x | 1.71x | 746.80 | 2e-07 |
+| 16384 | 512 | 50% | 8192 | 10.64 | 5.54 | 2.90 | 7.23 | 6.46 | 3.73 | **5.63** | **2.91** | **2.92** | 0.60 | 1.93x | 3.66x | 0.99x | 746.80 | 2e-07 |
+| 16384 | 512 | 75% | 12288 | 10.98 | 5.68 | 3.01 | 12.95 | - | - | **7.44** | **4.20** | **4.17** | 0.46 | 1.78x | 2.63x | 0.72x | - | 3e-07 |
+| 16384 | 512 | 100% | 16384 | 10.98 | 5.68 | 3.01 | 16.80 | - | - | **11.45** | **6.28** | **5.34** | 0.68 | 2.14x | 2.06x | 0.56x | - | 3e-07 |
+
+### Block-sparse attention forward, one head, query rows split (fp32, ms)
+
+| seq | hd | mask | block dens. | SDPA dense 1c | SDPA dense 4c (rows split) | SDPA masked 1c | SDPA masked 4c | API 1c | **sparse 1c** | **sparse 2c** | **sparse 4c** | 1c->4c | rel err |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 8192 | 64 | dilated | 25.0% | 0.72 | 1.05 | 5.13 | 4.22 | 1.97 | **1.55** | **1.14** | **1.29** | 1.20x | 1e-06 |
+| 8192 | 64 | global | 7.7% | 0.72 | 1.05 | 5.14 | 4.20 | 1.09 | **0.76** | **0.84** | **0.84** | 0.91x | 9e-07 |
+| 8192 | 64 | local | 4.6% | 0.72 | 1.05 | 5.04 | 3.85 | 0.85 | **0.55** | **0.57** | **0.90** | 0.61x | 9e-07 |
+| 8192 | 128 | dilated | 25.0% | 0.77 | 1.06 | 5.03 | 4.22 | 1.88 | **1.42** | **1.30** | **1.25** | 1.14x | 9e-07 |
+| 8192 | 128 | global | 7.7% | 0.77 | 1.06 | 5.13 | 4.17 | 1.21 | **0.89** | **0.68** | **0.93** | 0.95x | 9e-07 |
+| 8192 | 128 | local | 4.6% | 0.77 | 1.06 | 5.04 | 4.09 | 1.03 | **0.72** | **0.70** | **0.85** | 0.85x | 9e-07 |
+| 16384 | 64 | dilated | 25.0% | 2.04 | 1.82 | 32.17 | 9.23 | 6.17 | **5.68** | **3.10** | **2.99** | 1.90x | 1e-06 |
+| 16384 | 64 | global | 3.9% | 2.04 | 1.82 | 32.46 | 9.17 | 1.86 | **1.34** | **0.93** | **1.14** | 1.18x | 9e-07 |
+| 16384 | 64 | local | 2.3% | 2.04 | 1.82 | 31.89 | 6.58 | 1.18 | **0.85** | **0.91** | **1.00** | 0.85x | 8e-07 |
+| 16384 | 128 | dilated | 25.0% | 2.22 | 1.96 | 32.94 | 10.67 | 5.71 | **5.17** | **2.91** | **2.88** | 1.80x | 1e-06 |
+| 16384 | 128 | global | 3.9% | 2.22 | 1.96 | 32.61 | 8.39 | 2.16 | **1.64** | **1.01** | **1.16** | 1.42x | 9e-07 |
+| 16384 | 128 | local | 2.3% | 2.22 | 1.96 | 32.58 | 9.37 | 1.80 | **1.58** | **1.03** | **1.10** | 1.44x | 9e-07 |
+
+### Block-sparse attention, four heads, whole heads per core (fp32, ms)
+
+| seq | hd | mask | block dens. | SDPA fwd 1c | SDPA fwd 4c | **sparse fwd 1c** | **sparse fwd 4c** | SDPA fwd+bwd 1c | SDPA fwd+bwd 4c | **sparse fwd+bwd 1c** | **sparse fwd+bwd 2c** | **sparse fwd+bwd 4c** | fwd+bwd 1c->4c |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 8192 | 64 | dilated | 25.0% | 2.09 | 1.64 | **6.93** | **4.25** | 12.99 | 12.46 | **18.70** | **14.94** | **13.22** | 1.42x |
+| 8192 | 64 | global | 7.7% | 2.09 | 1.64 | **3.77** | **2.92** | 12.99 | 12.46 | **10.45** | **10.23** | **9.58** | 1.09x |
+| 8192 | 64 | local | 4.6% | 2.09 | 1.64 | **2.93** | **2.48** | 12.99 | 12.46 | **9.70** | **9.28** | **7.56** | 1.28x |
+| 8192 | 128 | dilated | 25.0% | 2.17 | 1.65 | **6.32** | **3.72** | 13.60 | 10.51 | **18.44** | **14.63** | **13.24** | 1.39x |
+| 8192 | 128 | global | 7.7% | 2.17 | 1.65 | **4.35** | **3.17** | 13.60 | 10.51 | **12.94** | **10.39** | **8.83** | 1.47x |
+| 8192 | 128 | local | 4.6% | 2.17 | 1.65 | **3.70** | **2.67** | 13.60 | 10.51 | **10.94** | **9.18** | **8.65** | 1.26x |
+| 16384 | 64 | dilated | 25.0% | 7.47 | 4.18 | **22.28** | **10.06** | 48.65 | 27.60 | **77.94** | **49.78** | **37.63** | 2.07x |
+| 16384 | 64 | global | 3.9% | 7.47 | 4.18 | **6.02** | **3.85** | 48.65 | 27.60 | **17.87** | **13.01** | **14.06** | 1.27x |
+| 16384 | 64 | local | 2.3% | 7.47 | 4.18 | **4.23** | **3.37** | 48.65 | 27.60 | **14.30** | **11.82** | **10.45** | 1.37x |
+| 16384 | 128 | dilated | 25.0% | 7.88 | 4.50 | **19.86** | **9.14** | 50.32 | 25.92 | **76.25** | **52.44** | **40.18** | 1.90x |
+| 16384 | 128 | global | 3.9% | 7.88 | 4.50 | **6.69** | **4.10** | 50.32 | 25.92 | **19.22** | **13.80** | **13.23** | 1.45x |
+| 16384 | 128 | local | 2.3% | 7.88 | 4.50 | **6.03** | **3.61** | 50.32 | 25.92 | **15.97** | **11.87** | **11.92** | 1.34x |
+
+### One process per core (BSR, n = 8192, width 512, pre-T, ms)
+
+`benchmarks/bench_multiproc_trn2.py`: each process owns one core and its
+share of the block rows, and all processes are pinned to the same two host
+CPUs.
+
+| processes | barrier | dense (rows split) | 1% | 5% | 10% | 25% | 50% |
+|---|---|---|---|---|---|---|---|
+| 1 | 0.02 | 2.31 | 0.28 | 0.32 | 0.41 | 0.70 | 1.20 |
+| 2 | 0.05 | 1.54 | 0.44 | 0.39 | 0.36 | 0.69 | 0.89 |
+| 4 | 0.11 | 1.66 | 0.84 | 1.02 | 0.78 | 1.10 | 1.12 |
+
+### Reading the multi-core tables
+
+- **The per-block fix moved the crossover more than extra cores did.**
+  - On one core, the pre-transposed, row-grouped kernel is 1.1–2.2×
+    faster than the #36 kernel at 25–50% density.
+  - It beats dense aten on that same core up to ~82–98% block density,
+    and still beats it at 100% for n = 8192, width 512. In #36 the
+    crossover was ~26–49% on two physical cores.
+  - Where the time goes: B-tile loads, shared across up to 8 block rows
+    of a group, and the in-kernel transpose, now gone.
+- **Four logical cores pay only for large work per call.**
+  - Speedup from one core to four (pre-T): 1.4–2.3× at n = 16384 and
+    25–100% density, 1.2–1.6× at n = 8192 and width 512 above 25%.
+  - It is a *slowdown* (0.45–0.8×) below ~0.6 ms of single-core work.
+- **Why the speedup stops there:**
+  - One Python thread issues the launches, at about 0.1 ms each (0.4–0.7 ms
+    for four).
+  - Concurrent kernels on different logical cores also slow each other.
+    At n = 16384, width 512, 50% density, one shard takes 1.15–1.3 ms alone
+    and 1.9–2.9 ms with all four running. Dense aten slabs barely contend
+    (2.5 ms alone, 3.1 ms for four).
+  - Two cores reach most of the four-core gain.
+  - One process per core does not help with two host CPUs: four processes
+    are no faster than one.
+- **Against dense split the same way, the crossover drops.** Dense aten
+  scales better across cores (3.7× from one to four at n = 16384, width
+  512), so the four-core crossovers are ~50–74% at n = 16384 and ~69% at
+  n = 8192, width 512. At n = 8192, width 128 both sides sit on the launch
+  floor (0.5–0.7 ms), so splitting is pointless there.
+- **Attention, one head:**
+  - The forward on one core now beats unmasked dense SDPA at seq 16384
+    for local and global masks: 0.85–1.6 ms vs 2.0–2.2 ms.
+  - At seq 8192 it ties: 0.55–0.89 ms vs 0.72–0.77 ms.
+  - Splitting query rows over cores pays only for the 25% dilated mask at
+    seq 16384: 5.2–5.7 → 2.9–3.0 ms, but that is still slower than dense
+    SDPA at 1.8–2.2 ms.
+  - Masked SDPA (32–33 ms at 16384 on one core, 6.6–11 ms on four) loses
+    to every sparse configuration.
+- **Attention, four heads (fwd+bwd):**
+  - With whole heads per core, sparse beats dense SDPA split the same way
+    at seq 16384 for local and global masks: 10.5–14 ms vs 26–28 ms.
+  - At seq 8192 the margin is narrower: 7.6–9.6 vs 10.5–12.5 ms.
+  - The 25% dilated mask loses at both lengths.
+  - Core scaling is 1.1–2.1×, held back by about 10–20 host-issued aten
+    ops per head on the public path.
