@@ -353,7 +353,9 @@ def test_static_kernel_lnc2_neff_compiles(case, tmp_path):
 # "nosplit" runs the whole solve on both cores.
 
 
-def _cg_inputs(T: int, precond: int, check_every: int, R: int = 1, sbuf_kib=160, split=1):
+def _cg_inputs(
+    T: int, precond: int, check_every: int, R: int = 1, sbuf_kib=160, split=1, matvec=0, precision=0
+):
     from trnsparse.nki.kernels import register_structure
 
     rp, cl = [0], []
@@ -363,7 +365,23 @@ def _cg_inputs(T: int, precond: int, check_every: int, R: int = 1, sbuf_kib=160,
     key = register_structure(rp, cl)
     minv = _f32(_P, T * _P) if precond else _f32(_P, _P)
     state = _f32(_P, 2 * T * R + 2)
-    return (_f32(_P, len(cl) * _P), minv, state, key, check_every, precond, sbuf_kib, split)
+    if precision:  # bf16 A: one (bf16) or two (bf16x2) parts per block
+        ml_dtypes = pytest.importorskip("ml_dtypes")
+        blocks = np.zeros((_P, len(cl) * _P * precision), dtype=ml_dtypes.bfloat16)
+    else:
+        blocks = _f32(_P, len(cl) * _P)
+    return (
+        blocks,
+        minv,
+        state,
+        key,
+        check_every,
+        precond,
+        sbuf_kib,
+        split,
+        matvec,
+        precision,
+    )
 
 
 _CG_CASES = {
@@ -375,6 +393,19 @@ _CG_CASES = {
     "rhs4": (dict(T=3, precond=1, check_every=2, R=4),),
     # 3 x 200 columns: the matvec spans two PSUM banks
     "rhs200-stream": (dict(T=3, precond=0, check_every=1, R=200, sbuf_kib=2),),
+    # column (vector-stationary) matvec; T=37 spans three 16-row PSUM chunks
+    "col-plain": (dict(T=3, precond=0, check_every=2, matvec=1),),
+    "col-bjacobi": (dict(T=3, precond=1, check_every=2, matvec=1),),
+    "col-stream": (dict(T=5, precond=1, check_every=1, sbuf_kib=2, matvec=1),),
+    "col-nosplit": (dict(T=4, precond=1, check_every=2, split=0, matvec=1),),
+    "col-one-tile": (dict(T=1, precond=0, check_every=3, matvec=1),),
+    "col-rhs4": (dict(T=3, precond=1, check_every=2, R=4, matvec=1),),
+    "col-rhs32": (dict(T=3, precond=0, check_every=1, R=32, matvec=1),),
+    "col-rows37": (dict(T=37, precond=1, check_every=1, matvec=1),),
+    "bf16": (dict(T=3, precond=0, check_every=2, matvec=1, precision=1),),
+    "bf16x2-bjacobi": (dict(T=3, precond=1, check_every=2, matvec=1, precision=2),),
+    "bf16x2-stream": (dict(T=5, precond=1, check_every=1, sbuf_kib=2, matvec=1, precision=2),),
+    "bf16-rhs16": (dict(T=3, precond=1, check_every=1, R=16, matvec=1, precision=1),),
 }
 
 
@@ -394,9 +425,51 @@ def test_cg_kernel_lnc_mlir_verifies(case, lnc):
     result.verify()
 
 
+_POWER_CASES = {
+    "row": dict(T=3, check_every=2, matvec=0),
+    "column": dict(T=3, check_every=2, matvec=1),
+    "one-tile": dict(T=1, check_every=3, matvec=1),
+    "bf16-stream": dict(T=5, check_every=1, matvec=1, precision=1, sbuf_kib=1),
+    "nosplit": dict(T=4, check_every=2, matvec=1, split=0),
+}
+
+
+def _power_inputs(T, check_every, matvec, precision=0, sbuf_kib=160, split=1):
+    blocks, _, _, key, *_ = _cg_inputs(T, 0, check_every, precision=precision)
+    return (blocks, _f32(_P, 2 * T + 2), key, check_every, sbuf_kib, split, matvec, precision)
+
+
+@pytest.mark.parametrize("lnc", [1, 2])
+@pytest.mark.parametrize("case", sorted(_POWER_CASES))
+def test_power_kernel_lnc_mlir_verifies(case, lnc):
+    from trnsparse.nki import kernels
+
+    result = source_to_mlir(
+        kernels._power_bsr_keyed_kernel,
+        *_power_inputs(**_POWER_CASES[case]),
+        target="trn2",
+        lnc=lnc,
+        frontend=FrontendKind.TRACER,
+    )
+    result.verify()
+
+
 @pytest.mark.skipif(shutil.which("neuronx-cc") is None, reason="neuronx-cc not on PATH")
 @pytest.mark.parametrize("lnc", [1, 2])
-@pytest.mark.parametrize("case", ["plain", "bjacobi", "rhs4", "nosplit"])
+@pytest.mark.parametrize(
+    "case",
+    [
+        "plain",
+        "bjacobi",
+        "rhs4",
+        "nosplit",
+        "col-bjacobi",
+        "col-rhs4",
+        "col-nosplit",
+        "bf16x2-bjacobi",
+        "bf16-rhs16",
+    ],
+)
 def test_cg_kernel_neff_compiles(case, lnc, tmp_path):
     """Full CPU NEFF compile. At LNC=2 this is what rejects per-core programs
     whose control flow differs (NCC_IXGM002), which MLIR verify does not see."""

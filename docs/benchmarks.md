@@ -615,3 +615,225 @@ busy). Going from 2 to 4 cores is limited by the 2 host CPUs that four
 processes share (per-solve host packing and copies) and by cores slowing
 each other. On these 2 CPUs, batching right-hand sides into one launch
 (above) is the better way to raise throughput.
+
+## Trn2: fused CG follow-ups: column matvec, bf16 A, fused power iteration (#22)
+
+Same machine, matrices, pinning and method as the section above (SDK
+2.33, one logical core at LNC=2, host on 2 CPUs, tol 1e-5, warm median of
+3). `row (#40)` is #40's matvec, still available as `matvec="row"`.
+`column` is the new default (`matvec="auto"` picks it for R <= 32). Both
+use the two-exchange LNC=2 step. "µs/iter" = (fused − fused with
+max_iter=0) / iterations ("n/a" where the fixed cost's run-to-run noise
+exceeds the iterations' time). Reproduce with `bench_cg_fused_trn2.py
+--matvec row,column,column:bf16,column:bf16x2` and
+`bench_power_fused_trn2.py`.
+
+#### TensorE microbenchmark (ns per fp32 128x128 block, one physical core)
+
+| form | stationary | moving | ns |
+|---|---|---|---:|
+| row (#40) | A block | p_j (128x1) | 425 |
+| row, 4 moving columns | A block | 4 columns | 443 |
+| vector-stationary, one PE tile | p_j (128x1) | A block | 206 |
+| vector-stationary, 4 column tiles in turn (`column`) | p_j | A block | 50 |
+| same, 32-column stationary | (128x32) | A block | 55 |
+| same, always tile 0 | p_j | A block | 229 |
+| TensorE transpose, fp32 128x128 (`nc_transpose`) | | | 109 |
+| K=1 matmul transposing one 128-element row | | | 420 |
+
+#### Plain CG, fp32 (ms to tol 1e-5, warm median of 3)
+
+| n | blocks | density | κ | resident | row (#40) | column | column vs row | scipy | torch fp64 | torch fp32 | column vs best CPU | iters (row / column) | µs/iter (row / column) | true res (row / column) | err (row / column) |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1024 | 16 | 0.250 | 1e+03 | 16 | 2.37 | 2.28 | 1.04x | 11.9 | 22.4 | 23.8 | 5.2x | 117 / 117 | 11 / 7 | 1.4e-05 / 1.9e-05 | 3.6e-06 / 3.6e-06 |
+| 1024 | 32 | 0.500 | 1e+03 | 32 | 1.79 | 1.45 | 1.23x | 10.1 | 8.65 | 18.5 | 5.9x | 36 / 36 | 27 / 19 | 1.0e-05 / 6.0e-06 | 4.2e-06 / 3.8e-06 |
+| 1024 | 64 | 1.000 | 1e+03 | 64 | 4.10 | 3.00 | 1.37x | 50.5 | 38.2 | 52.0 | 12.7x | 120 / 116 | 24 / 16 | 1.4e-05 / 1.5e-05 | 3.0e-06 / 3.7e-06 |
+| 2048 | 32 | 0.125 | 1e+03 | 32 | 1.45 | 1.30 | 1.11x | 7.93 | 15.9 | 12.0 | 6.1x | 25 / 25 | 23 / 20 | 5.3e-06 / 6.2e-06 | 2.1e-06 / 1.1e-06 |
+| 2048 | 64 | 0.250 | 1e+03 | 64 | 1.93 | 1.83 | 1.05x | 17.9 | 14.4 | 25.9 | 7.8x | 33 / 33 | 31 / 18 | 6.9e-06 / 6.9e-06 | 3.3e-06 / 3.1e-06 |
+| 2048 | 128 | 0.500 | 1e+03 | 128 | 3.48 | 2.10 | 1.66x | 56.8 | 35.2 | 38.6 | 16.8x | 62 / 61 | 42 / n/a | 7.9e-06 / 9.2e-06 | 5.1e-06 / 6.1e-06 |
+| 2048 | 256 | 1.000 | 1e+03 | 256 | 9.46 | 3.70 | 2.56x | 215.2 | 126.7 | 155.7 | 34.2x | 128 / 128 | 65 / 22 | 1.2e-05 / 1.5e-05 | 3.4e-06 / 3.5e-06 |
+| 4096 | 64 | 0.062 | 1e+03 | 64 | 2.07 | 1.75 | 1.18x | 16.4 | 12.5 | 12.0 | 6.8x | 29 / 29 | 29 / 20 | 8.6e-06 / 8.7e-06 | 5.1e-06 / 5.1e-06 |
+| 4096 | 128 | 0.125 | 1e+03 | 128 | 3.39 | 2.05 | 1.65x | 40.8 | 36.2 | 30.5 | 14.9x | 54 / 53 | 39 / 21 | 8.5e-06 / 8.5e-06 | 5.2e-06 / 6.1e-06 |
+| 4096 | 256 | 0.250 | 1e+03 | 256 | 6.45 | 2.59 | 2.49x | 92.6 | 66.7 | 57.7 | 22.2x | 66 / 66 | 73 / 23 | 9.0e-06 / 8.0e-06 | 5.2e-06 / 5.1e-06 |
+| 4096 | 512 | 0.500 | 1e+03 | 512 | 16.1 | 5.03 | 3.20x | 469.6 | 298.7 | 232.9 | 46.3x | 118 / 117 | 123 / 36 | 1.0e-05 / 8.9e-06 | 3.8e-06 / 4.4e-06 |
+| 8192 | 122 | 0.030 | 1e+03 | 122 | 2.68 | 1.67 | 1.61x | 25.2 | 18.5 | 31.4 | 11.1x | 34 / 34 | 51 / 23 | 6.8e-06 / 9.8e-06 | 3.6e-06 / 4.2e-06 |
+| 8192 | 256 | 0.062 | 1e+03 | 256 | 4.61 | 2.07 | 2.23x | 94.3 | 52.8 | 41.5 | 20.0x | 48 / 48 | 69 / 27 | 6.8e-06 / 7.0e-06 | 8.4e-06 / 8.5e-06 |
+| 8192 | 512 | 0.125 | 1e+03 | 512 | 11.2 | 3.82 | 2.94x | 258.6 | 154.8 | 93.8 | 24.5x | 75 / 75 | 131 / 33 | 7.6e-06 / 8.0e-06 | 1.0e-05 / 1.0e-05 |
+| 8192 | 1024 | 0.250 | 1e+03 | 640 | 29.7 | 11.9 | 2.51x | 1728.3 | 976.6 | 559.8 | 47.2x | 114 / 116 | 250 / 93 | 9.1e-06 / 9.4e-06 | 1.1e-05 / 9.7e-06 |
+| 2048 | 64 | 0.250 | 1e+05 | 64 | 2.56 | 1.74 | 1.47x | 20.7 | 35.0 | 31.1 | 11.9x | 43 / 43 | 35 / 15 | 3.5e-05 / 5.0e-05 | 2.0e-04 / 2.3e-04 |
+| 4096 | 128 | 0.125 | 1e+05 | 128 | 4.01 | 2.32 | 1.73x | 48.5 | 38.2 | 37.4 | 16.1x | 67 / 67 | 40 / 22 | 1.9e-05 / 1.4e-05 | 1.4e-04 / 1.2e-04 |
+| 8192 | 256 | 0.062 | 1e+05 | 256 | 5.50 | 2.58 | 2.13x | 89.5 | 70.9 | 55.8 | 21.6x | 61 / 60 | 69 / 27 | 1.4e-05 / 1.3e-05 | 3.5e-04 / 2.8e-04 |
+| 8192 | 1024 | 0.250 | 1e+05 | 640 | 52.0 | 19.6 | 2.65x | 2876.2 | 1796.4 | 1103.0 | 56.2x | 215 / 213 | 238 / 88 | 9.5e-06 / 1.0e-05 | 1.2e-05 / 1.5e-05 |
+
+#### Block-Jacobi PCG, fp32 (ms to tol 1e-5, warm median of 3)
+
+| n | blocks | density | κ | resident | row (#40) | column | column vs row | scipy | torch fp64 | torch fp32 | column vs best CPU | iters (row / column) | µs/iter (row / column) | true res (row / column) | err (row / column) |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1024 | 16 | 0.250 | 1e+03 | 16 | 2.81 | 2.32 | 1.21x | 20.2 | 33.9 | 31.5 | 8.7x | 98 / 98 | 20 / 16 | 1.8e-05 / 2.0e-05 | 6.3e-06 / 6.4e-06 |
+| 1024 | 32 | 0.500 | 1e+03 | 32 | 1.91 | 1.43 | 1.33x | 9.68 | 9.11 | 17.1 | 6.4x | 26 / 26 | 35 / 23 | 9.4e-06 / 9.5e-06 | 5.3e-06 / 5.3e-06 |
+| 1024 | 64 | 1.000 | 1e+03 | 64 | 3.76 | 2.51 | 1.50x | 66.0 | 50.0 | 53.1 | 19.9x | 113 / 112 | 28 / 16 | 1.4e-05 / 1.2e-05 | 6.2e-06 / 6.4e-06 |
+| 2048 | 32 | 0.125 | 1e+03 | 32 | 1.20 | 1.31 | 0.92x | 9.67 | 18.2 | 16.6 | 7.4x | 21 / 21 | 29 / 26 | 7.2e-06 / 7.2e-06 | 2.5e-06 / 1.8e-06 |
+| 2048 | 64 | 0.250 | 1e+03 | 64 | 1.86 | 1.57 | 1.18x | 18.6 | 14.0 | 25.1 | 8.9x | 27 / 27 | 35 / 26 | 3.7e-06 / 3.6e-06 | 2.7e-06 / 2.0e-06 |
+| 2048 | 128 | 0.500 | 1e+03 | 128 | 3.75 | 2.51 | 1.49x | 57.4 | 39.0 | 35.6 | 14.2x | 51 / 50 | 50 / 27 | 9.1e-06 / 9.1e-06 | 3.6e-06 / 6.5e-06 |
+| 2048 | 256 | 1.000 | 1e+03 | 256 | 12.2 | 4.81 | 2.54x | 309.2 | 171.5 | 235.8 | 35.7x | 158 / 157 | 72 / 24 | 1.1e-05 / 1.2e-05 | 4.9e-06 / 5.3e-06 |
+| 4096 | 64 | 0.062 | 1e+03 | 64 | 1.78 | 1.58 | 1.12x | 19.1 | 16.5 | 26.7 | 10.4x | 24 / 24 | 32 / 25 | 4.8e-06 / 6.1e-06 | 2.6e-06 / 2.7e-06 |
+| 4096 | 128 | 0.125 | 1e+03 | 128 | 3.13 | 2.01 | 1.55x | 51.4 | 38.7 | 32.9 | 16.3x | 44 / 43 | 50 / 27 | 6.1e-06 / 1.0e-05 | 3.2e-06 / 5.6e-06 |
+| 4096 | 256 | 0.250 | 1e+03 | 256 | 5.95 | 2.45 | 2.43x | 83.1 | 59.5 | 50.1 | 20.4x | 49 / 49 | 84 / 33 | 9.7e-06 / 9.8e-06 | 4.7e-06 / 5.0e-06 |
+| 4096 | 512 | 0.500 | 1e+03 | 512 | 12.4 | 4.62 | 2.69x | 681.2 | 238.2 | 170.2 | 36.8x | 81 / 85 | 143 / 41 | 9.8e-06 / 7.3e-06 | 6.9e-06 / 4.1e-06 |
+| 8192 | 122 | 0.030 | 1e+03 | 122 | 2.76 | 1.80 | 1.53x | 31.7 | 27.7 | 29.4 | 15.3x | 30 / 30 | 50 / 31 | 6.0e-06 / 6.0e-06 | 4.0e-06 / 3.7e-06 |
+| 8192 | 256 | 0.062 | 1e+03 | 256 | 5.41 | 2.72 | 1.99x | 100.3 | 65.2 | 54.0 | 19.9x | 41 / 41 | 97 / 39 | 9.6e-06 / 9.4e-06 | 2.0e-05 / 2.0e-05 |
+| 8192 | 512 | 0.125 | 1e+03 | 512 | 10.8 | 3.42 | 3.16x | 350.9 | 182.4 | 110.9 | 32.4x | 61 / 61 | 149 / 22 | 7.9e-06 / 7.8e-06 | 8.7e-06 / 8.7e-06 |
+| 8192 | 1024 | 0.250 | 1e+03 | 576 | 20.5 | 9.25 | 2.21x | 1298.7 | 682.4 | 370.8 | 40.1x | 74 / 76 | 259 / 106 | 9.3e-06 / 7.8e-06 | 1.3e-05 / 1.1e-05 |
+| 2048 | 64 | 0.250 | 1e+05 | 64 | 2.49 | 1.85 | 1.34x | 22.8 | 17.8 | 30.5 | 9.6x | 33 / 33 | 38 / 26 | 3.5e-05 / 3.5e-05 | 2.5e-04 / 2.3e-04 |
+| 4096 | 128 | 0.125 | 1e+05 | 128 | 3.52 | 2.44 | 1.45x | 48.0 | 43.1 | 37.7 | 15.5x | 54 / 54 | 48 / 25 | 1.9e-05 / 1.5e-05 | 1.1e-04 / 1.1e-04 |
+| 8192 | 256 | 0.062 | 1e+05 | 256 | 5.60 | 2.69 | 2.08x | 96.8 | 85.8 | 63.9 | 23.8x | 54 / 54 | 72 / 33 | 1.3e-05 / 1.5e-05 | 3.3e-04 / 3.2e-04 |
+| 8192 | 1024 | 0.250 | 1e+05 | 576 | 35.1 | 13.7 | 2.56x | 1850.7 | 1211.8 | 616.0 | 44.9x | 130 / 132 | 255 / 95 | 1.0e-05 / 1.3e-05 | 1.1e-05 / 1.8e-05 |
+
+#### bf16 A (opt-in), column matvec (ms to tol 1e-5; true residual and error against the fp64 A)
+
+| n | blocks | κ | precond | fp32 ms | bf16 ms | bf16x2 ms | resident fp32 / bf16 | iters fp32 / bf16 / bf16x2 | true res fp32 | true res bf16 | true res bf16x2 | err fp32 | err bf16 | err bf16x2 |
+|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1024 | 16 | 1e+03 | PCG | 2.32 | 2.26 | 2.34 | 16 / 16 | 98 / 96 / 99 | 2.0e-05 | 7.5e-02 | 1.5e-04 | 6.4e-06 | 8.5e-02 | 1.3e-04 |
+| 1024 | 16 | 1e+03 | CG | 2.28 | 2.50 | 2.74 | 16 / 16 | 117 / 139 / 124 | 1.9e-05 | 7.5e-02 | 1.2e-04 | 3.6e-06 | 8.5e-02 | 1.3e-04 |
+| 1024 | 32 | 1e+03 | PCG | 1.43 | 1.62 | 1.61 | 32 / 32 | 26 / 27 / 27 | 9.5e-06 | 3.5e-03 | 9.1e-06 | 5.3e-06 | 2.8e-02 | 2.8e-05 |
+| 1024 | 32 | 1e+03 | CG | 1.45 | 1.58 | 1.74 | 32 / 32 | 36 / 37 / 37 | 6.0e-06 | 3.5e-03 | 8.6e-06 | 3.8e-06 | 2.8e-02 | 2.8e-05 |
+| 1024 | 64 | 1e+03 | PCG | 2.51 | 2.88 | 3.04 | 64 / 64 | 112 / 114 / 114 | 1.2e-05 | 7.4e-02 | 1.6e-04 | 6.4e-06 | 8.3e-02 | 1.2e-04 |
+| 1024 | 64 | 1e+03 | CG | 3.00 | 2.60 | 2.90 | 64 / 64 | 116 / 137 / 123 | 1.5e-05 | 7.4e-02 | 1.1e-04 | 3.7e-06 | 8.3e-02 | 1.2e-04 |
+| 2048 | 32 | 1e+03 | PCG | 1.31 | 1.20 | 1.41 | 32 / 32 | 21 / 21 / 21 | 7.2e-06 | 5.8e-03 | 9.8e-06 | 1.8e-06 | 1.4e-01 | 5.3e-05 |
+| 2048 | 32 | 1e+03 | CG | 1.30 | 1.31 | 1.39 | 32 / 32 | 25 / 25 / 25 | 6.2e-06 | 5.8e-03 | 1.0e-05 | 1.1e-06 | 1.4e-01 | 5.3e-05 |
+| 2048 | 64 | 1e+03 | PCG | 1.57 | 1.20 | 1.61 | 64 / 64 | 27 / 27 / 27 | 3.6e-06 | 2.9e-03 | 9.7e-06 | 2.0e-06 | 3.1e-02 | 2.9e-05 |
+| 2048 | 64 | 1e+03 | CG | 1.83 | 1.68 | 1.67 | 64 / 64 | 33 / 35 / 34 | 6.9e-06 | 2.9e-03 | 8.1e-06 | 3.1e-06 | 3.1e-02 | 2.9e-05 |
+| 2048 | 128 | 1e+03 | PCG | 2.51 | 1.92 | 2.21 | 128 / 128 | 50 / 52 / 52 | 9.1e-06 | 3.4e-03 | 1.0e-05 | 6.5e-06 | 4.5e-03 | 1.0e-05 |
+| 2048 | 128 | 1e+03 | CG | 2.10 | 2.19 | 2.24 | 128 / 128 | 61 / 65 / 64 | 9.2e-06 | 3.4e-03 | 1.1e-05 | 6.1e-06 | 4.5e-03 | 1.0e-05 |
+| 2048 | 256 | 1e+03 | PCG | 4.81 | 4.11 | 4.49 | 256 / 256 | 157 / 162 / 160 | 1.2e-05 | 5.9e-02 | 1.1e-04 | 5.3e-06 | 6.6e-02 | 9.6e-05 |
+| 2048 | 256 | 1e+03 | CG | 3.70 | 3.22 | 3.59 | 256 / 256 | 128 / 147 / 136 | 1.5e-05 | 5.9e-02 | 9.4e-05 | 3.5e-06 | 6.6e-02 | 9.6e-05 |
+| 4096 | 64 | 1e+03 | PCG | 1.58 | 1.66 | 1.70 | 64 / 64 | 24 / 24 / 24 | 6.1e-06 | 1.4e-03 | 8.7e-06 | 2.7e-06 | 5.4e-02 | 9.8e-06 |
+| 4096 | 64 | 1e+03 | CG | 1.75 | 1.77 | 1.78 | 64 / 64 | 29 / 30 / 29 | 8.7e-06 | 1.4e-03 | 9.2e-06 | 5.1e-06 | 5.4e-02 | 1.1e-05 |
+| 4096 | 128 | 1e+03 | PCG | 2.01 | 1.87 | 2.29 | 128 / 128 | 43 / 44 / 44 | 1.0e-05 | 2.5e-03 | 1.1e-05 | 5.6e-06 | 6.2e-02 | 2.1e-04 |
+| 4096 | 128 | 1e+03 | CG | 2.05 | 1.78 | 1.85 | 128 / 128 | 53 / 55 / 54 | 8.5e-06 | 2.5e-03 | 1.3e-05 | 6.1e-06 | 6.2e-02 | 2.1e-04 |
+| 4096 | 256 | 1e+03 | PCG | 2.45 | 2.29 | 2.29 | 256 / 256 | 49 / 49 / 49 | 9.8e-06 | 5.5e-03 | 1.2e-05 | 5.0e-06 | 6.4e-02 | 7.0e-06 |
+| 4096 | 256 | 1e+03 | CG | 2.59 | 2.55 | 2.52 | 256 / 256 | 66 / 68 / 66 | 8.0e-06 | 5.5e-03 | 1.1e-05 | 5.1e-06 | 6.4e-02 | 7.7e-06 |
+| 4096 | 512 | 1e+03 | PCG | 4.62 | 3.06 | 3.99 | 512 / 512 | 85 / 85 / 84 | 7.3e-06 | 1.2e-02 | 2.4e-05 | 4.1e-06 | 1.2e-02 | 2.0e-05 |
+| 4096 | 512 | 1e+03 | CG | 5.03 | 3.88 | 4.26 | 512 / 512 | 117 / 121 / 121 | 8.9e-06 | 1.2e-02 | 2.2e-05 | 4.4e-06 | 1.2e-02 | 1.9e-05 |
+| 8192 | 122 | 1e+03 | PCG | 1.80 | 2.07 | 1.82 | 122 / 122 | 30 / 30 / 30 | 6.0e-06 | 2.4e-03 | 7.2e-06 | 3.7e-06 | 1.1e-01 | 9.1e-05 |
+| 8192 | 122 | 1e+03 | CG | 1.67 | 1.62 | 1.71 | 122 / 122 | 34 / 35 / 34 | 9.8e-06 | 2.4e-03 | 1.0e-05 | 4.2e-06 | 1.1e-01 | 9.1e-05 |
+| 8192 | 256 | 1e+03 | PCG | 2.72 | 2.32 | 2.58 | 256 / 256 | 41 / 40 / 43 | 9.4e-06 | 3.7e-03 | 7.9e-06 | 2.0e-05 | 1.2e-01 | 9.3e-05 |
+| 8192 | 256 | 1e+03 | CG | 2.07 | 2.13 | 1.99 | 256 / 256 | 48 / 45 / 48 | 7.0e-06 | 3.7e-03 | 1.0e-05 | 8.5e-06 | 1.2e-01 | 9.4e-05 |
+| 8192 | 512 | 1e+03 | PCG | 3.42 | 2.81 | 3.66 | 512 / 512 | 61 / 63 / 63 | 7.8e-06 | 2.9e-03 | 1.1e-05 | 8.7e-06 | 8.9e-03 | 8.7e-06 |
+| 8192 | 512 | 1e+03 | CG | 3.82 | 2.92 | 3.19 | 512 / 512 | 75 / 75 / 75 | 8.0e-06 | 2.9e-03 | 1.1e-05 | 1.0e-05 | 8.9e-03 | 1.4e-05 |
+| 8192 | 1024 | 1e+03 | PCG | 9.25 | 4.40 | 8.15 | 576 / 1024 | 76 / 74 / 75 | 7.8e-06 | 5.4e-03 | 1.6e-05 | 1.1e-05 | 5.8e-03 | 1.6e-05 |
+| 8192 | 1024 | 1e+03 | CG | 11.9 | 5.03 | 11.1 | 640 / 1024 | 116 / 118 / 118 | 9.4e-06 | 5.4e-03 | 1.4e-05 | 9.7e-06 | 5.8e-03 | 1.2e-05 |
+| 2048 | 64 | 1e+05 | PCG | 1.85 | 1.61 | 2.00 | 64 / 64 | 33 / 30 / 33 | 3.5e-05 | 2.9e-02 | 7.7e-04 | 2.3e-04 | 9.4e-01 | 2.4e-02 |
+| 2048 | 64 | 1e+05 | CG | 1.74 | 1.83 | 1.86 | 64 / 64 | 43 / 38 / 43 | 5.0e-05 | 2.9e-02 | 7.5e-04 | 2.3e-04 | 9.4e-01 | 2.4e-02 |
+| 4096 | 128 | 1e+05 | PCG | 2.44 | 2.04 | 2.30 | 128 / 128 | 54 / 51 / 54 | 1.5e-05 | 1.8e-02 | 1.5e-04 | 1.1e-04 | 8.0e-01 | 7.5e-03 |
+| 4096 | 128 | 1e+05 | CG | 2.32 | 1.84 | 2.25 | 128 / 128 | 67 / 64 / 68 | 1.4e-05 | 1.8e-02 | 1.4e-04 | 1.2e-04 | 8.0e-01 | 7.6e-03 |
+| 8192 | 256 | 1e+05 | PCG | 2.69 | 2.11 | 2.67 | 256 / 256 | 54 / 50 / 54 | 1.5e-05 | 8.8e-03 | 1.1e-04 | 3.2e-04 | 8.6e-01 | 9.9e-03 |
+| 8192 | 256 | 1e+05 | CG | 2.58 | 2.20 | 2.20 | 256 / 256 | 60 / 56 / 61 | 1.3e-05 | 8.8e-03 | 1.1e-04 | 2.8e-04 | 8.6e-01 | 9.9e-03 |
+| 8192 | 1024 | 1e+05 | PCG | 13.7 | 3.45 | 13.4 | 576 / 1024 | 132 / 63 / 133 | 1.3e-05 | 6.5e+32 | 7.4e-05 | 1.8e-05 | 5.4e+33 | 6.9e-04 |
+| 8192 | 1024 | 1e+05 | CG | 19.6 | 3.96 | 17.8 | 640 / 1024 | 213 / 101 / 218 | 1.0e-05 | nan | 7.4e-05 | 1.5e-05 | nan | 7.1e-04 |
+
+#### Small cases, warm median of 11 (ms)
+
+| n | blocks | precond | row | column | column vs row |
+|---:|---:|---|---:|---:|---:|
+| 1024 | 16 | block_jacobi | 2.53 | 2.32 | 1.09x |
+| 1024 | 16 | none | 2.66 | 2.45 | 1.09x |
+| 1024 | 32 | block_jacobi | 1.52 | 1.27 | 1.19x |
+| 1024 | 32 | none | 1.52 | 1.42 | 1.07x |
+| 2048 | 32 | block_jacobi | 1.40 | 1.33 | 1.05x |
+| 2048 | 32 | none | 1.45 | 1.32 | 1.10x |
+| 2048 | 64 | block_jacobi | 1.89 | 1.56 | 1.21x |
+| 2048 | 64 | none | 1.89 | 1.55 | 1.22x |
+| 4096 | 64 | block_jacobi | 1.64 | 1.53 | 1.07x |
+| 4096 | 64 | none | 1.64 | 1.58 | 1.03x |
+
+#### µs per CG iteration (plain, fixed iterations: (t(576) − t(64)) / 512)
+
+| n | blocks | row, LNC=2 split | column, LNC=2 split | column, LNC=2 no split | column, LNC=1 | row, LNC=1 | column vs row (split) | split vs LNC=1 (column) |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 2048 | 256 | 63.4 | 19.3 | 22.6 | 21.3 | 113.3 | 3.29x | 1.10x |
+| 4096 | 256 | 64.8 | 21.8 | 25.6 | 25.2 | 113.3 | 2.98x | 1.16x |
+| 4096 | 512 | 118.6 | 31.4 | 71.3 | 67.5 | 222.8 | 3.78x | 2.15x |
+| 8192 | 512 | 118.7 | 30.3 | 62.5 | 58.3 | 222.9 | 3.92x | 1.92x |
+| 8192 | 1024 | 232.9 | 87.0 | 186.5 | 167.7 | 441.0 | 2.68x | 1.93x |
+
+#### Several right-hand sides (n = 4096, 256 blocks; ms total, ms per right-hand side)
+
+| precond | R | row total | column total | row per RHS | column per RHS | torch fp64 per RHS | torch fp32 per RHS | best fused vs best CPU |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| block_jacobi | 1 | 5.3 | 2.6 | 5.305 | 2.568 | 84.290 | 71.733 | 28x |
+| block_jacobi | 4 | 9.9 | 3.1 | 2.488 | 0.763 | 17.023 | 14.869 | 19x |
+| block_jacobi | 16 | 10.0 | 8.0 | 0.624 | 0.498 | 8.295 | 4.783 | 10x |
+| block_jacobi | 32 | 9.8 | 8.3 | 0.307 | 0.260 | 8.782 | 3.910 | 15x |
+| block_jacobi | 64 | 11.9 | (row) | 0.186 | - | 14.245 | 3.482 | 19x |
+| block_jacobi | 128 | 19.7 | (row) | 0.154 | - | 15.291 | 8.452 | 55x |
+| none | 1 | 6.0 | 2.5 | 5.958 | 2.546 | 80.064 | 75.837 | 30x |
+| none | 4 | 10.7 | 7.5 | 2.672 | 1.865 | 18.938 | 17.136 | 9x |
+| none | 16 | 9.7 | 3.2 | 0.607 | 0.199 | 7.785 | 5.284 | 27x |
+| none | 32 | 10.8 | 4.8 | 0.338 | 0.149 | 9.915 | 5.259 | 35x |
+| none | 64 | 32.5 | (row) | 0.507 | - | 19.169 | 4.587 | 9x |
+| none | 128 | 22.9 | (row) | 0.179 | - | 19.703 | 10.094 | 56x |
+
+#### Power iteration, 200 iterations (ms; λ relative error against fp64 eigvalsh)
+
+| n | blocks | fused column | fused row | host_bsr (`power_iteration_bsr` on device) | torch fp64 | torch fp32 | scipy | fused µs/iter | column vs best CPU | column vs host_bsr | λ err fused | λ err fp64 CPU |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1024 | 32 | 3.2 | 4.1 | 136 | 29 | 40 | 41 | 16 | 9x | 42x | 2.6e-08 | 1.0e-09 |
+| 2048 | 64 | 4.0 | 5.7 | 150 | 79 | 101 | 168 | 20 | 20x | 38x | 5.2e-08 | 2.6e-09 |
+| 2048 | 256 | 4.9 | 13.6 | 168 | 213 | 235 | 306 | 25 | 43x | 34x | 9.5e-08 | 5.4e-10 |
+| 4096 | 256 | 5.5 | 14.6 | 225 | 262 | 200 | 506 | 28 | 36x | 41x | 3.1e-08 | 6.0e-11 |
+| 4096 | 512 | 6.7 | 25.0 | 201 | 540 | 344 | 769 | 33 | 51x | 30x | 3.0e-08 | 2.2e-10 |
+| 8192 | 256 | 5.0 | 13.3 | 159 | 207 | 242 | 326 | 25 | 42x | 32x | 2.8e-08 | 1.0e-09 |
+| 8192 | 1024 | 18.5 | 49.0 | 258 | 1381 | 633 | 2671 | 92 | 34x | 14x | 1.6e-08 | 2.7e-10 |
+
+#### Independent solves, one process per logical core (whole chip, n = 4096, 256 blocks, 40 solves per process, 2 shared host CPUs)
+
+| matvec | cores | solves/s | scaling |
+|---|---:|---:|---:|
+| column | 1 | 294 | 1.00x |
+| column | 2 | 632 | 2.15x |
+| column | 4 | 699 | 2.38x |
+| row | 1 | 147 | 1.00x |
+| row | 2 | 321 | 2.18x |
+| row | 4 | 333 | 2.26x |
+
+### Reading the follow-up tables
+
+- **The column matvec beats the row matvec in every case measured.** It
+  is 1.03–1.2x faster at the smallest sizes (median of 11 runs), up to
+  3.2x faster to tolerance, and 2.7–3.9x faster per iteration. It is as
+  accurate: true residuals and errors match the row matvec within
+  run-to-run variation, and iteration counts differ by at most 4. That is
+  why it is the new default for R <= 32.
+- **Against the best 2-thread CPU solver, fused CG is now 5–56x faster to
+  tolerance.** In #40 it was 3.5–11x.
+- **The per-block cost is no longer the floor.** At about 50 ns per
+  resident block, an iteration costs about 11 µs fixed at LNC=2 (8 µs at
+  LNC=1) plus the blocks. The fixed part is the chain of small VectorE /
+  TensorE steps and the `sendrecv`s. Cutting the exchanges from three to
+  two saved 2–3 µs per iteration. So the LNC=2 row split now gives
+  1.1–1.2x up to 256 blocks and about 2x at 512–1024 blocks.
+- **SBUF residency matters again.** At n = 8192 with 1024 blocks, 384 of
+  the fp32 blocks (64 KiB each) stream from HBM and set the pace: 87 µs
+  per iteration, against 30 µs with 512 resident blocks. bf16 A keeps all
+  1024 blocks resident and is 2.3x faster there, but at bf16 accuracy.
+- **bf16 A does not pay as a replacement for fp32** (opt-in only). The
+  vectors stay fp32 (split into bf16 hi + lo) and accumulation is fp32,
+  so the recursive residual converges, but for the rounded matrix. At
+  κ = 1e3 the true residual against the fp64 A stalls at 1e-3 to 7e-2. At
+  κ = 1e5 the error is about 0.9, or CG breaks down because the rounded
+  matrix is indefinite (n = 8192, 1024 blocks). bf16 hi + lo (`bf16x2`)
+  recovers most of the accuracy at κ = 1e3 (1–15x tol) but is 5–70x tol
+  at κ = 1e5. It also costs as much as fp32: two matmuls and the same
+  bytes per block.
+- **Several right-hand sides.** The column matvec takes up to 32 and is
+  1.2–3.3x faster per solve than the row matvec there. Above 32 the row
+  matvec is used.
+- **Fused power iteration** (`power_iteration_bsr_fused`) runs 200
+  iterations in 3–19 ms. That is 9–51x faster than the best CPU baseline
+  and 14–42x faster than `power_iteration_bsr` on the device, which syncs
+  with the host twice per iteration. λ matches fp64 eigvalsh to about
+  3e-8 (fp32).
+- **One process per logical core.** The column matvec doubles the
+  single-core rate (294 against 147 solves/s). Going to 2 and 4 cores
+  scales 2.15x and 2.38x, limited by the 2 shared host CPUs as in #40.
