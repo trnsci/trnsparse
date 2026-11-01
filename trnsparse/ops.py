@@ -585,6 +585,45 @@ def _block_sparse_attn_backward(
     return dQ, dK, dV
 
 
+def _block_sparse_attn_rows(Q, K, V, mask_bsr, scale: float) -> torch.Tensor:
+    """Block-sparse attention as differentiable torch ops, one block row at a time.
+
+    Same result as `_block_sparse_attn_pytorch`, without in-place updates,
+    so autograd can differentiate it to any order. Memory per block row is
+    `block_size x (stored blocks in the row x block_size)`; there is still no
+    `(seq_len, seq_len)` intermediate. Used for double backward only.
+    """
+    b = mask_bsr.block_size
+    row_ptrs = mask_bsr.block_row_ptrs.cpu().tolist()
+    cols = mask_bsr.block_col_indices.cpu().tolist()
+    outs = []
+    for m in range(Q.shape[0] // b):
+        cs = cols[row_ptrs[m] : row_ptrs[m + 1]]
+        if not cs:
+            outs.append(Q.new_zeros(b, V.shape[1]))
+            continue
+        k_rows = torch.cat([K[c * b : (c + 1) * b] for c in cs])
+        v_rows = torch.cat([V[c * b : (c + 1) * b] for c in cs])
+        p = torch.softmax((Q[m * b : (m + 1) * b] @ k_rows.T) * scale, dim=-1)
+        outs.append(p @ v_rows)
+    return torch.cat(outs)
+
+
+def _attn_grads_with_graph(Q, K, V, dO, mask_bsr, ctx):
+    """(dQ, dK, dV) that are themselves differentiable (create_graph=True)."""
+    need = ctx.needs_input_grad[:3]
+    ins = [t if n else t.detach() for t, n in zip((Q, K, V), need, strict=True)]
+    with torch.enable_grad():
+        out = _block_sparse_attn_rows(*ins, mask_bsr, ctx.scale)
+        wrt = [t for t, n in zip(ins, need, strict=True) if n]
+        grads = iter(torch.autograd.grad(out, wrt, dO, create_graph=True, allow_unused=True))
+    res = []
+    for t, n in zip(ins, need, strict=True):
+        g = next(grads) if n else None
+        res.append(torch.zeros_like(t) if n and g is None else g)
+    return res
+
+
 class _AttnTiledFunction(torch.autograd.Function):
     """Autograd wrapper for block-sparse tiled attention (v0.5.0).
 
@@ -650,6 +689,22 @@ class _AttnTiledFunction(torch.autograd.Function):
                 return len(self.block_col_indices)
 
         mask_bsr = _BSRHandle()
+
+        if torch.is_grad_enabled():
+            # Double backward (create_graph=True). The tiled backward below
+            # reuses the saved row_max / row_denom, which are constants to
+            # autograd, so differentiating it drops their dependence on Q
+            # and K: second derivatives came out wrong with no error (#65).
+            # Take the first-order gradients from a differentiable forward
+            # instead, so they carry a correct graph.
+            return (
+                *_attn_grads_with_graph(Q, K, V, dO, mask_bsr, ctx),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
 
         from .nki.dispatch import _nki_block_ok, _use_nki
 
