@@ -78,6 +78,30 @@ class TestSymmetricSpMV:
         expected = A @ x
         np.testing.assert_allclose(result.numpy(), expected.numpy(), atol=1e-6)
 
+    @pytest.mark.parametrize("uplo", ["upper", "lower"])
+    @pytest.mark.parametrize("store", ["triangle", "full"])
+    def test_uplo_selects_triangle(self, uplo, store):
+        """Only the `uplo` triangle is referenced, so a fully stored (even
+        non-symmetric) A gives the symmetric matrix of that triangle (#52)."""
+        g = torch.Generator().manual_seed(3)
+        S = torch.randn(9, 9, generator=g, dtype=torch.float64)
+        S[torch.rand(9, 9, generator=g) > 0.5] = 0
+        T = torch.triu(S) if uplo == "upper" else torch.tril(S)
+        full_sym = T + T.T - torch.diag(torch.diagonal(T))
+        stored = T if store == "triangle" else S
+        csr = trnsparse.from_dense(stored)
+        x = torch.randn(9, generator=g, dtype=torch.float64)
+        want = 0.7 * full_sym @ x
+        torch.testing.assert_close(trnsparse.spmv_symmetric(csr, x, alpha=0.7, uplo=uplo), want)
+        from trnsparse.ops import _spmv_symmetric_dense
+
+        torch.testing.assert_close(_spmv_symmetric_dense(csr, x, 0.7, uplo), want)
+
+    def test_bad_uplo(self):
+        csr = trnsparse.from_dense(torch.eye(3))
+        with pytest.raises(ValueError):
+            trnsparse.spmv_symmetric(csr, torch.ones(3), uplo="U")
+
 
 class TestSparseAdd:
     def test_basic(self):

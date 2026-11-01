@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`spmv_symmetric` ignored `uplo`** (silent). Affects **every release through
+  0.11.0**, on every backend. Every stored entry was used, so a fully stored
+  symmetric matrix (or any entry outside the intended triangle) gave
+  `A @ x + strict(A)ᵀ @ x` with no error (rel. err 0.85–1.9 on a 20×20 test).
+  Only the `uplo` triangle is referenced now, as in BLAS `symv`, on the host
+  and device paths; other `uplo` values raise. One-triangle storage gives the
+  same results as before (#52).
+
 - **`block_sparse_attention_tiled` silently ignored a custom `scale` on the
   NKI paths** (released 0.6.0 through 0.11.0; #47). With `backend="nki"` or
   `"auto"` on Neuron, the forward and all three gradients always used
