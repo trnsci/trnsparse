@@ -20,6 +20,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `NKI_TRACE_CACHE_URL` directory per session (no stale editable-install
   traces). `NKI_ENABLE_TRACE_CACHE=0` still turns it off.
 - README: known platform issue note for #1454.
+### Fixed
+
+- **`COOMatrix.to_dense` dropped duplicate entries** (silent; every release
+  0.1.1–0.12.1, backend-independent). Repeated `(row, col)` entries were
+  assigned rather than summed, so all but one was lost, while `to_csr()`,
+  `torch.sparse_coo_tensor` and `scipy.sparse` sum them. This also affected
+  `CSRMatrix.to_coo().to_dense()` for a CSR with a repeated column in a row.
+  Duplicates are now summed; matrices without duplicates are unchanged (#56).
 
 ## [0.12.1] — 2026-11-01
 
