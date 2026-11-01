@@ -31,3 +31,21 @@ def pytest_configure(config):
         "nki_simulator: runs NKI kernels via nki.simulate on CPU "
         "(requires TRNSPARSE_USE_SIMULATOR=1 + nki>=0.3.0)",
     )
+
+
+def pytest_addoption(parser):
+    # tests/test_conformance.py runs its reference cases on the selected
+    # backend and device, so a Trn2 run executes the same cases as CPU CI:
+    #   pytest tests/test_conformance.py --backend nki --conformance-device neuron
+    group = parser.getgroup("trnsparse conformance")
+    group.addoption(
+        "--backend",
+        default="pytorch",
+        choices=("pytorch", "nki", "auto"),
+        help="trnsparse backend for tests/test_conformance.py (default: pytorch)",
+    )
+    group.addoption(
+        "--conformance-device",
+        default="cpu",
+        help="device for the dense operands in tests/test_conformance.py (default: cpu)",
+    )
