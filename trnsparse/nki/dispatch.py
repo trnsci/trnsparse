@@ -113,6 +113,31 @@ def _use_nki() -> bool:
     return HAS_NKI
 
 
+# Block sizes the BSR / attention kernels take. Every kernel treats a
+# block as one 128x128 Tensor Engine tile (`_TILE_M` is built into its
+# shapes), so any other block size fails to lower on every call (#46).
+_NKI_BLOCK_SIZES = (_TILE_M,)
+
+
+def _nki_block_ok(op: str, block_size: int) -> bool:
+    """True when the NKI kernels behind `op` take `block_size`.
+
+    Callers route to the PyTorch path on False, without tracing a kernel
+    that cannot lower. Under `TRNSPARSE_REQUIRE_NKI` an unsupported block
+    size raises `NotImplementedError` instead.
+    """
+    if int(block_size) in _NKI_BLOCK_SIZES:
+        return True
+    if _REQUIRE_NKI:
+        sizes = ", ".join(str(b) for b in _NKI_BLOCK_SIZES)
+        raise NotImplementedError(
+            f"trnsparse {op}: the NKI kernels support block_size {sizes} only, "
+            f"got {block_size}. Rebuild the BSR matrix with block_size={_TILE_M}, "
+            "or unset TRNSPARSE_REQUIRE_NKI to use the PyTorch path."
+        )
+    return False
+
+
 def _round_up(n: int, multiple: int) -> int:
     return ((n + multiple - 1) // multiple) * multiple
 
@@ -678,10 +703,14 @@ def nki_bsr_spmm(A, B: torch.Tensor) -> torch.Tensor:
     `A.blocks` and `B` through the gather), so no per-block Python loop
     runs on device tensors. The result is on B's device.
     """
+    if not _nki_block_ok("bsr_spmm", A.block_size):
+        from ..ops import _bsr_spmm_pytorch
+
+        return _bsr_spmm_pytorch(A, B)
     if _native_path():
         out_cols = B.shape[1]
         n_tiles = 1 if out_cols <= _TILE_N else -(-out_cols // _TILE_N)
-        if A.block_size == _TILE_M and _static_structure_ok(A.n_blocks * n_tiles):
+        if _static_structure_ok(A.n_blocks * n_tiles):
             try:
                 return _nki_bsr_spmm_static(A, B)
             except Exception:
@@ -1040,10 +1069,14 @@ def nki_bsr_attn_tiled(
     seq_len, head_dim = Q.shape
     scale = head_dim**-0.5
 
+    if not _nki_block_ok("block_sparse_attention_tiled", mask_bsr.block_size):
+        from ..ops import _block_sparse_attn_pytorch
+
+        return _block_sparse_attn_pytorch(Q, K, V, mask_bsr, scale, return_stats=return_stats)
+
     if (
         _native_path()
         and head_dim <= _TILE_K
-        and mask_bsr.block_size == _TILE_M
         and seq_len % _TILE_M == 0
         and _static_structure_ok(2 * mask_bsr.n_blocks)
     ):
@@ -1385,10 +1418,16 @@ def nki_bsr_attn_bwd(
     b = mask_bsr.block_size
     scale = head_dim**-0.5
 
+    if not _nki_block_ok("block_sparse_attention_tiled backward", b):
+        from ..ops import _block_sparse_attn_backward
+
+        return _block_sparse_attn_backward(
+            Q, K, V, O, dO, mask_bsr, scale, row_max=row_max, row_denom=row_denom
+        )
+
     if (
         _native_path()
         and head_dim <= _TILE_K
-        and b == _TILE_M
         and seq_len % _TILE_M == 0
         and _static_structure_ok(2 * mask_bsr.n_blocks)
     ):

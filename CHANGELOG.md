@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `bsr_spmm` and `block_sparse_attention_tiled` with a `block_size` other than
+  128 (16, 32 and 64 in the audit) no longer try an NKI kernel first. The
+  kernels take 128x128 blocks only, so that trace always failed, and the call
+  fell back to torch only after paying for it: 7-9 s on the first `bsr_spmm`
+  call and 27-41 s on the first attention call on Trn2. These block sizes now
+  go straight to the PyTorch path under `auto` (and under `nki` when
+  `TRNSPARSE_REQUIRE_NKI` is not set). Under `TRNSPARSE_REQUIRE_NKI` they raise
+  `NotImplementedError` naming the supported block size. The unfused
+  iterative solvers (`cg_bsr`, `power_iteration_bsr`, `chebyshev_bsr`,
+  `richardson_bsr`) also benefit, because they call `bsr_spmm` on every
+  iteration (#46).
+
 ## [0.11.0] — 2026-11-01
 
 Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.

@@ -264,9 +264,10 @@ def bsr_spmm(A: BSRMatrix, B: torch.Tensor) -> torch.Tensor:
     `A.block_col_indices` on the host; `A.blocks` and `B` on the host or on
     `neuron`. The result is on B's device.
     """
-    from .nki.dispatch import _use_nki
+    from .nki.dispatch import _nki_block_ok, _use_nki
 
-    if _use_nki():
+    # Block sizes the kernels do not take go straight to PyTorch (#46).
+    if _use_nki() and _nki_block_ok("bsr_spmm", A.block_size):
         from .nki.dispatch import nki_bsr_spmm
 
         return nki_bsr_spmm(A, B)
@@ -566,9 +567,9 @@ class _AttnTiledFunction(torch.autograd.Function):
 
         mask_bsr = _BSRHandle()
 
-        from .nki.dispatch import _use_nki
+        from .nki.dispatch import _nki_block_ok, _use_nki
 
-        if _use_nki():
+        if _use_nki() and _nki_block_ok("block_sparse_attention_tiled", mask_block_size):
             from .nki.dispatch import nki_bsr_attn_tiled
 
             out, row_max, row_denom = nki_bsr_attn_tiled(Q, K, V, mask_bsr, return_stats=True)
@@ -601,9 +602,9 @@ class _AttnTiledFunction(torch.autograd.Function):
 
         mask_bsr = _BSRHandle()
 
-        from .nki.dispatch import _use_nki
+        from .nki.dispatch import _nki_block_ok, _use_nki
 
-        if _use_nki():
+        if _use_nki() and _nki_block_ok("block_sparse_attention_tiled", ctx.mask_block_size):
             from .nki.dispatch import nki_bsr_attn_bwd
 
             dQ, dK, dV = nki_bsr_attn_bwd(Q, K, V, dO, O, mask_bsr, row_max, row_denom)
@@ -688,9 +689,11 @@ def block_sparse_attention_tiled(
     if scale is None:
         scale = head_dim**-0.5
 
-    from .nki.dispatch import _native_path, _use_nki
+    from .nki.dispatch import _native_path, _nki_block_ok, _use_nki
 
-    if _use_nki() and _native_path():
+    # Block sizes the kernels do not take go straight to PyTorch (#46).
+    use_nki = _use_nki() and _nki_block_ok("block_sparse_attention_tiled", b)
+    if use_nki and _native_path():
         from .nki.dispatch import _get_native_ops
 
         out, _, _ = _get_native_ops()["bsr_attn"](
@@ -715,7 +718,7 @@ def block_sparse_attention_tiled(
             scale,
         )
 
-    if _use_nki():
+    if use_nki:
         from .nki.dispatch import nki_bsr_attn_tiled
 
         return nki_bsr_attn_tiled(Q, K, V, mask_bsr)

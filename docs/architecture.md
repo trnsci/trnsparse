@@ -121,7 +121,11 @@ operands run in fp32.
   interop with scipy/PyTorch, and SpMV.
 - **COO**: three parallel 1-D tensors. Preferred for construction and permutation.
 - **BSR** (`block_size=128`): stacked 128×128 blocks + block-level CSR pattern.
-  Every block maps to one `nc_matmul`; zero gather overhead.
+  Every block maps to one `nc_matmul`; zero gather overhead. Other block
+  sizes work everywhere on the PyTorch path. The NKI kernels take 128 only, so
+  `bsr_spmm` and `block_sparse_attention_tiled` send any other block size
+  straight to PyTorch, or raise `NotImplementedError` under
+  `TRNSPARSE_REQUIRE_NKI=1`.
 
 All three support `from_dense`, `to_dense`, and interconversion.
 

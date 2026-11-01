@@ -15,6 +15,8 @@ as OK, SILENT (wrong result) or LOUD (exception) instead of asserting.
 
 from __future__ import annotations
 
+import itertools
+
 import pytest
 import torch
 
@@ -115,6 +117,18 @@ def case_bsr(m, n, N, static=True, block_size=P, dtype=torch.float32, seed=1):
         d._STATIC_STRUCTURE = prev
     tol = 1e-4 if dtype == torch.float32 else 3e-2
     return _rel(C, A @ B), tol
+
+
+def case_bsr_unsupported(m, n, N, block_size):
+    """Block sizes the kernels do not take (#46): straight to torch, or a
+    NotImplementedError naming block_size 128 under TRNSPARSE_REQUIRE_NKI."""
+    import trnsparse.nki.dispatch as d
+
+    if not d._REQUIRE_NKI:
+        return case_bsr(m, n, N, block_size=block_size)
+    with pytest.raises(NotImplementedError, match="block_size 128 only"):
+        case_bsr(m, n, N, block_size=block_size)
+    return 0.0, 1e-4
 
 
 # ── Screened SpMM (`_screened_spmm_kernel`) ───────────────────────────────────
@@ -266,7 +280,16 @@ for m, n, N in [(129, 200, 513), (4097, 257, 5)]:
             lambda m=m, n=n, N=N: case_bsr(m, n, N, dtype=torch.bfloat16),
         )
     )
-CASES.append(("bsr_spmm_block32", "200x200x7", lambda: case_bsr(200, 200, 7, block_size=32)))
+for b, (m, n, N) in itertools.product(
+    (16, 32, 64), [(200, 200, 7), (256, 256, 513), (1000, 300, 33)]
+):
+    CASES.append(
+        (
+            f"bsr_spmm_block{b}",
+            _s(m, n, N),
+            lambda m=m, n=n, N=N, b=b: case_bsr_unsupported(m, n, N, b),
+        )
+    )
 for M, N in SCREENED_SHAPES:
     CASES.append(("screened_spmm", _s(M, M, N), lambda M=M, N=N: case_screened(M, N)))
 for seq, hd in ATTN_SHAPES:

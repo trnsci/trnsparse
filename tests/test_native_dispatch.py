@@ -1076,3 +1076,114 @@ class TestNativeAttentionOps:
         assert len(calls) == 1
         # Mask structure is passed as host tensors.
         assert calls[0][3].device.type == "cpu" and calls[0][4].device.type == "cpu"
+
+
+class TestUnsupportedBlockSize:
+    """#46: the BSR and attention kernels take 128x128 blocks only. Other
+    block sizes go straight to the PyTorch path (no kernel trace, which
+    used to fail and cost seconds per call) or, under TRNSPARSE_REQUIRE_NKI,
+    raise NotImplementedError naming the supported size."""
+
+    @pytest.fixture(params=["native", "xla"])
+    def no_kernels(self, request, monkeypatch):
+        # The wrappers catch kernel errors and fall back, so record any
+        # launch attempt and check the record, not only the exception.
+        attempts = []
+
+        def boom(*a, **k):
+            attempts.append(a)
+            raise AssertionError("no kernel may be traced for an unsupported block size")
+
+        monkeypatch.setattr(dispatch, "HAS_NKI", True)
+        monkeypatch.setattr(dispatch, "_USE_SIMULATOR", False)
+        monkeypatch.setattr(dispatch, "_REQUIRE_NKI", False)
+        monkeypatch.setattr(dispatch, "_backend", "nki")
+        monkeypatch.setattr(dispatch, "_dispatch_path", request.param)
+        monkeypatch.setattr(dispatch, "_get_native_ops", boom)
+        monkeypatch.setattr(dispatch, "_launch", boom)
+        monkeypatch.setattr(dispatch, "_run", boom)
+        monkeypatch.setattr(dispatch, "_to_device", boom)
+        monkeypatch.setattr(dispatch._BSRSpMMFunction, "apply", boom)
+        yield
+        assert attempts == [], f"{len(attempts)} kernel launch attempt(s)"
+
+    @staticmethod
+    def _bsr(m, n, b, seed=0):
+        g = torch.Generator().manual_seed(seed)
+        bm = torch.rand(-(-m // b), -(-n // b), generator=g) < 0.5
+        bm[-1, -1] = True
+        mask = bm.repeat_interleave(b, 0).repeat_interleave(b, 1)[:m, :n]
+        dense = torch.randn(m, n, generator=g) * mask
+        return dense, trnsparse.BSRMatrix.from_dense(dense, block_size=b)
+
+    @pytest.mark.parametrize("b", [16, 32, 64])
+    def test_bsr_spmm_goes_to_torch(self, no_kernels, b):
+        dense, A = self._bsr(200, 136, b)
+        A.blocks.requires_grad_(True)
+        B = torch.randn(136, 7, requires_grad=True)
+        C = trnsparse.bsr_spmm(A, B)
+        torch.testing.assert_close(C, dense @ B.detach(), atol=1e-4, rtol=1e-4)
+        C.sum().backward()
+        assert A.blocks.grad is not None and B.grad is not None
+        # The dispatch-level entry point is guarded as well.
+        torch.testing.assert_close(dispatch.nki_bsr_spmm(A, B.detach()), C.detach())
+
+    @pytest.mark.parametrize("b", [16, 32, 64])
+    def test_bsr_spmm_require_nki_raises(self, no_kernels, monkeypatch, b):
+        monkeypatch.setattr(dispatch, "_REQUIRE_NKI", True)
+        _, A = self._bsr(64, 64, b)
+        with pytest.raises(NotImplementedError, match=r"block_size 128 only, got " + str(b)):
+            trnsparse.bsr_spmm(A, torch.randn(64, 3))
+        with pytest.raises(NotImplementedError, match="block_size 128"):
+            dispatch.nki_bsr_spmm(A, torch.randn(64, 3))
+
+    def test_pytorch_backend_never_raises(self, no_kernels, monkeypatch):
+        monkeypatch.setattr(dispatch, "_REQUIRE_NKI", True)
+        monkeypatch.setattr(dispatch, "_backend", "pytorch")
+        dense, A = self._bsr(64, 64, 32)
+        B = torch.randn(64, 3)
+        torch.testing.assert_close(trnsparse.bsr_spmm(A, B), dense @ B, atol=1e-4, rtol=1e-4)
+
+    def test_cg_bsr_block32_goes_to_torch(self, no_kernels):
+        n = 96
+        g = torch.Generator().manual_seed(3)
+        M = torch.randn(n, n, generator=g) * 0.05
+        A = (M + M.T) / 2 + 2.0 * torch.eye(n)
+        b = torch.randn(n, generator=g)
+        x, iters = trnsparse.cg_bsr(trnsparse.BSRMatrix.from_dense(A, block_size=32), b)[:2]
+        torch.testing.assert_close(A @ x, b, atol=1e-4, rtol=1e-4)
+
+    @staticmethod
+    def _attn(seq, b, seed=5):
+        g = torch.Generator().manual_seed(seed)
+        nb = seq // b
+        bm = (torch.rand(nb, nb, generator=g) < 0.4) | torch.eye(nb, dtype=torch.bool)
+        dense = bm.repeat_interleave(b, 0).repeat_interleave(b, 1).float()
+        return trnsparse.BSRMatrix.from_dense(dense, block_size=b)
+
+    @pytest.mark.parametrize("b", [32, 64])
+    def test_attention_goes_to_torch(self, no_kernels, b):
+        from trnsparse.ops import _block_sparse_attn_pytorch
+
+        mask = self._attn(256, b)
+        g = torch.Generator().manual_seed(6)
+        Q, K, V = (torch.randn(256, 16, generator=g) for _ in range(3))
+        ref = _block_sparse_attn_pytorch(Q, K, V, mask, 16**-0.5)
+        torch.testing.assert_close(trnsparse.block_sparse_attention_tiled(Q, K, V, mask), ref)
+        Qg, Kg, Vg = (t.clone().requires_grad_(True) for t in (Q, K, V))
+        out = trnsparse.block_sparse_attention_tiled(Qg, Kg, Vg, mask)
+        torch.testing.assert_close(out, ref)
+        out.sum().backward()
+        assert all(t.grad is not None for t in (Qg, Kg, Vg))
+        # Dispatch-level entry points (what the native composite ops call).
+        o, rm, rd = dispatch.nki_bsr_attn_tiled(Q, K, V, mask, return_stats=True)
+        torch.testing.assert_close(o, ref)
+        dQ, dK, dV = dispatch.nki_bsr_attn_bwd(Q, K, V, torch.ones_like(Q), o, mask, rm, rd)
+        torch.testing.assert_close(dQ, Qg.grad, atol=1e-5, rtol=1e-4)
+
+    def test_attention_require_nki_raises(self, no_kernels, monkeypatch):
+        monkeypatch.setattr(dispatch, "_REQUIRE_NKI", True)
+        mask = self._attn(256, 64)
+        Q = torch.randn(256, 16)
+        with pytest.raises(NotImplementedError, match="block_size 128 only, got 64"):
+            trnsparse.block_sparse_attention_tiled(Q, Q, Q, mask)
