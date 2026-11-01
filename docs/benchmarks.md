@@ -123,12 +123,14 @@ host passes into one dispatch:
 - **Block-sparse attention (v0.4.2, [#21](https://github.com/trnsci/trnsparse/issues/21))**
   ✅ shipped: `bsr_spmm` handles `attn_weights @ V` for local-window / dilated /
   global-token masks. At seq_len=8192, window=2: 4.9% block density means 95%
-  of `nc_matmul` calls are skipped. Current example still materializes the full
-  score matrix (follow-up: [#25](https://github.com/trnsci/trnsparse/issues/25)).
+  of `nc_matmul` calls are skipped. The example materializes the full score
+  matrix; `block_sparse_attention_tiled` (v0.4.3, NKI kernels from v0.4.4,
+  [#25](https://github.com/trnsci/trnsparse/issues/25)) does not.
 - **[#22 — on-chip iterative solvers](https://github.com/trnsci/trnsparse/issues/22)**:
   CG/power-iteration with A SBUF-resident across all iterations (replaces #20).
-  v0.3.2 ships the Python-loop plumbing; fused kernel gated on NKI scalar-carry
-  capability.
+  v0.3.2 shipped the Python-loop plumbing; the fused kernel (`cg_bsr_fused`,
+  `power_iteration_bsr_fused`) shipped in 0.11.0. Trn2 results are in the
+  fused CG sections below.
 
 See [`docs/architecture.md`](architecture.md) for why BSR is the
 Trainium-native format.

@@ -103,10 +103,15 @@ class COOMatrix:
         return self.nnz / (self.shape[0] * self.shape[1])
 
     def to_dense(self) -> torch.Tensor:
+        """Convert to dense tensor. Duplicate entries are summed, as in
+        `to_csr().to_dense()`, `torch.sparse_coo_tensor` and `scipy.sparse`."""
         m, n = self.shape
         dense = torch.zeros(m, n, dtype=self.dtype)
-        dense[self.row_indices, self.col_indices] = self.values
-        return dense
+        return dense.index_put(
+            (self.row_indices.to(torch.long), self.col_indices.to(torch.long)),
+            self.values,
+            accumulate=True,
+        )
 
     def to_csr(self) -> CSRMatrix:
         """Convert to CSR format."""
@@ -314,12 +319,19 @@ def from_dense(A: torch.Tensor, threshold: float = 0.0) -> CSRMatrix:
 
 
 def from_scipy(sp_matrix) -> CSRMatrix:
-    """Convert scipy.sparse matrix to CSRMatrix."""
+    """Convert scipy.sparse matrix to CSRMatrix.
+
+    Values are stored in single precision: float32 for real input,
+    complex64 for complex input (through 0.12.1 complex input was cast to
+    float32, which discarded the imaginary part, #58).
+    """
+    import numpy as np
     import scipy.sparse as sp
 
     csr = sp.csr_matrix(sp_matrix)
+    dtype = torch.complex64 if np.iscomplexobj(csr.data) else torch.float32
     return CSRMatrix(
-        values=torch.tensor(csr.data, dtype=torch.float32),
+        values=torch.tensor(csr.data, dtype=dtype),
         col_indices=torch.tensor(csr.indices, dtype=torch.long),
         row_ptrs=torch.tensor(csr.indptr, dtype=torch.long),
         shape=csr.shape,
