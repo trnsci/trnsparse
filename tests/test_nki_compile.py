@@ -354,7 +354,15 @@ def test_static_kernel_lnc2_neff_compiles(case, tmp_path):
 
 
 def _cg_inputs(
-    T: int, precond: int, check_every: int, R: int = 1, sbuf_kib=160, split=1, matvec=0, precision=0
+    T: int,
+    precond: int,
+    check_every: int,
+    R: int = 1,
+    sbuf_kib=160,
+    split=1,
+    matvec=0,
+    precision=0,
+    variant=0,
 ):
     from trnsparse.nki.kernels import register_structure
 
@@ -381,6 +389,7 @@ def _cg_inputs(
         split,
         matvec,
         precision,
+        variant,
     )
 
 
@@ -406,6 +415,24 @@ _CG_CASES = {
     "bf16x2-bjacobi": (dict(T=3, precond=1, check_every=2, matvec=1, precision=2),),
     "bf16x2-stream": (dict(T=5, precond=1, check_every=1, sbuf_kib=2, matvec=1, precision=2),),
     "bf16-rhs16": (dict(T=3, precond=1, check_every=1, R=16, matvec=1, precision=1),),
+    # plain CG under the split: one exchange of q's segments per step
+    "rhs4-plain": (dict(T=3, precond=0, check_every=2, R=4),),
+    "col-rhs4-plain": (dict(T=3, precond=0, check_every=2, R=4, matvec=1),),
+    "col-plain-rows37": (dict(T=37, precond=0, check_every=1, matvec=1),),
+    "col-plain-stream": (dict(T=5, precond=0, check_every=1, sbuf_kib=2, matvec=1),),
+    "bf16x2-plain": (dict(T=5, precond=0, check_every=2, matvec=1, precision=2),),
+    # spread sources: rows37 fit one chunk per core; 100 rows on one core
+    # hit the spread-bytes cap and take several chunks
+    "col-plain-rows100-nosplit": (dict(T=100, precond=0, check_every=2, split=0, matvec=1),),
+    "col-rhs8-rows37": (dict(T=37, precond=1, check_every=2, R=8, matvec=1),),
+    "col-odd-check": (dict(T=6, precond=1, check_every=3, matvec=1),),
+    # Chronopoulos-Gear recurrence (opt-in, plain CG)
+    "cgcg": (dict(T=3, precond=0, check_every=2, variant=1),),
+    "cgcg-col": (dict(T=3, precond=0, check_every=2, matvec=1, variant=1),),
+    "cgcg-col-odd-check": (dict(T=5, precond=0, check_every=3, matvec=1, variant=1),),
+    "cgcg-col-rhs4": (dict(T=3, precond=0, check_every=2, R=4, matvec=1, variant=1),),
+    "cgcg-col-nosplit": (dict(T=4, precond=0, check_every=2, split=0, matvec=1, variant=1),),
+    "cgcg-col-rows37": (dict(T=37, precond=0, check_every=2, matvec=1, variant=1),),
 }
 
 
@@ -468,6 +495,9 @@ def test_power_kernel_lnc_mlir_verifies(case, lnc):
         "col-nosplit",
         "bf16x2-bjacobi",
         "bf16-rhs16",
+        "col-plain-rows37",
+        "cgcg-col",
+        "cgcg-col-rhs4",
     ],
 )
 def test_cg_kernel_neff_compiles(case, lnc, tmp_path):
