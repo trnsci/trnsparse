@@ -103,10 +103,15 @@ class COOMatrix:
         return self.nnz / (self.shape[0] * self.shape[1])
 
     def to_dense(self) -> torch.Tensor:
+        """Convert to dense tensor. Duplicate entries are summed, as in
+        `to_csr().to_dense()`, `torch.sparse_coo_tensor` and `scipy.sparse`."""
         m, n = self.shape
         dense = torch.zeros(m, n, dtype=self.dtype)
-        dense[self.row_indices, self.col_indices] = self.values
-        return dense
+        return dense.index_put(
+            (self.row_indices.to(torch.long), self.col_indices.to(torch.long)),
+            self.values,
+            accumulate=True,
+        )
 
     def to_csr(self) -> CSRMatrix:
         """Convert to CSR format."""

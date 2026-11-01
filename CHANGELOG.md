@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Guard against the NKI trace-cache closure bug ([aws-neuron/aws-neuron-sdk#1454](https://github.com/aws-neuron/aws-neuron-sdk/issues/1454),
+  trnsci/trnsci#35).** `tests/test_trace_cache_safety.py` (CPU) finds every
+  `@nki.jit` kernel and fails if its body, or a helper it calls, reads a
+  closure variable or a module global that is not a constant expression
+  (reviewed exceptions are allow-listed with a reason), and checks each
+  kernel's `__closure__` at runtime against a stub `nki`.
+- Tests: `conftest.py` no longer turns the NKI trace cache off. Neuron tests
+  run with it on, as under `import torch_neuronx`, with a fresh
+  `NKI_TRACE_CACHE_URL` directory per session (no stale editable-install
+  traces). `NKI_ENABLE_TRACE_CACHE=0` still turns it off.
+- README: known platform issue note for #1454.
+### Fixed
+
+- **`COOMatrix.to_dense` dropped duplicate entries** (silent; every release
+  0.1.1–0.12.1, backend-independent). Repeated `(row, col)` entries were
+  assigned rather than summed, so all but one was lost, while `to_csr()`,
+  `torch.sparse_coo_tensor` and `scipy.sparse` sum them. This also affected
+  `CSRMatrix.to_coo().to_dense()` for a CSR with a repeated column in a row.
+  Duplicates are now summed; matrices without duplicates are unchanged (#56).
 ### Fixed
 
 - **`from_scipy` discarded the imaginary part of complex matrices** (silent;
