@@ -78,6 +78,58 @@ class TestSymmetricSpMV:
         expected = A @ x
         np.testing.assert_allclose(result.numpy(), expected.numpy(), atol=1e-6)
 
+    @staticmethod
+    def _case(store, seed=3):
+        g = torch.Generator().manual_seed(seed)
+        S = torch.randn(9, 9, generator=g, dtype=torch.float64)
+        S[torch.rand(9, 9, generator=g) > 0.5] = 0
+        S.fill_diagonal_(1.5)
+        stored = {"upper": torch.triu(S), "lower": torch.tril(S), "both": S}[store]
+        x = torch.randn(9, generator=g, dtype=torch.float64)
+        return S, stored, x
+
+    @staticmethod
+    def _sym(T):
+        return T + T.T - torch.diag(torch.diagonal(T))
+
+    @pytest.mark.parametrize("dense_branch", [False, True])
+    @pytest.mark.parametrize("uplo", ["upper", "lower"])
+    @pytest.mark.parametrize("store", ["upper", "lower", "both"])
+    def test_uplo_and_storage(self, monkeypatch, store, uplo, dense_branch):
+        """Both triangles stored: only `uplo` is referenced (#52). One triangle
+        stored: that triangle is used whatever `uplo` says, as through 0.11.0,
+        with a DeprecationWarning when `uplo` names the empty triangle."""
+        import warnings
+
+        from trnsparse import ops
+
+        if dense_branch:  # the device-operand branch, on the host
+            monkeypatch.setattr(ops, "_torch_sparse_ok", lambda A, x: False)
+        S, stored, x = self._case(store)
+        tri = uplo if store == "both" else store
+        want = 0.7 * self._sym(torch.triu(S) if tri == "upper" else torch.tril(S)) @ x
+        csr = trnsparse.from_dense(stored)
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            got = trnsparse.spmv_symmetric(csr, x, alpha=0.7, uplo=uplo)
+        torch.testing.assert_close(got, want)
+        dep = [m for m in w if issubclass(m.category, DeprecationWarning)]
+        assert bool(dep) == (store != "both" and store != uplo)
+
+    def test_diagonal_only_no_warning(self):
+        import warnings
+
+        csr = trnsparse.from_dense(torch.diag(torch.arange(1.0, 6.0)))
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            got = trnsparse.spmv_symmetric(csr, torch.ones(5), uplo="lower")
+        torch.testing.assert_close(got, torch.arange(1.0, 6.0))
+
+    def test_bad_uplo(self):
+        csr = trnsparse.from_dense(torch.eye(3))
+        with pytest.raises(ValueError):
+            trnsparse.spmv_symmetric(csr, torch.ones(3), uplo="U")
+
 
 class TestSparseAdd:
     def test_basic(self):

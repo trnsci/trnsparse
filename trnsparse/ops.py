@@ -23,6 +23,7 @@ sparse tensor) and only the dense data moves.
 from __future__ import annotations
 
 import math
+import warnings
 
 import torch
 
@@ -121,40 +122,86 @@ def spmm(
 def spmv_symmetric(
     A: CSRMatrix, x: torch.Tensor, alpha: float = 1.0, uplo: str = "upper"
 ) -> torch.Tensor:
-    """Symmetric sparse matrix × vector using only stored triangle.
+    """Symmetric sparse matrix × vector using only the `uplo` triangle.
 
     For symmetric matrices (like the overlap matrix S or density P),
-    only half the non-zeros need to be stored. Computes
-    `A @ x + (A_strict_triangle)ᵀ @ x` as two vectorized SpMVs.
+    only half the non-zeros need to be stored. Entries of `A` outside the
+    `uplo` triangle (``"upper"``: col >= row, ``"lower"``: col <= row) are
+    not referenced, as in BLAS ``symv``, so `A` may store one triangle or
+    the full matrix. Computes `T @ x + (T_strict)ᵀ @ x` for the triangle T
+    as two vectorized SpMVs.
+
+    Compatibility: through 0.11.0 `uplo` was ignored, so a matrix storing
+    only the *other* triangle gave the right answer. That case still does:
+    when every stored nonzero off-diagonal entry is in the triangle opposite
+    `uplo`, that triangle is used and a `DeprecationWarning` asks for the
+    matching `uplo` (#52).
     """
     m, n = A.shape
     assert m == n, "Matrix must be square for symmetric SpMV"
+    if uplo not in ("upper", "lower"):
+        raise ValueError(f"uplo must be 'upper' or 'lower'; got {uplo!r}")
+    uplo = _resolve_uplo(A, uplo)
 
     if not _torch_sparse_ok(A, x):
-        return _spmv_symmetric_dense(A, x, alpha)
+        return _spmv_symmetric_dense(A, x, alpha, uplo)
 
     rows = torch.repeat_interleave(torch.arange(m), A.row_ptrs[1:] - A.row_ptrs[:-1])
     cols = A.col_indices
-    strict_mask = rows != cols
-    A_sparse = _as_torch_csr(A)
-
+    # The stored triangle only: entries in the other one were silently used
+    # through 0.11.0, so a fully stored A gave A @ x + strict(A)ᵀ @ x (#52).
+    keep = cols >= rows if uplo == "upper" else cols <= rows
+    r, c, v = rows[keep], cols[keep], A.values[keep]
+    tri = torch.sparse_coo_tensor(torch.stack([r, c]), v, size=A.shape).coalesce()
+    strict_mask = r != c
     strict = torch.sparse_coo_tensor(
-        torch.stack([rows[strict_mask], cols[strict_mask]]),
-        A.values[strict_mask],
+        torch.stack([r[strict_mask], c[strict_mask]]),
+        v[strict_mask],
         size=A.shape,
     ).coalesce()
 
-    return alpha * (A_sparse @ x + strict.t() @ x)
+    return alpha * (tri @ x + strict.t() @ x)
 
 
-def _spmv_symmetric_dense(A: CSRMatrix, x: torch.Tensor, alpha: float) -> torch.Tensor:
+def _resolve_uplo(A: CSRMatrix, uplo: str) -> str:
+    """`uplo`, or the opposite triangle when only that one holds entries.
+
+    Keeps one-triangle callers that relied on `uplo` being ignored (through
+    0.11.0) correct: storing the lower triangle with the default
+    ``uplo="upper"`` would otherwise reference only the diagonal.
+    """
+    row_ptrs = A.row_ptrs.cpu()
+    cols = A.col_indices.cpu()
+    nz = A.values.detach().cpu() != 0
+    rows = torch.repeat_interleave(torch.arange(A.shape[0]), row_ptrs[1:] - row_ptrs[:-1])
+    has_upper = bool(((cols > rows) & nz).any())
+    has_lower = bool(((cols < rows) & nz).any())
+    other = "lower" if uplo == "upper" else "upper"
+    in_uplo, in_other = (has_upper, has_lower) if uplo == "upper" else (has_lower, has_upper)
+    if in_other and not in_uplo:
+        warnings.warn(
+            f"spmv_symmetric: A stores its off-diagonal entries only in the {other} "
+            f"triangle but uplo={uplo!r}; using the {other} triangle. Pass "
+            f"uplo={other!r}. Since 0.12.0 only the uplo triangle is referenced "
+            "when both are stored, and this fallback will be removed (#52).",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+        return other
+    return uplo
+
+
+def _spmv_symmetric_dense(
+    A: CSRMatrix, x: torch.Tensor, alpha: float, uplo: str = "upper"
+) -> torch.Tensor:
     """`spmv_symmetric` for a host CSR and an operand on another device.
 
     The device has no sparse tensors: build the symmetric dense view
-    (stored triangle plus the transpose of its strict part) on the host and
-    move it once.
+    (the `uplo` triangle plus the transpose of its strict part) on the host
+    and move it once.
     """
     D = _csr_to_dense_host(A)
+    D = torch.triu(D) if uplo == "upper" else torch.tril(D)
     strict = D - torch.diag(torch.diagonal(D))
     return alpha * ((D + strict.T).to(x.device) @ x)
 
