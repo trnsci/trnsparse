@@ -329,6 +329,47 @@ class TestTwoCoreAndBf16:
             assert got.dtype == dtype
             assert _rel(got, exp) < tol
 
+    # fp32 gradients at scale 2.0 measure ~1.2e-5 against fp64 on Trn2.
+    @pytest.mark.parametrize("dtype,tol", [(torch.float32, 1e-5), (torch.bfloat16, 3e-2)])
+    @pytest.mark.parametrize("scale", [0.1, 1.0, 2.0])
+    def test_attention_custom_scale(self, scale, dtype, tol):
+        """trnsparse#47: a non-default scale reaches the forward and backward kernels.
+
+        Same shape for every scale in one process, so a trace cache keyed
+        without the scale would reuse the first trace and fail the later ones.
+        """
+        g = torch.Generator().manual_seed(16)
+        seq_len, hd = 3 * P, 64
+        mask = _block_causal_mask(seq_len)
+        Q, K, V, dO = (torch.randn(seq_len, hd, generator=g).to(dtype) for _ in range(4))
+        q64, k64, v64, do64 = (t.double().requires_grad_(True) for t in (Q, K, V, dO))
+        allowed = mask.to_dense().bool()
+        s = (q64 @ k64.T * scale).masked_fill(~allowed, float("-inf"))
+        ref = torch.softmax(s, dim=-1) @ v64
+        ref.backward(do64.detach())
+
+        Qd, Kd, Vd = (t.to(DEV).requires_grad_(True) for t in (Q, K, V))
+        out = trnsparse.block_sparse_attention_tiled(Qd, Kd, Vd, mask, scale=scale)
+        assert _rel(out, ref.detach()) < tol
+        out.backward(dO.to(DEV))
+        for got, exp in ((Qd.grad, q64.grad), (Kd.grad, k64.grad), (Vd.grad, v64.grad)):
+            assert _rel(got, exp) < 5 * tol
+        with torch.no_grad():
+            out2 = trnsparse.block_sparse_attention_tiled(
+                Q.to(DEV), K.to(DEV), V.to(DEV), mask, scale=scale
+            )
+        assert _rel(out2, ref.detach()) < tol
+
+    def test_attention_default_scale_unchanged(self):
+        """scale=None and scale=head_dim**-0.5 give bit-identical results."""
+        g = torch.Generator().manual_seed(17)
+        seq_len, hd = 3 * P, 64
+        mask = _block_causal_mask(seq_len)
+        Q, K, V = (torch.randn(seq_len, hd, generator=g).to(DEV) for _ in range(3))
+        a = trnsparse.block_sparse_attention_tiled(Q, K, V, mask)
+        b = trnsparse.block_sparse_attention_tiled(Q, K, V, mask, scale=hd**-0.5)
+        assert torch.equal(a.cpu(), b.cpu())
+
     def test_attention_bf16_stats_are_fp32(self):
         seq_len, hd = 2 * P, 64
         mask = _block_causal_mask(seq_len)

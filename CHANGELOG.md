@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`block_sparse_attention_tiled` silently ignored a custom `scale` on the
+  NKI paths** (released 0.6.0 through 0.11.0; #47). With `backend="nki"` or
+  `"auto"` on Neuron, the forward and all three gradients always used
+  `head_dim ** -0.5`, and no error was raised. On Trn2 (seq 384, head_dim 64,
+  relative error against dense fp64 attention) the forward was off by 29%
+  (`scale=0.1`), 93% (`1.0`) and 95% (`2.0`), and dQ / dK by up to 99%. The
+  XLA / simulator path (`_AttnTiledFunction` and the no-grad call) was
+  affected from 0.6.0, and the native TorchNeuron `trnsparse::bsr_attn` op
+  from 0.9.0. The PyTorch backend was always correct. `scale` now reaches
+  `nki_bsr_attn_tiled`, `nki_bsr_attn_bwd` and the `bsr_attn` /
+  `bsr_attn_bwd` ops, each of which takes a new optional `scale` argument
+  (default `head_dim ** -0.5`). The kernels are unchanged: they already take
+  `Q * scale`, and the static backward takes `scale` as a kernel argument.
+  With the default `scale=None`, outputs and gradients are bit-identical to
+  0.11.0 on Trn2. `ShardedAttention.shard_rows(Q, scale)` was not affected.
 - `bsr_spmm` and `block_sparse_attention_tiled` with a `block_size` other than
   128 (16, 32 and 64 in the audit) no longer try an NKI kernel first. The
   kernels take 128x128 blocks only, so that trace always failed, and the call

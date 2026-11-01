@@ -6,7 +6,7 @@ NKI forward and the dQ / dK-dV NKI backward on the PyTorch/XLA path. On the
 native path the same pair is two composite custom ops, linked with
 `register_autograd`:
 
-- `trnsparse::bsr_attn(Q, K, V, block_col_indices, block_row_ptrs, block_size)`
+- `trnsparse::bsr_attn(Q, K, V, block_col_indices, block_row_ptrs, block_size, scale=None)`
   -> `(out, row_max, row_denom)`: `dispatch.nki_bsr_attn_tiled`, i.e. the
   `trnsparse::attn_stats` and `trnsparse::attn_out` kernel ops plus the
   host-side softmax reduction.
@@ -53,9 +53,10 @@ def bsr_attn(
     block_col_indices: torch.Tensor,
     block_row_ptrs: torch.Tensor,
     block_size: int,
+    scale: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     mask = _pattern(block_col_indices, block_row_ptrs, Q.shape[0], block_size)
-    out, row_max, row_denom = _d.nki_bsr_attn_tiled(Q, K, V, mask, return_stats=True)
+    out, row_max, row_denom = _d.nki_bsr_attn_tiled(Q, K, V, mask, return_stats=True, scale=scale)
     # Fixed output contract (Q's device; out in Q's dtype, the statistics in
     # `_stats_dtype`) to match the fake.
     sdt = _stats_dtype(Q.dtype)
@@ -67,7 +68,7 @@ def bsr_attn(
 
 
 @bsr_attn.register_fake
-def _bsr_attn_fake(Q, K, V, block_col_indices, block_row_ptrs, block_size):
+def _bsr_attn_fake(Q, K, V, block_col_indices, block_row_ptrs, block_size, scale=None):
     M_tiles = Q.shape[0] // block_size
     sdt = _stats_dtype(Q.dtype)
     return (
@@ -89,22 +90,24 @@ def bsr_attn_bwd(
     block_size: int,
     row_max: torch.Tensor,
     row_denom: torch.Tensor,
+    scale: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     mask = _pattern(block_col_indices, block_row_ptrs, Q.shape[0], block_size)
-    dQ, dK, dV = _d.nki_bsr_attn_bwd(Q, K, V, dO, O, mask, row_max, row_denom)
+    dQ, dK, dV = _d.nki_bsr_attn_bwd(Q, K, V, dO, O, mask, row_max, row_denom, scale=scale)
     return tuple(t.to(device=Q.device, dtype=Q.dtype) for t in (dQ, dK, dV))
 
 
 @bsr_attn_bwd.register_fake
-def _bsr_attn_bwd_fake(Q, K, V, dO, O, block_col_indices, block_row_ptrs, block_size, *stats):
+def _bsr_attn_bwd_fake(Q, K, V, dO, O, block_col_indices, block_row_ptrs, block_size, *rest):
     return torch.empty_like(Q), torch.empty_like(K), torch.empty_like(V)
 
 
 def _bsr_attn_setup_context(ctx, inputs, output):
-    Q, K, V, block_col_indices, block_row_ptrs, block_size = inputs
+    Q, K, V, block_col_indices, block_row_ptrs, block_size, scale = inputs
     out, row_max, row_denom = output
     ctx.save_for_backward(Q, K, V, out, row_max, row_denom, block_col_indices, block_row_ptrs)
     ctx.block_size = block_size
+    ctx.scale = scale
 
 
 def _bsr_attn_backward(ctx, d_out, d_row_max, d_row_denom):
@@ -122,8 +125,9 @@ def _bsr_attn_backward(ctx, d_out, d_row_max, d_row_denom):
         ctx.block_size,
         row_max,
         row_denom,
+        ctx.scale,
     )
-    return dQ, dK, dV, None, None, None
+    return dQ, dK, dV, None, None, None, None
 
 
 bsr_attn.register_autograd(_bsr_attn_backward, setup_context=_bsr_attn_setup_context)

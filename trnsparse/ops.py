@@ -572,7 +572,9 @@ class _AttnTiledFunction(torch.autograd.Function):
         if _use_nki() and _nki_block_ok("block_sparse_attention_tiled", mask_block_size):
             from .nki.dispatch import nki_bsr_attn_tiled
 
-            out, row_max, row_denom = nki_bsr_attn_tiled(Q, K, V, mask_bsr, return_stats=True)
+            out, row_max, row_denom = nki_bsr_attn_tiled(
+                Q, K, V, mask_bsr, return_stats=True, scale=scale
+            )
         else:
             out, row_max, row_denom = _block_sparse_attn_pytorch(
                 Q, K, V, mask_bsr, scale, return_stats=True
@@ -607,7 +609,9 @@ class _AttnTiledFunction(torch.autograd.Function):
         if _use_nki() and _nki_block_ok("block_sparse_attention_tiled", ctx.mask_block_size):
             from .nki.dispatch import nki_bsr_attn_bwd
 
-            dQ, dK, dV = nki_bsr_attn_bwd(Q, K, V, dO, O, mask_bsr, row_max, row_denom)
+            dQ, dK, dV = nki_bsr_attn_bwd(
+                Q, K, V, dO, O, mask_bsr, row_max, row_denom, scale=ctx.scale
+            )
         else:
             dQ, dK, dV = _block_sparse_attn_backward(
                 Q, K, V, O, dO, mask_bsr, ctx.scale, row_max=row_max, row_denom=row_denom
@@ -703,6 +707,7 @@ def block_sparse_attention_tiled(
             mask_bsr.block_col_indices.cpu(),
             mask_bsr.block_row_ptrs.cpu(),
             mask_bsr.block_size,
+            float(scale),
         )
         return out
 
@@ -721,6 +726,6 @@ def block_sparse_attention_tiled(
     if use_nki:
         from .nki.dispatch import nki_bsr_attn_tiled
 
-        return nki_bsr_attn_tiled(Q, K, V, mask_bsr)
+        return nki_bsr_attn_tiled(Q, K, V, mask_bsr, scale=scale)
 
     return _block_sparse_attn_pytorch(Q, K, V, mask_bsr, scale)

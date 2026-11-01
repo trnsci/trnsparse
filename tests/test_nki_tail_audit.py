@@ -162,33 +162,33 @@ def _attn_mask(seq: int, seed: int) -> trnsparse.BSRMatrix:
     return trnsparse.BSRMatrix.from_dense(dense, block_size=P)
 
 
-def _attn_ref(Q, K, V, mask):
+def _attn_ref(Q, K, V, mask, scale=None):
     dense = mask.to_dense().bool()[: Q.shape[0], : Q.shape[0]]
-    s = (Q @ K.T) * Q.shape[1] ** -0.5
+    s = (Q @ K.T) * (Q.shape[1] ** -0.5 if scale is None else scale)
     s = s.masked_fill(~dense, float("-inf"))
     return torch.softmax(s, dim=-1) @ V
 
 
-def case_attn(seq, hd, static=True, backward=False, seed=3):
+def case_attn(seq, hd, static=True, backward=False, seed=3, scale=None):
     import trnsparse.nki.dispatch as d
 
     g = _g(seed)
     Q, K, V = (torch.randn(seq, hd, generator=g, dtype=torch.float64) for _ in range(3))
     mask = _attn_mask(seq, seed)
-    ref = _attn_ref(Q, K, V, mask)
+    ref = _attn_ref(Q, K, V, mask, scale)
     prev = d._STATIC_STRUCTURE
     d._STATIC_STRUCTURE = static
     try:
         if not backward:
             out = trnsparse.block_sparse_attention_tiled(
-                *(t.float().to(DEV) for t in (Q, K, V)), mask
+                *(t.float().to(DEV) for t in (Q, K, V)), mask, scale=scale
             )
             return _rel(out, ref), 1e-4
         dO = torch.randn(seq, hd, generator=g, dtype=torch.float64)
         Qr, Kr, Vr = (t.detach().clone().requires_grad_(True) for t in (Q, K, V))
-        (_attn_ref(Qr, Kr, Vr, mask) * dO).sum().backward()
+        (_attn_ref(Qr, Kr, Vr, mask, scale) * dO).sum().backward()
         Qd, Kd, Vd = (t.float().to(DEV).requires_grad_(True) for t in (Q, K, V))
-        out = trnsparse.block_sparse_attention_tiled(Qd, Kd, Vd, mask)
+        out = trnsparse.block_sparse_attention_tiled(Qd, Kd, Vd, mask, scale=scale)
         (out * dO.float().to(DEV)).sum().backward()
         err = max(_rel(a.grad, b.grad) for a, b in ((Qd, Qr), (Kd, Kr), (Vd, Vr)))
         return err, 1e-3
@@ -308,6 +308,20 @@ for seq, hd in ATTN_SHAPES:
             lambda s=seq, h=hd: case_attn(s, h, static=False, backward=True),
         )
     )
+# Non-default QK scale (trnsparse#47: it was dropped on every NKI path).
+for path, static in (("static", True), ("gather", False)):
+    for direction, bwd in (("fwd", False), ("bwd", True)):
+        for scale in (0.1, 2.0):
+            CASES.append(
+                (
+                    f"attn_{direction}_{path}_scale{scale}",
+                    _s(384, 64),
+                    lambda st=static, b=bwd, sc=scale: case_attn(
+                        384, 64, static=st, backward=b, scale=sc
+                    ),
+                )
+            )
+CASES.append(("attn_fwd_gather_scale0.1", _s(384, 256), lambda: case_attn(384, 256, scale=0.1)))
 for n in FUSED_N:
     for R in (1, 3, 33):
         CASES.append(("cg_bsr_fused", f"n={n},R={R}", lambda n=n, R=R: case_cg(n, R)))
