@@ -134,6 +134,13 @@ class TestBsrDiagonal:
         d = trnsparse.bsr_diagonal(A_bsr)
         torch.testing.assert_close(d, torch.zeros(256))
 
+    def test_diagonal_of_tall_and_wide(self):
+        """Rectangular A gives length min(m, n), like torch.diagonal (#74)."""
+        A_tall = torch.arange(1.0, 97.0).reshape(12, 8)
+        for A_dense in (A_tall, A_tall.T.contiguous()):
+            d = trnsparse.bsr_diagonal(trnsparse.BSRMatrix.from_dense(A_dense, block_size=4))
+            torch.testing.assert_close(d, torch.diagonal(A_dense))
+
 
 class TestRichardsonBsr:
     def test_identity_converges_one_step(self):

@@ -724,14 +724,7 @@ def test_bsr_spmm_transposed_block_view_and_empty():
     assert_close(ts.bsr_spmm(Az, D(torch.ones(256, 4))), torch.zeros(256, 4), torch.float32)
 
 
-_DIAG_XFAIL = pytest.mark.xfail(
-    strict=True, reason="trnsci/trnsparse#74: tall A gives length m, not min(m, n)"
-)
-
-
-@pytest.mark.parametrize(
-    "m,n,b", [(12, 12, 5), (8, 12, 4), pytest.param(12, 8, 4, marks=_DIAG_XFAIL), (129, 129, 128)]
-)
+@pytest.mark.parametrize("m,n,b", [(12, 12, 5), (8, 12, 4), (12, 8, 4), (129, 129, 128)])
 def test_bsr_diagonal(m, n, b):
     Ad = rand_dense(m, n, 0.5, torch.float64, 79) + torch.eye(m, n, dtype=torch.float64)
     assert_close(ts.bsr_diagonal(ts.BSRMatrix.from_dense(Ad, block_size=b)), torch.diagonal(Ad))

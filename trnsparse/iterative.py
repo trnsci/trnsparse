@@ -26,8 +26,11 @@ def bsr_diagonal(A: BSRMatrix) -> torch.Tensor:
     column i). Blocks that aren't diagonal contribute nothing. Returns
     a zero vector if no diagonal block is stored (a fully zero-diagonal
     matrix would be degenerate as a preconditioner anyway).
+
+    For a rectangular (m, n) matrix the result has length min(m, n), as
+    `torch.diagonal` and `scipy.sparse.spmatrix.diagonal` do.
     """
-    m, _ = A.shape
+    m, n = A.shape
     b = A.block_size
     M_tiles = (m + b - 1) // b
     # Find each block row's diagonal block on host copies of the structure,
@@ -49,7 +52,7 @@ def bsr_diagonal(A: BSRMatrix) -> torch.Tensor:
     if rows:
         diag = torch.diagonal(A.blocks[torch.tensor(ks, device=dev)], dim1=-2, dim2=-1)
         out[torch.tensor(rows, device=dev)] = diag
-    return out.reshape(-1)[:m]
+    return out.reshape(-1)[: min(m, n)]
 
 
 def _bsr_matvec(A: BSRMatrix) -> Callable[[torch.Tensor], torch.Tensor]:
