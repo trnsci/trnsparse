@@ -707,6 +707,8 @@ def nki_bsr_spmm(A, B: torch.Tensor) -> torch.Tensor:
         from ..ops import _bsr_spmm_pytorch
 
         return _bsr_spmm_pytorch(A, B)
+    if A.blocks.is_complex() or B.is_complex():
+        return _nki_bsr_spmm_complex(A, B)
     if _native_path():
         out_cols = B.shape[1]
         n_tiles = 1 if out_cols <= _TILE_N else -(-out_cols // _TILE_N)
@@ -728,6 +730,32 @@ def nki_bsr_spmm(A, B: torch.Tensor) -> torch.Tensor:
         A.block_size,
         B,
     )
+
+
+def _nki_bsr_spmm_complex(A, B: torch.Tensor) -> torch.Tensor:
+    """Complex BSR SpMM as real kernel launches (#78).
+
+    The kernels are real-only. Through 0.12.1 the static path cast complex
+    operands to fp32, which silently dropped the imaginary part. Here
+    C_re = Ar·Br − Ai·Bi and C_im = Ar·Bi + Ai·Br, with one launch per real
+    part of A against `[Br | Bi]` (columns side by side), so a complex A and
+    complex B take two launches. `.real` / `.imag` / `torch.complex` are
+    differentiable, so autograd reaches complex `A.blocks` and `B`.
+    """
+    out_dtype = torch.promote_types(A.blocks.dtype, B.dtype)
+    n = B.shape[1]
+    b_parts = torch.cat([B.real, B.imag], dim=1) if B.is_complex() else B
+    blocks = A.blocks
+    a_parts = (blocks.real, blocks.imag) if blocks.is_complex() else (blocks,)
+    prods = [nki_bsr_spmm(_BlockView(A, a), b_parts) for a in a_parts]
+    if not B.is_complex():  # complex A, real B
+        re, im = prods
+    elif len(prods) == 1:  # real A, complex B
+        re, im = prods[0][:, :n], prods[0][:, n:]
+    else:
+        (rr, ri), (ir, ii) = ((p[:, :n], p[:, n:]) for p in prods)
+        re, im = rr - ii, ri + ir
+    return torch.complex(re.contiguous(), im.contiguous()).to(out_dtype)
 
 
 def _bsr_structure_lists(A) -> tuple[list[int], list[int]]:
