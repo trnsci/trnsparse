@@ -1,6 +1,6 @@
 # Installation
 
-## From PyPI (once published)
+## From PyPI
 
 ```bash
 pip install trnsparse

@@ -18,12 +18,16 @@ trnsparse follows the [trnsci 5-phase roadmap](https://trnsci.dev/roadmap/). Act
 
 - **[Phase 1 — correctness](https://github.com/trnsci/trnsparse/issues/14)** ✅ v0.2.0: NKI SpMM validated on trn1 via densify-then-GEMM (see [`trnsci/trnsci#3`](https://github.com/trnsci/trnsci/issues/3)).
 - **v0.3.0** ✅ [`BSRMatrix`](https://trnsci.dev/trnsparse/architecture/) — Trainium-native 128×128 block-sparse format; `bsr_spmm` NKI kernel. CSR becomes interop; BSR is the compute path.
-- **v0.3.2** ✅ `cg_bsr`, `power_iteration_bsr` — iterative solvers over BSR (Python loop; fused kernel gated on NKI capability).
+- **v0.3.2** ✅ `cg_bsr`, `power_iteration_bsr` — iterative solvers over BSR (Python loop; the fused kernel shipped in 0.11.0, below).
 - **v0.4.0** ✅ `screened_spmm` — fused Schwarz-screened SpMM in one NKI dispatch.
 - **v0.4.2** ✅ Block-sparse attention — `BSRMatrix` + `bsr_spmm` as the primitive; `examples/block_sparse_attention.py` + [`docs/sparse_attention.md`](https://trnsci.dev/trnsparse/sparse_attention/).
 - **v0.4.3** ✅ Architecture-friendly alternatives: `chebyshev_bsr` / `richardson_bsr` (fixed-K solvers, no inner products); `block_sparse_attention_tiled` (two-pass, no O(seq²) intermediate).
-- **[Phase 3 — perf](https://github.com/trnsci/trnsparse/issues/15)**: nnz-bucketing, NKI attention kernel pair — parked on NKI indirect DMA gather / hardware validation.
-- **[Phase 4 — multi-chip](https://github.com/trnsci/trnsparse/issues/16)**: sharded BSR across NeuronCores.
+- **v0.4.4–v0.6.0** ✅ NKI attention kernel pair, NKI backward, `head_dim` multiples of 128 (K-tiling).
+- **v0.8.0–v0.9.0** ✅ Native TorchNeuron path (Trn2/Trn3): static-structure BSR SpMM and attention kernels, split across both LNC=2 cores, bf16 operands on fp32 PSUM.
+- **v0.10.0** ✅ `ShardedBSR` / `ShardedAttention` across the logical NeuronCores of one chip; pre-transposed BSR SpMM beats dense aten up to ~82–98% block density on one core.
+- **v0.11.0** ✅ `cg_bsr_fused` / `prepare_cg_bsr` — one-launch CG and block-Jacobi PCG with A in SBUF (5–56× faster than CPU on Trn2), `power_iteration_bsr_fused`.
+- **[Phase 3 — perf](https://github.com/trnsci/trnsparse/issues/15)**: nnz-bucketing CSR, streaming large-sparse — parked on NKI indirect DMA gather.
+- **[Phase 4 — multi-chip](https://github.com/trnsci/trnsparse/issues/16)**: sharded BSR across chips (within one chip: `ShardedBSR`, v0.10.0).
 - **[Phase 5 — generation](https://github.com/trnsci/trnsparse/issues/17)**: trn2 DMA bandwidth exploitation.
 
 _(No Phase 2 for trnsparse — precision inherited from trnblas.)_
@@ -90,10 +94,10 @@ stats = trnsparse.sparsity_stats(Q)
 | Operation | Description |
 |-----------|-------------|
 | `spmv` | Sparse × dense vector (CSR) |
-| `spmm` | Sparse × dense matrix (CSR, PyTorch fallback) |
-| `bsr_spmm` | Block-sparse × dense (BSR-native, Tensor Engine) |
+| `spmm` | Sparse × dense matrix (CSR; densify-then-GEMM on NKI, `torch.sparse` otherwise) |
+| `bsr_spmm` | Block-sparse × dense (BSR-native, Tensor Engine; NKI at `block_size=128`, other sizes run on PyTorch) |
 | `screened_spmm` | Fused Schwarz-screened matmul (one NKI dispatch) |
-| `spmv_symmetric` | Symmetric SpMV (half storage) |
+| `spmv_symmetric` | Symmetric SpMV; references only the `uplo` triangle, as in BLAS `symv` (0.12.1) |
 | `sparse_add` | C = αA + βB |
 | `sparse_scale` | B = αA |
 | `sparse_transpose` | Aᵀ |
@@ -104,8 +108,9 @@ stats = trnsparse.sparsity_stats(Q)
 | `power_iteration_bsr` | Dominant eigenpair via power iteration |
 | `power_iteration_bsr_fused` | Power iteration in one launch (the fused CG kernel's machinery) |
 | `jacobi_preconditioner_bsr` | Diagonal preconditioner for `cg_bsr` |
+| `ShardedBSR` / `ShardedAttention` | BSR SpMM / attention forward split across logical NeuronCores (`trnsparse.multicore`) |
 | `bsr_diagonal` | Extract main diagonal from BSR matrix |
-| `block_sparse_attention_tiled` | Two-pass sparse attention, no O(seq²) intermediate |
+| `block_sparse_attention_tiled` | Two-pass sparse attention, no O(seq²) intermediate, autograd; `seq_len` must be a multiple of the block size |
 | `schwarz_bounds` | Schwarz screening bounds |
 | `screen_quartets` | Shell quartet significance mask |
 | `density_screen` | Density-weighted screening |

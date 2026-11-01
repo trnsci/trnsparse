@@ -117,7 +117,8 @@ def block_sparse_attention(Q, K, V, mask_bsr):
 
 **What this materializes**: the full `(seq_len, seq_len)` score matrix. At
 `seq_len=4096` that's 64 MB of float32 even before the matmul. See
-[What's next](#whats-next) for the fused-tile path that avoids this.
+[the tiled two-pass path](#tiled-two-pass-path-v043) for the version that
+avoids this.
 
 **Gradients**: `bsr_spmm` is differentiable (see `architecture.md`). The
 backward through `block_sparse_attention` works out-of-the-box with
@@ -169,7 +170,22 @@ the output via a PSUM-style loop.
 
 ```python
 out = trnsparse.block_sparse_attention_tiled(Q, K, V, mask_bsr)
+out = trnsparse.block_sparse_attention_tiled(Q, K, V, mask_bsr, scale=0.1)
 ```
+
+`scale` defaults to `head_dim ** -0.5`. A custom `scale` is honored on every
+backend since 0.12.0; in 0.6.0–0.11.0 the NKI paths silently ignored it.
+
+`seq_len` must be a multiple of `mask_bsr.block_size`; otherwise the call
+raises `ValueError` on every backend (0.11.0). Through 0.10.0 the PyTorch
+path silently left the query rows of a partial last block at zero. To
+handle a ragged length, pad Q, K and V to a whole block and mask the padded
+keys out (-inf scores), not just zero-pad them. `ShardedAttention` has the
+same requirement.
+
+The NKI kernels take `block_size=128` only. Other block sizes run on the
+PyTorch path (correct, without NKI), or raise `NotImplementedError` under
+`TRNSPARSE_REQUIRE_NKI=1`.
 
 Memory: `n_stored_blocks × block_size × 4` bytes for stats (5 KB at seq_len=512,
 window=1) vs `seq_len² × 4` bytes for the naive dense score matrix (1 MB at
@@ -203,7 +219,13 @@ two-pass decomposition in `trnsparse/nki/kernels.py`:
   `weights @ V` into a PSUM tile that spans all ki blocks.
 
 **Constraint:** `head_dim ≤ 128` in v0.4.4 (`nc_matmul` partition limit).
-`head_dim=256` requires K-tiling and is a follow-up.
+Since 0.6.0 the kernels also take any `head_dim` that is a multiple of 128
+(256, 512) by K-tiling into the same PSUM accumulator.
+
+On the native TorchNeuron path (0.8.0+) the forward is one static-structure
+launch (the static-structure attention-forward kernel) with the softmax statistics kept on
+chip, so there is no host reduction between the passes. See
+[architecture](architecture.md#static-structure-on-the-native-path-trn2trn3).
 
 A runnable reference for both the naive and tiled paths is in
 [`examples/block_sparse_attention.py`](https://github.com/trnsci/trnsparse/blob/main/examples/block_sparse_attention.py).
@@ -230,5 +252,8 @@ For each stored block (m, ki):
 `torch.autograd.gradcheck` passes at `atol=1e-3` for local-window and dilated
 patterns (float64, seq_len=256, head_dim=32).
 
-**NKI backward kernel** is a follow-up (v0.5.x). The current backward runs on
-CPU/PyTorch even when the forward used the NKI kernel pair.
+**NKI backward kernels** shipped in 0.5.1 (`_attn_bwd_dq_kernel` +
+`_attn_bwd_dkdv_kernel`). On the native path the backward is one
+static-structure launch (`trnsparse::attn_bwd_static`) for dQ and dK/dV, attached to the
+`trnsparse::bsr_attn` op with `register_autograd`. The PyTorch backend keeps
+the reference backward above.
