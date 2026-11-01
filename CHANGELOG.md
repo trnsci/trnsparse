@@ -7,7 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`block_sparse_attention_tiled` silently returned zero rows for a partial
+  last block** (released 0.6.0 through 0.10.0, PyTorch path). With
+  `seq_len % block_size != 0` the query rows past the last whole block were
+  left at 0 (seq_len 200, block 128: rows 128-199 zero, max error 0.79). It now
+  raises `ValueError` on every backend; partial blocks need -inf key masking,
+  not zero padding. `ShardedAttention` raises the same error.
+- `ShardedBSR.gather` (0.10.0) raised a `RuntimeError` from `view` when the row
+  count was not a multiple of 128. It now gathers at the padded row count and
+  slices back.
+
 ### Added
+
+- `tests/test_nki_tail_audit.py`: every NKI kernel (CSR and BSR SpMM, screened
+  SpMM, attention, fused CG and power iteration) at awkward sizes (1, 127, 129,
+  200, 1000, 4097; odd N; free dims not a multiple of 512) against fp64
+  references (trnsci/trnsci#35).
 
 #### Fused SBUF-resident CG (#22)
 
