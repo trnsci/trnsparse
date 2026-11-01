@@ -22,6 +22,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - README: known platform issue note for #1454.
 ### Fixed
 
+- **`bsr_spmm` dropped the imaginary part of complex operands on the NKI
+  backend** (silent, #78). The static-structure kernel path cast complex
+  blocks and `B` to fp32 and the result back to complex, so the imaginary
+  part was zero and the value was wrong. Affects 0.8.0 through 0.12.1 on
+  Trainium with `block_size=128`. Complex operands now run as real kernel
+  launches: one per real part of A, against `[Re B | Im B]`. Autograd works
+  through them. Found by the conformance suite on Trn2 (trnsci/trnsci#35).
 - **`bsr_diagonal` returned length m for a tall matrix** (silent; every
   release 0.3.2–0.12.1, every backend). For a rectangular (m, n) BSR matrix
   with m > n the result was zero-padded to length m; it now has length
