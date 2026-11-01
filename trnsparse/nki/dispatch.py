@@ -1042,6 +1042,7 @@ def nki_bsr_attn_tiled(
     V: torch.Tensor,
     mask_bsr,
     return_stats: bool = False,
+    scale: float | None = None,
 ):
     """Two-pass block-sparse attention via NKI kernel pair.
 
@@ -1059,6 +1060,8 @@ def nki_bsr_attn_tiled(
         return_stats: If True, returns (out, row_max, row_denom) where row_max
                       and row_denom have shape (M_tiles, block_size). Used by
                       `_AttnTiledFunction.forward` to save stats for backward.
+        scale:        QK scale; None means head_dim ** -0.5. Applied to Q on
+                      the host/device before the kernels (they take Q * scale).
 
     Returns:
         (seq_len, head_dim) attention output, or a 3-tuple when return_stats=True.
@@ -1067,7 +1070,7 @@ def nki_bsr_attn_tiled(
         raise RuntimeError("NKI not available")
 
     seq_len, head_dim = Q.shape
-    scale = head_dim**-0.5
+    scale = head_dim**-0.5 if scale is None else float(scale)
 
     if not _nki_block_ok("block_sparse_attention_tiled", mask_bsr.block_size):
         from ..ops import _block_sparse_attn_pytorch
@@ -1149,10 +1152,9 @@ def nki_bsr_attn_tiled(
         # PyTorch fallback — import lazily to avoid circular dependency.
         from ..ops import _block_sparse_attn_pytorch
 
-        scale_val = head_dim**-0.5
         if return_stats:
-            return _block_sparse_attn_pytorch(Q, K, V, mask_bsr, scale_val, return_stats=True)
-        return _block_sparse_attn_pytorch(Q, K, V, mask_bsr, scale_val)
+            return _block_sparse_attn_pytorch(Q, K, V, mask_bsr, scale, return_stats=True)
+        return _block_sparse_attn_pytorch(Q, K, V, mask_bsr, scale)
 
 
 def _nki_attn_fwd_static(Q, K, V, mask_bsr, scale: float, return_stats: bool):
@@ -1401,12 +1403,15 @@ def nki_bsr_attn_bwd(
     mask_bsr,
     row_max: torch.Tensor,
     row_denom: torch.Tensor,
+    scale: float | None = None,
 ) -> tuple:
     """NKI backward pass for block-sparse tiled attention.
 
     Runs two NKI kernels:
       1. `_attn_bwd_dq_kernel`   — row-first, computes dQ.
       2. `_attn_bwd_dkdv_kernel` — column-first, computes dK and dV.
+
+    `scale` must be the forward's QK scale (None means head_dim ** -0.5).
 
     Returns:
         (dQ, dK, dV) — same shape as (Q, K, V).
@@ -1416,7 +1421,7 @@ def nki_bsr_attn_bwd(
 
     seq_len, head_dim = Q.shape
     b = mask_bsr.block_size
-    scale = head_dim**-0.5
+    scale = head_dim**-0.5 if scale is None else float(scale)
 
     if not _nki_block_ok("block_sparse_attention_tiled backward", b):
         from ..ops import _block_sparse_attn_backward

@@ -912,6 +912,26 @@ class TestNativePathOnCpu:
         for g_, w_ in zip(got, want, strict=True):
             torch.testing.assert_close(g_, w_, atol=1e-4, rtol=1e-4)
 
+    @pytest.mark.parametrize("scale", [0.1, 1.0, 2.0])
+    def test_attention_static_custom_scale(self, cpu_native, scale):
+        """trnsparse#47: the static kernels see Q * scale and the dQ scale."""
+        from trnsparse.ops import _block_sparse_attn_backward, _block_sparse_attn_pytorch
+
+        torch.manual_seed(15)
+        seq_len, hd = 3 * P, 64
+        pattern = torch.tril(torch.ones(3, 3)).repeat_interleave(P, 0).repeat_interleave(P, 1)
+        mask = trnsparse.BSRMatrix.from_dense(pattern, block_size=P)
+        Q, K, V, dO = (torch.randn(seq_len, hd) for _ in range(4))
+        out, rm, rd = dispatch.nki_bsr_attn_tiled(Q, K, V, mask, return_stats=True, scale=scale)
+        ref, rm_ref, rd_ref = _block_sparse_attn_pytorch(Q, K, V, mask, scale, return_stats=True)
+        torch.testing.assert_close(out, ref, atol=1e-4, rtol=1e-4)
+        got = dispatch.nki_bsr_attn_bwd(Q, K, V, dO, out, mask, rm, rd, scale=scale)
+        want = _block_sparse_attn_backward(
+            Q, K, V, ref, dO, mask, scale, row_max=rm_ref, row_denom=rd_ref
+        )
+        for g_, w_ in zip(got, want, strict=True):
+            torch.testing.assert_close(g_, w_, atol=1e-4, rtol=1e-4)
+
     def test_static_kernels_bf16_operand_contract(self, cpu_native, monkeypatch):
         """bf16 inputs reach the static kernels as bf16 operands; statistics stay fp32."""
         seen = {}
@@ -1004,14 +1024,14 @@ class TestNativeAttentionOps:
         from trnsparse.nki import _native_attn  # registers once per process
         from trnsparse.ops import _block_sparse_attn_backward, _block_sparse_attn_pytorch
 
-        def fwd(Q, K, V, mask, return_stats=False):
-            return _block_sparse_attn_pytorch(
-                Q, K, V, mask, Q.shape[1] ** -0.5, return_stats=return_stats
-            )
+        def fwd(Q, K, V, mask, return_stats=False, scale=None):
+            scale = Q.shape[1] ** -0.5 if scale is None else scale
+            return _block_sparse_attn_pytorch(Q, K, V, mask, scale, return_stats=return_stats)
 
-        def bwd(Q, K, V, dO, O, mask, row_max, row_denom):
+        def bwd(Q, K, V, dO, O, mask, row_max, row_denom, scale=None):
+            scale = Q.shape[1] ** -0.5 if scale is None else scale
             return _block_sparse_attn_backward(
-                Q, K, V, O, dO, mask, Q.shape[1] ** -0.5, row_max=row_max, row_denom=row_denom
+                Q, K, V, O, dO, mask, scale, row_max=row_max, row_denom=row_denom
             )
 
         monkeypatch.setattr(dispatch, "nki_bsr_attn_tiled", fwd)
@@ -1046,6 +1066,34 @@ class TestNativeAttentionOps:
             ref = trnsparse.block_sparse_attention_tiled(Qr, Kr, Vr, mask)
         finally:
             trnsparse.set_backend(prev)
+        ref.backward(g)
+        torch.testing.assert_close(out, ref)
+        for got, exp in ((Q.grad, Qr.grad), (K.grad, Kr.grad), (V.grad, Vr.grad)):
+            torch.testing.assert_close(got, exp)
+
+    @pytest.mark.parametrize("scale", [0.1, 1.0, 2.0])
+    def test_custom_scale_reaches_op_and_backward(self, attn, scale, monkeypatch):
+        """trnsparse#47: a non-default scale reaches bsr_attn and bsr_attn_bwd."""
+        torch.manual_seed(14)
+        seq_len, hd = 3 * P, 32
+        mask = self._mask(seq_len)
+        Q, K, V = (torch.randn(seq_len, hd, requires_grad=True) for _ in range(3))
+        Qr, Kr, Vr = (t.detach().clone().requires_grad_(True) for t in (Q, K, V))
+        prev = trnsparse.get_backend()
+        trnsparse.set_backend("pytorch")
+        try:
+            ref = trnsparse.block_sparse_attention_tiled(Qr, Kr, Vr, mask, scale=scale)
+        finally:
+            trnsparse.set_backend(prev)
+
+        monkeypatch.setattr(dispatch, "HAS_NKI", True)
+        monkeypatch.setattr(dispatch, "_USE_SIMULATOR", False)
+        monkeypatch.setattr(dispatch, "_backend", "nki")
+        monkeypatch.setattr(dispatch, "_dispatch_path", "native")
+        monkeypatch.setattr(dispatch, "_native_ops", {"bsr_attn": torch.ops.trnsparse.bsr_attn})
+        out = trnsparse.block_sparse_attention_tiled(Q, K, V, mask, scale=scale)
+        g = torch.randn_like(out)
+        out.backward(g)
         ref.backward(g)
         torch.testing.assert_close(out, ref)
         for got, exp in ((Q.grad, Qr.grad), (K.grad, Kr.grad), (V.grad, Vr.grad)):
