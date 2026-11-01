@@ -206,6 +206,38 @@ class TestChebyshevBsr:
         assert abs(alpha[0].item() - 1.0 / d) < 1e-5
         assert abs(beta[0].item()) < 1e-6  # first step has no momentum
 
+    @pytest.mark.parametrize("K", [1, 2, 3, 7, 30])
+    @pytest.mark.parametrize("bounds", [(0.5, 4.0), (1e-2, 1.0)])
+    def test_residual_is_scaled_chebyshev(self, K, bounds):
+        """Residual polynomial is T_K((d - lam)/c) / T_K(d/c) and meets the
+        bound 2 / (q^K + q^-K) (#73). Dense reference, A = diag(lam), b = 1."""
+        lam_min, lam_max = bounds
+        d, c = (lam_max + lam_min) / 2, (lam_max - lam_min) / 2
+        alpha, beta = trnsparse.chebyshev_coeffs(lam_min, lam_max, K)
+        lam = torch.linspace(lam_min, lam_max, 65, dtype=torch.float64)
+        A = torch.diag(lam)
+        b = torch.ones(65, dtype=torch.float64)
+        x_prev = x = torch.zeros(65, dtype=torch.float64)
+        for k in range(K):
+            r = b - A @ x
+            x, x_prev = x + float(alpha[k]) * r + float(beta[k]) * (x - x_prev), x
+        res = b - A @ x
+        T = np.polynomial.chebyshev.Chebyshev.basis(K)
+        ref = torch.from_numpy(T(((d - lam) / c).numpy()) / T(d / c))
+        torch.testing.assert_close(res, ref, atol=1e-6, rtol=0)
+        kappa = lam_max / lam_min
+        q = (kappa**0.5 + 1) / (kappa**0.5 - 1)
+        bound = 2 / (q**K + q**-K)
+        assert res.abs().max().item() <= bound * (1 + 1e-4)  # fp32 coefficients
+        # The bound is attained (equioscillation) at the Chebyshev extrema.
+        assert res.abs().max().item() >= bound * (1 - 1e-2)
+
+    def test_coeffs_degenerate_interval(self):
+        """lam_min == lam_max: one step at 1/d is exact, no division by zero."""
+        alpha, beta = trnsparse.chebyshev_coeffs(2.0, 2.0, 4)
+        torch.testing.assert_close(alpha, torch.full((4,), 0.5))
+        torch.testing.assert_close(beta, torch.zeros(4))
+
     def test_lower_residual_than_richardson_same_K(self):
         """For well-conditioned SPD, Chebyshev beats Richardson at same K."""
         n = 128

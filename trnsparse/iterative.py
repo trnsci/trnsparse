@@ -168,12 +168,26 @@ def chebyshev_coeffs(
 
         x_{k+1} = x_k + alpha[k] * r_k + beta[k] * (x_k - x_{k-1})
 
-    (with r_k = b - A @ x_k) minimises the Chebyshev residual polynomial
-    over [lam_min, lam_max] after K steps.
+    (with r_k = b - A @ x_k) gives the residual r_K = p_K(A) r_0 with
 
-    Algorithm: Templates for the Solution of Linear Systems (Barrett et
-    al. 1994), Algorithm 2.1 converted from direction-vector form to the
-    momentum / heavy-ball form. c = half-range, d = centre.
+        p_K(lam) = T_K((d - lam) / c) / T_K(d / c),
+
+    the scaled Chebyshev polynomial, which has the smallest maximum
+    modulus on [lam_min, lam_max] among degree-K polynomials with
+    p_K(0) = 1. So max |p_K| on the interval is 1 / T_K(d / c)
+    = 2 / (q^K + q^-K), q = (sqrt(kappa) + 1) / (sqrt(kappa) - 1),
+    kappa = lam_max / lam_min.
+
+    Algorithm: Saad, *Iterative Methods for Sparse Linear Systems* (2nd
+    ed.), Algorithm 12.1 (Chebyshev acceleration), with c = half-range,
+    d = centre, sigma = d / c:
+
+        rho_0 = 1 / sigma,  rho_k = 1 / (2 sigma - rho_{k-1})
+        x_1 = x_0 + r_0 / d
+        x_{k+1} = x_k + rho_k rho_{k-1} (x_k - x_{k-1}) + (2 rho_k / c) r_k
+
+    so alpha[0] = 1 / d, beta[0] = 0, and for k >= 1
+    alpha[k] = 2 rho_k / c, beta[k] = rho_k rho_{k-1}.
 
     Args:
         lam_min: Lower eigenvalue bound (must be > 0 for SPD A).
@@ -181,30 +195,31 @@ def chebyshev_coeffs(
         K: Number of iterations for which coefficients are needed.
 
     Returns:
-        (alpha, beta): float32 tensors of length K.
+        (alpha, beta): float32 tensors of length K (computed in float64).
     """
     c = (lam_max - lam_min) / 2.0  # half-range
     d = (lam_max + lam_min) / 2.0  # centre
 
     alpha = torch.zeros(K, dtype=torch.float64)
     beta = torch.zeros(K, dtype=torch.float64)
+    if K == 0:
+        return alpha.float(), beta.float()
 
-    # k=0: pure Richardson at the optimal single-step rate.
-    alpha_prev = 1.0 / d
-    alpha[0] = alpha_prev
-    beta[0] = 0.0
+    # k=0: Richardson step at the centre of the interval.
+    alpha[0] = 1.0 / d
+    if c == 0.0:
+        # Single-point spectrum: one step with 1/d is exact; later steps
+        # are the limit c -> 0 of the recurrence (alpha = 1/d, beta = 0).
+        alpha[1:] = 1.0 / d
+        return alpha.float(), beta.float()
 
+    sigma = d / c
+    rho_prev = 1.0 / sigma
     for k in range(1, K):
-        # Templates step: beta_t = (c * alpha_prev / 2)^2
-        #                  alpha_new = 1 / (d - beta_t / alpha_prev)
-        beta_t = (c * alpha_prev / 2.0) ** 2
-        alpha_new = 1.0 / (d - beta_t / alpha_prev)
-        # Convert to momentum form:
-        #   alpha_k^(momentum) = alpha_new
-        #   beta_k^(momentum)  = alpha_new * beta_t / alpha_prev
-        alpha[k] = alpha_new
-        beta[k] = alpha_new * beta_t / alpha_prev
-        alpha_prev = alpha_new
+        rho = 1.0 / (2.0 * sigma - rho_prev)
+        alpha[k] = 2.0 * rho / c
+        beta[k] = rho * rho_prev
+        rho_prev = rho
 
     return alpha.float(), beta.float()
 
