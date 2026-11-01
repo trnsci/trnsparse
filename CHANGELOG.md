@@ -13,9 +13,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   0.11.0**, on every backend. Every stored entry was used, so a fully stored
   symmetric matrix (or any entry outside the intended triangle) gave
   `A @ x + strict(A)ᵀ @ x` with no error (rel. err 0.85–1.9 on a 20×20 test).
-  Only the `uplo` triangle is referenced now, as in BLAS `symv`, on the host
-  and device paths; other `uplo` values raise. One-triangle storage gives the
-  same results as before (#52).
+  When both triangles hold entries, only the `uplo` triangle is now
+  referenced, as in BLAS `symv`, on the host and device paths. Other `uplo`
+  values raise. Callers that store one triangle get the same results as
+  before, including those whose `uplo` names the *other* triangle (the old
+  code ignored it): that triangle is still used, now with a
+  `DeprecationWarning` asking for the matching `uplo` (#52).
 
 - **`block_sparse_attention_tiled` silently ignored a custom `scale` on the
   NKI paths** (released 0.6.0 through 0.11.0; #47). With `backend="nki"` or

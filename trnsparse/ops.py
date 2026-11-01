@@ -23,6 +23,7 @@ sparse tensor) and only the dense data moves.
 from __future__ import annotations
 
 import math
+import warnings
 
 import torch
 
@@ -129,11 +130,18 @@ def spmv_symmetric(
     not referenced, as in BLAS ``symv``, so `A` may store one triangle or
     the full matrix. Computes `T @ x + (T_strict)ᵀ @ x` for the triangle T
     as two vectorized SpMVs.
+
+    Compatibility: through 0.11.0 `uplo` was ignored, so a matrix storing
+    only the *other* triangle gave the right answer. That case still does:
+    when every stored nonzero off-diagonal entry is in the triangle opposite
+    `uplo`, that triangle is used and a `DeprecationWarning` asks for the
+    matching `uplo` (#52).
     """
     m, n = A.shape
     assert m == n, "Matrix must be square for symmetric SpMV"
     if uplo not in ("upper", "lower"):
         raise ValueError(f"uplo must be 'upper' or 'lower'; got {uplo!r}")
+    uplo = _resolve_uplo(A, uplo)
 
     if not _torch_sparse_ok(A, x):
         return _spmv_symmetric_dense(A, x, alpha, uplo)
@@ -153,6 +161,34 @@ def spmv_symmetric(
     ).coalesce()
 
     return alpha * (tri @ x + strict.t() @ x)
+
+
+def _resolve_uplo(A: CSRMatrix, uplo: str) -> str:
+    """`uplo`, or the opposite triangle when only that one holds entries.
+
+    Keeps one-triangle callers that relied on `uplo` being ignored (through
+    0.11.0) correct: storing the lower triangle with the default
+    ``uplo="upper"`` would otherwise reference only the diagonal.
+    """
+    row_ptrs = A.row_ptrs.cpu()
+    cols = A.col_indices.cpu()
+    nz = A.values.detach().cpu() != 0
+    rows = torch.repeat_interleave(torch.arange(A.shape[0]), row_ptrs[1:] - row_ptrs[:-1])
+    has_upper = bool(((cols > rows) & nz).any())
+    has_lower = bool(((cols < rows) & nz).any())
+    other = "lower" if uplo == "upper" else "upper"
+    in_uplo, in_other = (has_upper, has_lower) if uplo == "upper" else (has_lower, has_upper)
+    if in_other and not in_uplo:
+        warnings.warn(
+            f"spmv_symmetric: A stores its off-diagonal entries only in the {other} "
+            f"triangle but uplo={uplo!r}; using the {other} triangle. Pass "
+            f"uplo={other!r}. Since 0.12.0 only the uplo triangle is referenced "
+            "when both are stored, and this fallback will be removed (#52).",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+        return other
+    return uplo
 
 
 def _spmv_symmetric_dense(
