@@ -33,6 +33,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `torch.sparse_coo_tensor` and `scipy.sparse` sum them. This also affected
   `CSRMatrix.to_coo().to_dense()` for a CSR with a repeated column in a row.
   Duplicates are now summed; matrices without duplicates are unchanged (#56).
+- **`chebyshev_coeffs` / `chebyshev_bsr` did not produce the Chebyshev
+  polynomial for K >= 2** (silent; every release 0.4.3–0.12.1, every
+  backend, host-side coefficients). The conversion from the Templates
+  listing used beta_1 = (c alpha_0 / 2)^2 instead of the special-case
+  ½(c alpha_0)^2, and every later coefficient inherited the error, so the
+  worst-case residual after K steps was up to ~3x the Chebyshev bound
+  (K = 7). The coefficients now follow Saad's three-term recurrence
+  (Alg. 12.1) and the residual is T_K((d - lam)/c) / T_K(d/c) (#73).
 ### Fixed
 
 - **`from_scipy` discarded the imaginary part of complex matrices** (silent;

@@ -1012,12 +1012,6 @@ def test_cg_bsr_fused_rejects_bad_kwargs():
         )
 
 
-_CHEB_XFAIL = pytest.mark.xfail(
-    strict=True,
-    reason="trnsci/trnsparse#73: chebyshev_coeffs residual polynomial is not Chebyshev for K >= 2",
-)
-
-
 def _cheb_residual_ref(lam, lmin, lmax, K):
     """Scaled Chebyshev residual polynomial T_K((d - lam)/c) / T_K(d/c)."""
     d, c = (lmax + lmin) / 2, (lmax - lmin) / 2
@@ -1025,9 +1019,7 @@ def _cheb_residual_ref(lam, lmin, lmax, K):
     return torch.from_numpy(T(((d - lam) / c).numpy()) / T(d / c))
 
 
-@pytest.mark.parametrize(
-    "K", [1, pytest.param(2, marks=_CHEB_XFAIL), pytest.param(7, marks=_CHEB_XFAIL)]
-)
+@pytest.mark.parametrize("K", [1, 2, 7])
 @pytest.mark.parametrize("bounds", [(0.5, 4.0), (1e-2, 1.0)])
 def test_chebyshev_coeffs(K, bounds):
     lmin, lmax = bounds
@@ -1038,10 +1030,12 @@ def test_chebyshev_coeffs(K, bounds):
     x_prev = x = torch.zeros_like(lam)
     for k in range(K):
         x, x_prev = x + float(alpha[k]) * (1 - lam * x) + float(beta[k]) * (x - x_prev), x
-    assert_close(1 - lam * x, _cheb_residual_ref(lam, lmin, lmax, K), tol=1e-6)
+    # alpha/beta are float32 (the documented return dtype); their rounding
+    # perturbs p_K by a few K * u32 relative to max |p_K| (1.05e-6 measured at
+    # K = 7, kappa = 100), so the tolerance is float32-coefficient level.
+    assert_close(1 - lam * x, _cheb_residual_ref(lam, lmin, lmax, K), tol=4e-6)
 
 
-@_CHEB_XFAIL
 def test_chebyshev_bsr_fixed_k_residual():
     # Small fixed K (the smoother use): the residual must meet the Chebyshev bound.
     A, Ad = spd_bsr(64, 8, band=2)
