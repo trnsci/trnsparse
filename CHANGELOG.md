@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] — 2026-11-01
+
+Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
+
+Headline: fused CG/PCG (`cg_bsr_fused`) with a column matvec is 5–56× faster than CPU, and the fixed per-iteration cost is halved (#41, #43); fused power iteration (#41). **Fix:** in 0.6.0–0.10.0, `block_sparse_attention_tiled` silently returned zero rows for a partial last block on the PyTorch path; it now raises (#44). A host `BSRMatrix` with device `b` in `cg_bsr_fused` now works (#42).
+
 ### Fixed
 
 - **`block_sparse_attention_tiled` silently returned zero rows for a partial
