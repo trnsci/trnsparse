@@ -307,6 +307,10 @@ def bsr_spmm(A: BSRMatrix, B: torch.Tensor) -> torch.Tensor:
 
     On PyTorch backend: the reference loop in `_bsr_spmm_pytorch`.
 
+    The NKI kernels take `block_size=128` only. Other block sizes use the
+    PyTorch path on every backend, or raise `NotImplementedError` under
+    `TRNSPARSE_REQUIRE_NKI` (#46).
+
     Placement (native TorchNeuron): `A.block_row_ptrs` and
     `A.block_col_indices` on the host; `A.blocks` and `B` on the host or on
     `neuron`. The result is on B's device.
@@ -724,6 +728,10 @@ def block_sparse_attention_tiled(
 
     Returns:
         (seq_len, head_dim) attention output.
+
+    Raises:
+        ValueError: if seq_len is not a multiple of `mask_bsr.block_size`
+            (0.11.0; pad Q/K/V and mask the padded keys out yourself).
     """
     seq_len, head_dim = Q.shape
     b = mask_bsr.block_size

@@ -9,14 +9,14 @@ import trnsparse
 # From a dense tensor (zeros dropped)
 dense = torch.randn(512, 512)
 dense[dense.abs() < 0.5] = 0.0
-A = trnsparse.CSRMatrix.from_dense(dense)
+A = trnsparse.from_dense(dense)
 print(f"density: {A.nnz / (A.shape[0] * A.shape[1]):.2%}")
 
 # From explicit COO triples
 rows = torch.tensor([0, 1, 2])
 cols = torch.tensor([1, 2, 0])
 vals = torch.tensor([1.0, 2.0, 3.0])
-B = trnsparse.COOMatrix(rows, cols, vals, shape=(3, 3))
+B = trnsparse.COOMatrix(values=vals, row_indices=rows, col_indices=cols, shape=(3, 3))
 ```
 
 ## SpMV and SpMM
