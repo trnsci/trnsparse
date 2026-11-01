@@ -359,6 +359,44 @@ def _kernel_dtype(*ts: torch.Tensor) -> torch.dtype:
     return torch.bfloat16 if all(t.dtype == torch.bfloat16 for t in ts) else torch.float32
 
 
+def _attn_operands(kdt: torch.dtype, *ts: torch.Tensor) -> tuple[torch.Tensor, ...]:
+    """Gather-attention operands in the kernel dtype `kdt` (from `_kernel_dtype`).
+
+    The gather kernels, like the static ones, need every matmul operand of a
+    call in one dtype (#49). Lower-precision operands of a mixed call are
+    upcast (lossless); fp64 is left for `_kernel_input` to downcast, as before.
+    """
+    return tuple(t if t.dtype in (kdt, torch.float64) else t.to(kdt) for t in ts)
+
+
+def _stat_input(t: torch.Tensor) -> torch.Tensor:
+    """Softmax statistics / D for the gather kernels: fp32 (fp64 downcast as before)."""
+    return t if t.dtype == torch.float32 else t.float()
+
+
+def _acc_dtype(dtype: torch.dtype) -> torch.dtype:
+    """Host arithmetic dtype for scale and D = rowsum(dO * O): at least fp32."""
+    return torch.promote_types(dtype, torch.float32)
+
+
+def _sim_np(t: torch.Tensor) -> np.ndarray:
+    """Host numpy view of a kernel operand for `nki.simulate` (bf16 via ml_dtypes)."""
+    t = t.detach().cpu().contiguous()
+    if t.dtype == torch.bfloat16:
+        import ml_dtypes
+
+        return t.view(torch.int16).numpy().view(ml_dtypes.bfloat16)
+    return t.numpy()
+
+
+def _sim_torch(a, device) -> torch.Tensor:
+    """`nki.simulate` output as a torch tensor (bf16 arrays widen to fp32, exactly)."""
+    a = np.asarray(a)
+    if a.dtype.name == "bfloat16":
+        a = a.astype(np.float32)
+    return torch.from_numpy(a).to(device)
+
+
 def _csr_to_dense_padded(A) -> torch.Tensor:
     """Materialize a CSRMatrix into a dense (M, K) tensor.
 
@@ -936,6 +974,23 @@ def _zero_invalid_slots(t: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
     return t * valid.view(shape).to(device=t.device, dtype=t.dtype)
 
 
+def _attn_kernel_head_dim(head_dim: int) -> int:
+    """head_dim the gather attention kernels run at; inputs are zero-padded to it.
+
+    The K-tiled kernels take head_dim in whole 128-column chunks, so a head_dim
+    above 128 that is not a multiple of 128 (e.g. 192) is padded up to the next
+    one (#49); before, it raised. Zero columns change no score, add zero
+    output / gradient columns, and are sliced off. NKI 0.3.0 simulator:
+    nc_matmul requires K = TILE_K exactly, so there head_dim < 128 is padded
+    to 128 as well.
+    """
+    if head_dim > _TILE_K:
+        return -(-head_dim // _TILE_K) * _TILE_K
+    if _use_simulator():
+        return _TILE_K
+    return head_dim
+
+
 def _attn_gather(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, mask_bsr, scale: float):
     """Host-side gather for the two-pass NKI attention kernels.
 
@@ -954,15 +1009,7 @@ def _attn_gather(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, mask_bsr, sc
     b = mask_bsr.block_size
     M_tiles = seq_len // b
 
-    assert head_dim <= _TILE_K or head_dim % _TILE_K == 0, (
-        f"head_dim {head_dim}: must be ≤ {_TILE_K} or a multiple of {_TILE_K}. "
-        f"Supported: 32, 64, 128 (single tile) and 256, 512 (K-tiled)."
-    )
-
-    # NKI 0.3.0 simulator: nc_matmul requires K = TILE_K exactly. Pad head_dim to
-    # TILE_K when running in the simulator with head_dim < TILE_K. The forward
-    # output is sliced to [:seq_len, :head_dim] so the padding is transparent.
-    head_dim_k = _TILE_K if (_use_simulator() and head_dim < _TILE_K) else head_dim
+    head_dim_k = _attn_kernel_head_dim(head_dim)
 
     # Structure on the host (no-op if it already is); grids are host tensors.
     block_row_ptrs = mask_bsr.block_row_ptrs.cpu()
@@ -992,7 +1039,8 @@ def _attn_gather(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, mask_bsr, sc
     k_gathered_pad = _zero_invalid_slots(K_by_block[safe_col], valid)  # (M_tiles, K_max, b, hd)
     v_gathered_pad = _zero_invalid_slots(V_by_block[safe_col.to(V.device)], valid)
 
-    q_scaled_blocks = (Q * scale).view(M_tiles, b, head_dim)
+    # Scale in at least fp32, then round to Q's dtype (bf16), as the static path does.
+    q_scaled_blocks = (Q.to(_acc_dtype(Q.dtype)) * scale).to(Q.dtype).view(M_tiles, b, head_dim)
 
     if head_dim_k != head_dim:
         extra = head_dim_k - head_dim
@@ -1050,8 +1098,9 @@ def nki_bsr_attn_tiled(
     `_attn_out_kernel` (pass 2) for the block-sparse attention forward pass.
     No O(seq_len²) intermediate is allocated.
 
-    head_dim must be ≤ 128 (single tile) or a multiple of 128 (K-tiling:
-    256, 512). K-tiling accumulates the score Q @ K.T across TILE_K=128
+    head_dim ≤ 128 runs as a single tile; above 128 it is K-tiled in 128-column
+    chunks (256, 512; other sizes such as 192 are zero-padded to the next
+    multiple of 128). K-tiling accumulates the score Q @ K.T across TILE_K=128
     chunks, reusing PSUM across nc_matmul calls.
 
     Args:
@@ -1089,7 +1138,10 @@ def nki_bsr_attn_tiled(
             if _REQUIRE_NKI:
                 raise
 
-    q_scaled, k_gathered, v_gathered, K_max, M_tiles = _attn_gather(Q, K, V, mask_bsr, scale)
+    # One operand dtype for the gather kernels: bf16 when Q, K and V all are,
+    # else fp32. Statistics, scores and PSUM are fp32 either way (#49).
+    Qk, Kk, Vk = _attn_operands(_kernel_dtype(Q, K, V), Q, K, V)
+    q_scaled, k_gathered, v_gathered, K_max, M_tiles = _attn_gather(Qk, Kk, Vk, mask_bsr, scale)
     slot_valid = _attn_slot_valid(mask_bsr, M_tiles, K_max)
     b = mask_bsr.block_size
 
@@ -1100,11 +1152,9 @@ def nki_bsr_attn_tiled(
 
     try:
         if _use_simulator():
-            tile_max_np, tile_sumexp_np = nki.simulate(_attn_stats_kernel)(
-                qs.cpu().numpy(), kg.cpu().numpy()
-            )
-            tile_max = torch.from_numpy(np.asarray(tile_max_np)).to(Q.device)
-            tile_sumexp = torch.from_numpy(np.asarray(tile_sumexp_np)).to(Q.device)
+            tile_max_np, tile_sumexp_np = nki.simulate(_attn_stats_kernel)(_sim_np(qs), _sim_np(kg))
+            tile_max = _sim_torch(tile_max_np, Q.device)
+            tile_sumexp = _sim_torch(tile_sumexp_np, Q.device)
             # NKI 0.3.0 keepdims: tile_max/tile_sumexp are (M_tiles, K_max, 128, 1)
             if tile_max.dim() == 4:
                 tile_max = tile_max.squeeze(-1)
@@ -1116,13 +1166,9 @@ def nki_bsr_attn_tiled(
             rd = row_denom.unsqueeze(-1).contiguous()
 
             out_np = nki.simulate(_attn_out_kernel)(
-                qs.cpu().numpy(),
-                kg.cpu().numpy(),
-                vg.cpu().numpy(),
-                rm.cpu().numpy(),
-                rd.cpu().numpy(),
+                _sim_np(qs), _sim_np(kg), _sim_np(vg), _sim_np(rm), _sim_np(rd)
             )
-            result = torch.from_numpy(np.asarray(out_np)).to(Q.device)
+            result = _sim_torch(out_np, Q.device)
         else:
             # Q/K/V tiles cross to the device once and feed both passes.
             (qs_x, kg_x, vg_x), orig_device = _to_device(qs, kg, vg)
@@ -1289,11 +1335,13 @@ def _attn_bwd_gather(
     block_row_ptrs = mask_bsr.block_row_ptrs.cpu()
     block_col_indices = mask_bsr.block_col_indices.cpu()
 
-    # NKI 0.3.0 simulator: pad head_dim to TILE_K so nc_matmul gets K=TILE_K.
+    # Pad head_dim to what the kernels take (`_attn_kernel_head_dim`: a whole
+    # number of 128 chunks above 128; 128 in the NKI 0.3.0 simulator).
     # Padding with zeros is correct: [dO|0]·[O|0] = dO·O for D, and the kernel
     # outputs are sliced to [:seq_len, :head_dim] in nki_bsr_attn_bwd.
-    if _use_simulator() and head_dim < _TILE_K:
-        extra = _TILE_K - head_dim
+    head_dim_k = _attn_kernel_head_dim(head_dim)
+    if head_dim_k != head_dim:
+        extra = head_dim_k - head_dim
 
         def _pad_hd(t: torch.Tensor) -> torch.Tensor:
             return torch.cat([t, t.new_zeros(*t.shape[:-1], extra)], dim=-1)
@@ -1303,7 +1351,7 @@ def _attn_bwd_gather(
         V = _pad_hd(V)
         dO = _pad_hd(dO)
         O = _pad_hd(O)
-        head_dim = _TILE_K  # update local for views below
+        head_dim = head_dim_k  # update local for views below
 
     # ── Row-first tensors (for dQ kernel) ──────────────────────────────────────
     blocks_per_row = (block_row_ptrs[1:] - block_row_ptrs[:-1]).tolist()
@@ -1322,7 +1370,10 @@ def _attn_bwd_gather(
     V_by_block = V.view(nb_rows, b, head_dim)
     dO_by_block = dO.view(nb_rows, b, head_dim)
 
-    q_scaled = (Q * scale).view(M_tiles, b, head_dim)
+    # Scale and D in at least fp32 (Q's dtype for the kernel operands), as
+    # the static path does (#49).
+    acc = _acc_dtype(Q.dtype)
+    q_scaled = (Q.to(acc) * scale).to(Q.dtype).view(M_tiles, b, head_dim)
     # Padded slots gather block 0; zero K/V there so dS @ K and dO @ V.T
     # contribute nothing to dQ.
     row_valid = col_grid >= 0
@@ -1334,7 +1385,7 @@ def _attn_bwd_gather(
     do_gathered = dO_by_block.unsqueeze(1).expand(M_tiles, K_max, b, head_dim)
 
     # D = dO · O row-wise; reshape to (M_tiles, b) for block indexing.
-    D_flat = (dO * O).sum(dim=-1)  # (seq_len,)
+    D_flat = (dO.to(acc) * O.to(acc)).sum(dim=-1)  # (seq_len,)
     D_blocks = D_flat.view(M_tiles, b)  # (M_tiles, b)
 
     row_first = {
@@ -1442,7 +1493,12 @@ def nki_bsr_attn_bwd(
             if _REQUIRE_NKI:
                 raise
 
-    row_first, col_first = _attn_bwd_gather(Q, K, V, dO, O, mask_bsr, scale, row_max, row_denom)
+    # One operand dtype for the gather kernels: bf16 when Q, K, V and dO all
+    # are, else fp32. The statistics and D are fp32 either way (#49).
+    Qk, Kk, Vk, dOk = _attn_operands(_kernel_dtype(Q, K, V, dO), Q, K, V, dO)
+    row_first, col_first = _attn_bwd_gather(
+        Qk, Kk, Vk, dOk, O, mask_bsr, scale, _stat_input(row_max), _stat_input(row_denom)
+    )
 
     # Pack contiguous inputs. NKI: per-row stat vectors (D_blocks, D/row_max/
     # row_denom gathered, trailing dim = b) must be ≥2D in the kernel —
@@ -1453,40 +1509,39 @@ def nki_bsr_attn_bwd(
     _stat_keys = {"D_blocks", "D_gathered", "row_max_gathered", "row_denom_gathered"}
 
     def _u(key: str, t: torch.Tensor) -> torch.Tensor:
-        t = _kernel_input(t)
         if key in _stat_keys:
-            return t.unsqueeze(-1).contiguous()
-        return t.contiguous()
+            return _stat_input(t).unsqueeze(-1).contiguous()
+        return _kernel_input(t).contiguous()
 
     rf = {k: _u(k, v) for k, v in row_first.items()}
     cf = {k: _u(k, v) for k, v in col_first.items()}
-    rm_in = _kernel_input(row_max).unsqueeze(-1).contiguous()
-    rd_in = _kernel_input(row_denom).unsqueeze(-1).contiguous()
+    rm_in = _stat_input(row_max).unsqueeze(-1).contiguous()
+    rd_in = _stat_input(row_denom).unsqueeze(-1).contiguous()
 
     try:
         if _use_simulator():
             dQ_np = nki.simulate(_attn_bwd_dq_kernel)(
-                rf["q_scaled"].cpu().numpy(),
-                rf["k_gathered"].cpu().numpy(),
-                rf["v_gathered"].cpu().numpy(),
-                rf["do_gathered"].cpu().numpy(),
-                rf["D_blocks"].cpu().numpy(),
-                rm_in.cpu().numpy(),
-                rd_in.cpu().numpy(),
+                _sim_np(rf["q_scaled"]),
+                _sim_np(rf["k_gathered"]),
+                _sim_np(rf["v_gathered"]),
+                _sim_np(rf["do_gathered"]),
+                _sim_np(rf["D_blocks"]),
+                _sim_np(rm_in),
+                _sim_np(rd_in),
             )
-            dQ_raw = torch.from_numpy(np.asarray(dQ_np)).to(Q.device)
+            dQ_raw = _sim_torch(dQ_np, Q.device)
 
             dK_np, dV_np = nki.simulate(_attn_bwd_dkdv_kernel)(
-                cf["k_blocks"].cpu().numpy(),
-                cf["v_blocks"].cpu().numpy(),
-                cf["q_gathered"].cpu().numpy(),
-                cf["do_gathered"].cpu().numpy(),
-                cf["D_gathered"].cpu().numpy(),
-                cf["row_max_gathered"].cpu().numpy(),
-                cf["row_denom_gathered"].cpu().numpy(),
+                _sim_np(cf["k_blocks"]),
+                _sim_np(cf["v_blocks"]),
+                _sim_np(cf["q_gathered"]),
+                _sim_np(cf["do_gathered"]),
+                _sim_np(cf["D_gathered"]),
+                _sim_np(cf["row_max_gathered"]),
+                _sim_np(cf["row_denom_gathered"]),
             )
-            dK_raw = torch.from_numpy(np.asarray(dK_np)).to(Q.device)
-            dV_raw = torch.from_numpy(np.asarray(dV_np)).to(Q.device)
+            dK_raw = _sim_torch(dK_np, Q.device)
+            dV_raw = _sim_torch(dV_np, Q.device)
         else:
             (
                 (
@@ -1538,8 +1593,10 @@ def nki_bsr_attn_bwd(
 
         # dQ needs scale: kernel gives dS@K (gradient w.r.t. Q_scaled=Q*scale),
         # but dL/dQ = dL/d(Q_scaled)*scale. dK already has scale via q_sbuf=Q*scale.
+        # The scale is applied in at least fp32 before rounding to Q's dtype.
+        dq = dQ_raw[:seq_len, :head_dim]
         return (
-            dQ_raw[:seq_len, :head_dim].to(Q.dtype).contiguous() * scale,
+            (dq.to(_acc_dtype(Q.dtype)) * scale).to(Q.dtype).contiguous(),
             dK_raw[:seq_len, :head_dim].to(Q.dtype).contiguous(),
             dV_raw[:seq_len, :head_dim].to(Q.dtype).contiguous(),
         )

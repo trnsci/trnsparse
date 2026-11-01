@@ -716,9 +716,12 @@ def block_sparse_attention_tiled(
         scale: Optional QK scale (default: head_dim ** -0.5).
 
     Note:
-        On the NKI backend, head_dim must be ≤ 128 (single tile) or a
-        multiple of 128 (K-tiling, e.g., 256 or 512). The PyTorch backend
-        accepts any head_dim.
+        On the NKI backend, head_dim ≤ 128 runs as a single tile and larger
+        head_dims are K-tiled in 128-column chunks (e.g. 256 or 512; others,
+        such as 192, are zero-padded to the next multiple of 128). fp32 and
+        bf16 Q / K / V are supported on every NKI path; bf16 needs all three
+        in bf16 (a mixed call runs in fp32), with fp32 scores, statistics and
+        accumulation. The PyTorch backend accepts any head_dim.
 
         Placement (native TorchNeuron): the mask's `block_row_ptrs` /
         `block_col_indices` stay on the host; Q, K, V may be on the host or

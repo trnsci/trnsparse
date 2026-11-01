@@ -448,6 +448,107 @@ class TestAttnKTilingSimulator:
         torch.testing.assert_close(got, ref, atol=ATOL, rtol=RTOL)
 
 
+def _dense_attn64(Q, K, V, mask_bsr, dO, scale=None):
+    """fp64 dense masked attention and its gradients, from the given (rounded) inputs."""
+    q, k, v = (t.detach().double().requires_grad_(True) for t in (Q, K, V))
+    scale = Q.shape[1] ** -0.5 if scale is None else scale
+    allowed = mask_bsr.to_dense().bool()
+    s = (q @ k.T * scale).masked_fill(~allowed, float("-inf"))
+    out = torch.softmax(s, dim=-1) @ v
+    out.backward(dO.double())
+    return out.detach(), q.grad, k.grad, v.grad
+
+
+def _rel(x, ref):
+    x, ref = x.detach().double(), ref.detach().double()
+    return float((x - ref).norm() / ref.norm())
+
+
+BF16_TOL = 3e-2  # as for the static kernels' bf16 path (tests/test_nki_native.py)
+
+
+class TestAttnGatherBf16Simulator:
+    """bf16 Q / K / V on the gather attention kernels (#49).
+
+    Before the fix the weights @ V, dS @ K, dS^T @ Q and P^T @ dO matmuls
+    mixed fp32 (P, dS) with bf16 operands and failed to trace. Checked
+    against fp64 dense attention of the bf16-rounded inputs. head_dim 256
+    is the K-tiled path, 192 is zero-padded to 256, and 64 is the
+    single-tile path (in the simulator every head_dim takes the gather
+    kernels). Backward uses a stride-2 dilated mask (K_max = 1): the
+    simulator's multi-iteration PSUM accumulate issue (see the xfails
+    above) is unrelated to the dtype.
+    """
+
+    @pytest.mark.parametrize("head_dim", [64, 192, 256])
+    def test_forward_bf16(self, nki_backend, head_dim):
+        g = torch.Generator().manual_seed(490 + head_dim)
+        seq_len, block_size = 256, 128
+        Q, K, V = (torch.randn(seq_len, head_dim, generator=g).bfloat16() for _ in range(3))
+        mask = _local_mask(seq_len, block_size, window=1)  # K_max = 2
+        mask_bsr = trnsparse.BSRMatrix.from_dense(mask.float(), block_size=block_size)
+
+        got = trnsparse.block_sparse_attention_tiled(Q, K, V, mask_bsr)
+        ref, *_ = _dense_attn64(Q, K, V, mask_bsr, torch.zeros(seq_len, head_dim))
+        assert got.dtype == torch.bfloat16 and got.shape == (seq_len, head_dim)
+        assert _rel(got, ref) < BF16_TOL
+
+    @pytest.mark.parametrize("head_dim", [64, 192, 256])
+    def test_backward_bf16(self, nki_backend, head_dim):
+        g = torch.Generator().manual_seed(491 + head_dim)
+        seq_len, block_size = 256, 128
+        Q, K, V, dO = (torch.randn(seq_len, head_dim, generator=g).bfloat16() for _ in range(4))
+        mask = _dilated_mask(seq_len, block_size, stride=2)  # K_max = 1
+        mask_bsr = trnsparse.BSRMatrix.from_dense(mask.float(), block_size=block_size)
+
+        Qr, Kr, Vr = (t.clone().requires_grad_(True) for t in (Q, K, V))
+        out = trnsparse.block_sparse_attention_tiled(Qr, Kr, Vr, mask_bsr)
+        out.backward(dO)
+        ref, dq, dk, dv = _dense_attn64(Q, K, V, mask_bsr, dO)
+        assert _rel(out, ref) < BF16_TOL
+        for got, exp in ((Qr.grad, dq), (Kr.grad, dk), (Vr.grad, dv)):
+            assert got.dtype == torch.bfloat16
+            assert _rel(got, exp) < 5 * BF16_TOL
+
+    def test_stats_fp32_for_bf16(self, nki_backend):
+        from trnsparse.nki.dispatch import nki_bsr_attn_tiled
+
+        g = torch.Generator().manual_seed(492)
+        Q, K, V = (torch.randn(256, 256, generator=g).bfloat16() for _ in range(3))
+        mask_bsr = trnsparse.BSRMatrix.from_dense(_local_mask(256, 128, 1).float(), block_size=128)
+        out, rm, rd = nki_bsr_attn_tiled(Q, K, V, mask_bsr, return_stats=True)
+        assert out.dtype == torch.bfloat16
+        assert rm.dtype == torch.float32 and rd.dtype == torch.float32
+
+    def test_mixed_dtypes_run_fp32(self, nki_backend):
+        """bf16 Q with fp32 K / V: the kernels run in fp32 (no mixed matmul)."""
+        g = torch.Generator().manual_seed(493)
+        Q = torch.randn(256, 256, generator=g).bfloat16()
+        K, V = (torch.randn(256, 256, generator=g) for _ in range(2))
+        mask_bsr = trnsparse.BSRMatrix.from_dense(_local_mask(256, 128, 1).float(), block_size=128)
+        got = trnsparse.block_sparse_attention_tiled(Q, K, V, mask_bsr)
+        ref, *_ = _dense_attn64(Q, K, V, mask_bsr, torch.zeros(256, 256))
+        assert got.dtype == torch.bfloat16
+        assert _rel(got, ref) < BF16_TOL
+
+    def test_head_dim_192_fp32_matches_reference(self, nki_backend):
+        """head_dim 192 (zero-padded to 256) in fp32: forward and backward."""
+        g = torch.Generator().manual_seed(494)
+        Q, K, V, dO = (torch.randn(256, 192, generator=g) for _ in range(4))
+        mask_bsr = trnsparse.BSRMatrix.from_dense(
+            _dilated_mask(256, 128, stride=2).float(), block_size=128
+        )
+        Qr, Kr, Vr = (t.clone().requires_grad_(True) for t in (Q, K, V))
+        out = trnsparse.block_sparse_attention_tiled(Qr, Kr, Vr, mask_bsr)
+        out.backward(dO)
+        ref, dq, dk, dv = _dense_attn64(Q, K, V, mask_bsr, dO)
+        assert out.shape == (256, 192)
+        assert _rel(out, ref) < 1e-5
+        for got, exp in ((Qr.grad, dq), (Kr.grad, dk), (Vr.grad, dv)):
+            assert got.shape == (256, 192)
+            assert _rel(got, exp) < 5e-5
+
+
 class TestScreenedSpmmSimulator:
     """Fused screened SpMM through the simulator (#19).
 

@@ -21,6 +21,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   traces). `NKI_ENABLE_TRACE_CACHE=0` still turns it off.
 - README: known platform issue note for #1454.
 
+### Fixed
+
+- **bf16 Q / K / V raised on the gather attention kernels** (loud; #49).
+  Affects released versions **0.4.4 through 0.12.1** with `backend="nki"`
+  (or `"auto"` on Neuron): every bf16 call that took the gather kernels,
+  i.e. `head_dim > 128` (K-tiled, since 0.6.0), the XLA path, or the native
+  path with the static structure off. The weights @ V, dS @ K, dSᵀ @ Q and
+  Pᵀ @ dO matmuls paired fp32 P / dS with bf16 operands, and NKI rejects
+  mixed fp32 / bf16 `nc_matmul` operands ("if one input is tfloat32/float32,
+  both must be"). With `TRNSPARSE_REQUIRE_NKI=1` the call raised. Without it,
+  the call fell back to the PyTorch path, which gives correct results but
+  runs off the NKI path. The gather kernels now handle precision like the
+  static kernels: one operand dtype per call (bf16 when Q, K, V (and dO) are
+  all bf16, else fp32); fp32 scores, softmax statistics, D and PSUM; and P /
+  dS rounded to the operand dtype before their matmul. The scale and D are
+  computed on the host in fp32. fp32 and fp64 inputs give the same values as
+  before.
+- **`head_dim` above 128 that is not a multiple of 128 (e.g. 192) raised on
+  the NKI attention path** (`AssertionError` in the gather, released 0.6.0
+  through 0.12.1). It is now zero-padded to the next multiple of 128 for the
+  K-tiled kernels and sliced back; zero columns change no score and no
+  gradient (#49).
+
 ## [0.12.1] — 2026-11-01
 
 Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.

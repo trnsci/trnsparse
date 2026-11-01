@@ -344,6 +344,107 @@ def test_static_kernel_lnc2_neff_compiles(case, tmp_path):
     assert (tmp_path / "file.neff").stat().st_size > 0
 
 
+# ── Gather attention kernels, fp32 and bf16 (#49) ────────────────────────────
+#
+# The gather kernels run for head_dim > 128 (K-tiled) and whenever the static
+# structure is off. bf16 Q / K / V used to fail to trace: the fp32 softmax
+# weights (P) and dS met bf16 V / K / Q in one nc_matmul ("if one input is
+# tfloat32/float32, both must be"). The operands now share the input dtype and
+# the statistics stay fp32, as in the static kernels.
+
+
+def _gather_attn_inputs(hd, mk):
+    # (M_tiles=2, K_max=2); statistics and D are always fp32.
+    return {
+        "_attn_stats_kernel": (mk(2, _P, hd), mk(2, 2, _P, hd)),
+        "_attn_out_kernel": (
+            mk(2, _P, hd),
+            mk(2, 2, _P, hd),
+            mk(2, 2, _P, hd),
+            _f32(2, _P, 1),
+            np.abs(_f32(2, _P, 1)) + 1.0,
+        ),
+        "_attn_bwd_dq_kernel": (
+            mk(2, _P, hd),
+            mk(2, 2, _P, hd),
+            mk(2, 2, _P, hd),
+            mk(2, 2, _P, hd),
+            _f32(2, _P, 1),
+            _f32(2, _P, 1),
+            np.abs(_f32(2, _P, 1)) + 1.0,
+        ),
+        "_attn_bwd_dkdv_kernel": (
+            mk(2, _P, hd),
+            mk(2, _P, hd),
+            mk(2, 2, _P, hd),
+            mk(2, 2, _P, hd),
+            _f32(2, 2, _P, 1),
+            _f32(2, 2, _P, 1),
+            np.abs(_f32(2, 2, _P, 1)) + 1.0,
+        ),
+    }
+
+
+_GATHER_ATTN = {
+    (name, f"hd{hd}-{dtype}"): (lambda name=name, hd=hd, mk=mk: _gather_attn_inputs(hd, mk)[name])
+    for dtype, mk in (("f32", _f32), ("bf16", _bf16))
+    for hd in (64, 128, 256)
+    for name in (
+        "_attn_stats_kernel",
+        "_attn_out_kernel",
+        "_attn_bwd_dq_kernel",
+        "_attn_bwd_dkdv_kernel",
+    )
+}
+
+
+@pytest.mark.parametrize("lnc", [1, 2])
+@pytest.mark.parametrize("case", sorted(_GATHER_ATTN), ids=lambda c: f"{c[0]}-{c[1]}")
+def test_gather_attn_kernel_lnc_mlir_verifies(case, lnc):
+    from trnsparse.nki import kernels
+
+    if case[1].endswith("bf16"):
+        pytest.importorskip("ml_dtypes")
+    kernel = getattr(kernels, case[0])
+    result = source_to_mlir(
+        kernel, *_GATHER_ATTN[case](), target="trn2", lnc=lnc, frontend=FrontendKind.TRACER
+    )
+    result.verify()
+
+
+@pytest.mark.skipif(shutil.which("neuronx-cc") is None, reason="neuronx-cc not on PATH")
+@pytest.mark.parametrize("case", sorted(_GATHER_ATTN), ids=lambda c: f"{c[0]}-{c[1]}")
+def test_gather_attn_kernel_neff_compiles(case, tmp_path):
+    """Full CPU NEFF compile (trn2, LNC=1); catches ISA-validation errors."""
+    try:
+        from nki.compiler import driver
+        from nki.compiler.frontend import TracerFrontend
+        from nki.compiler.ncc_driver import CompileOptions
+    except ImportError as e:
+        pytest.skip(f"nki compiler driver API not available: {e}")
+    if not hasattr(driver, "_compile_bir_to_neff"):
+        pytest.skip("nki.compiler.driver._compile_bir_to_neff not available in this nki")
+    if case[1].endswith("bf16"):
+        pytest.importorskip("ml_dtypes")
+
+    from trnsparse.nki import kernels
+
+    kernel = getattr(kernels, case[0])
+    fn = getattr(kernel, "func", kernel)
+    inputs = dict(zip(inspect.signature(fn).parameters, _GATHER_ATTN[case](), strict=True))
+    opts = CompileOptions(
+        target="trn2",
+        lnc=1,
+        artifacts_dir=str(tmp_path),
+        output_path=str(tmp_path / "file.neff"),
+    )
+    bir = driver.compile_to_bir(
+        fn, frontend=TracerFrontend(), inputs=inputs, compile_opts=opts, enable_cache=False
+    )
+    driver._compile_bir_to_neff(bir, opts, inputs)
+    assert (tmp_path / "file.neff").stat().st_size > 0
+
+
 # ── Fused SBUF-resident CG (#22) ─────────────────────────────────────────────
 #
 # Device-side while loop, PSUM dot products, both physical cores at LNC=2
