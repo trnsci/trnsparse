@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`COOMatrix.to_dense` dropped duplicate entries** (silent; every release
+  0.1.1–0.12.1, backend-independent). Repeated `(row, col)` entries were
+  assigned rather than summed, so all but one was lost, while `to_csr()`,
+  `torch.sparse_coo_tensor` and `scipy.sparse` sum them. This also affected
+  `CSRMatrix.to_coo().to_dense()` for a CSR with a repeated column in a row.
+  Duplicates are now summed; matrices without duplicates are unchanged (#56).
+
 ## [0.12.1] — 2026-11-01
 
 Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
