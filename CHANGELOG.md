@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0] — 2026-11-01
+
+Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
+
+Headline: **correctness fix — upgrade recommended if you pass `scale` to block-sparse attention.** In 0.6.0–0.11.0 a custom `scale` passed to `block_sparse_attention_tiled` was silently ignored on the NKI paths (forward and dQ/dK/dV; 29–99% relative error at scale 0.1–2.0). The native `trnsparse::bsr_attn` op was affected from 0.9.0. The PyTorch backend and `ShardedAttention` were correct, and the default `scale=None` was unaffected (#50, #47). Also: BSR block sizes other than 128 go straight to the torch path instead of paying a failed NKI compile on every call (7–41 s first call, 6.7–8.3× steady), which covers `bsr_spmm`, attention and the iterative solvers (#48, #46).
+
 ### Fixed
 
 - **`block_sparse_attention_tiled` silently ignored a custom `scale` on the
