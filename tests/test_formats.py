@@ -88,3 +88,26 @@ class TestTranspose:
         csr = trnsparse.from_dense(A)
         csr_t = trnsparse.sparse_transpose(csr)
         np.testing.assert_allclose(csr_t.to_dense().numpy(), A.T.numpy())
+
+
+class TestFromScipy:
+    def test_complex_keeps_imaginary_part(self):
+        # Through 0.12.1 complex input was cast to float32, dropping the
+        # imaginary part (#58).
+        sp = pytest.importorskip("scipy.sparse")
+        M = sp.random(15, 11, density=0.4, random_state=0, format="csr")
+        M = (M + 1j * sp.random(15, 11, density=0.4, random_state=1, format="csr")).tocsr()
+        A = trnsparse.from_scipy(M)
+        assert A.dtype == torch.complex64
+        np.testing.assert_allclose(A.to_dense().numpy(), M.toarray(), rtol=1e-6, atol=1e-6)
+        x = np.random.default_rng(2).standard_normal(11).astype(np.complex64)
+        np.testing.assert_allclose(
+            trnsparse.spmv(A, torch.from_numpy(x)).numpy(), M @ x, rtol=1e-5, atol=1e-5
+        )
+
+    def test_real_stays_float32(self):
+        sp = pytest.importorskip("scipy.sparse")
+        M = sp.random(6, 6, density=0.5, random_state=3, format="csr")
+        A = trnsparse.from_scipy(M)
+        assert A.dtype == torch.float32
+        np.testing.assert_allclose(A.to_dense().numpy(), M.toarray(), rtol=1e-6)

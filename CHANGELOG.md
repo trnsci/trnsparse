@@ -28,6 +28,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `torch.sparse_coo_tensor` and `scipy.sparse` sum them. This also affected
   `CSRMatrix.to_coo().to_dense()` for a CSR with a repeated column in a row.
   Duplicates are now summed; matrices without duplicates are unchanged (#56).
+### Fixed
+
+- **`from_scipy` discarded the imaginary part of complex matrices** (silent;
+  every release 0.1.1–0.12.1). Values were always cast to float32, so a
+  complex scipy matrix became its real part (one C++ `UserWarning`, no
+  error). Complex input now gives `complex64` values; real input is
+  unchanged (float32) (#58).
 
 ## [0.12.1] — 2026-11-01
 
