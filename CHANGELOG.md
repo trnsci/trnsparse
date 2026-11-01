@@ -72,6 +72,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `benchmarks/bench_cg_fused_trn2.py --matvec row,column,column:bf16,...`
   and `benchmarks/bench_power_fused_trn2.py`.
 
+#### Fused CG: fixed per-iteration cost (#22)
+
+- Plain CG at LNC=2 exchanges **once per step**: the cores swap their rows
+  of q = A p and then compute p.q, r, r.r and p over the full width,
+  bit-identically. PCG still exchanges twice, but the second exchange
+  carries z with the partial r.z and r.r. Full-width vectors use a
+  segment layout (each core's rows contiguous), so every exchange is one
+  `sendrecv` with no copies, and exchanges up to 1 KiB per partition use
+  GpSimd's SBUF-to-SBUF DMA (about 0.9 µs against 2.4 µs).
+- Column matvec: "spread" source vectors (each block column after
+  (G - 1) R zero columns) put up to 4 G block rows into one PSUM slot, so
+  a chunk takes one PSUM-to-SBUF copy and one TensorE transpose instead of
+  one of each per four rows (fp32 A, R in 1, 2, 4, 8).
+- `cg_row_order`: each core's block rows are reordered so the four
+  concurrent TensorE column groups carry about the same number of blocks
+  (b, x0 and x are permuted by DMA in the kernel).
+- Shorter step-size chain (no `max` before the reciprocal of p.Ap; r.z x
+  act formed off the critical path), the x update deferred into the next
+  matvec, the all-ones reduction matmul flagged `is_stationary_onezero`.
+- PSUM tiles are allocated once per trip of the device loop and re-zeroed,
+  so NKI's allocator no longer falls back to neuronx-cc allocation and
+  scheduling.
+- `cg_bsr_fused(..., recurrence="chronopoulos_gear")` (opt-in, plain CG):
+  the Chronopoulos–Gear recurrence, one reduction phase per step. The host
+  path runs the same recurrence.
+- Measured on Trn2 (#22, `docs/benchmarks.md`): the fixed cost per plain
+  CG iteration falls from about 11 µs to about 4 µs at LNC=2 and from about
+  8 µs to about 3.5 µs at LNC=1.
+
+### Fixed
+
+- `cg_bsr_fused` / `power_iteration_bsr_fused` with a host `BSRMatrix` and
+  `b` (or `v0`) on the `neuron` device raised `ModuleNotFoundError:
+  torch_neuronx.pyhlo`: the kernel got host tensors and NKI fell back to
+  its torch-xla framework (#42). A `BSRMatrix` is now prepared on b's
+  device, and the fused kernel runs only for an operator on a `neuron`
+  device (a host operator takes the host path).
+
 ## [0.10.0] — 2026-10-31
 
 Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.

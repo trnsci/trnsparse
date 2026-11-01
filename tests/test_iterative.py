@@ -441,6 +441,58 @@ class TestCgBsrFused:
         assert cg_resident_blocks(1000, 32, True, block_bytes=256) == 576
         assert cg_resident_blocks(1000, 32, False, block_bytes=512) == 320
 
+    def test_chronopoulos_gear_recurrence(self):
+        # Opt-in Chronopoulos-Gear CG: the same Krylov iterates in exact
+        # arithmetic, so in fp64 it matches standard CG closely.
+        A = _block_spd(4, seed=21)
+        b = torch.randn(
+            A.shape[0], dtype=torch.float64, generator=torch.Generator().manual_seed(22)
+        )
+        bsr = trnsparse.BSRMatrix.from_dense(A, block_size=128)
+        x, k, rel, info = trnsparse.cg_bsr_fused(
+            bsr, b, tol=1e-10, max_iter=500, return_info=True, recurrence="chronopoulos_gear"
+        )
+        xs, ks, _ = trnsparse.cg_bsr_fused(bsr, b, tol=1e-10, max_iter=500)
+        assert info["recurrence"] == "chronopoulos_gear" and info["path"] == "pytorch"
+        assert rel < 1e-10 and abs(k - ks) <= 1
+        torch.testing.assert_close(x, torch.linalg.solve(A, b), atol=1e-8, rtol=1e-8)
+        torch.testing.assert_close(x, xs, atol=1e-8, rtol=1e-8)
+        # exact iteration cap, and several right-hand sides with their own counts
+        _, k5, _ = trnsparse.cg_bsr_fused(
+            bsr, b, tol=0.0, max_iter=5, recurrence="chronopoulos_gear"
+        )
+        assert k5 == 5
+        B = torch.stack([b, 2 * b, torch.zeros_like(b)], dim=1)
+        X, K, REL = trnsparse.cg_bsr_fused(
+            bsr, B, tol=1e-8, max_iter=500, recurrence="chronopoulos_gear"
+        )
+        assert K.tolist()[2] == 0 and abs(int(K[0]) - int(K[1])) <= 1
+        torch.testing.assert_close(X[:, 1], 2 * X[:, 0], atol=1e-6, rtol=1e-6)
+        with pytest.raises(ValueError, match="plain CG only"):
+            trnsparse.cg_bsr_fused(
+                bsr, b, preconditioner="block_jacobi", recurrence="chronopoulos_gear"
+            )
+        with pytest.raises(ValueError, match="recurrence"):
+            trnsparse.cg_bsr_fused(bsr, b, recurrence="pipelined")
+
+    def test_row_order_balances_column_groups(self):
+        from trnsparse.nki.kernels import cg_row_order
+
+        counts = [9, 1, 1, 1, 8, 1, 1, 1, 7, 1, 1, 1, 6, 2, 2]  # heavy rows all at i % 4 == 0
+        ptrs = [0]
+        for c in counts:
+            ptrs.append(ptrs[-1] + c)
+        for lo, hi in [(0, 15), (3, 11), (0, 1), (2, 4)]:
+            order = cg_row_order(ptrs, lo, hi)
+            assert sorted(order) == list(range(lo, hi))
+            n = hi - lo
+            loads = [sum(counts[order[i]] for i in range(g, n, 4)) for g in range(4)]
+            naive = [sum(counts[m] for m in range(lo + g, hi, 4)) for g in range(4)]
+            assert max(loads) <= max(naive)
+        order = cg_row_order(ptrs, 0, 15)
+        loads = [sum(counts[order[i]] for i in range(g, 15, 4)) for g in range(4)]
+        assert max(loads) <= 13 < 33  # i % 4 puts 30 + 3 blocks on group 0
+
 
 class TestPowerIterationFused:
     def test_matches_power_iteration_bsr(self):
