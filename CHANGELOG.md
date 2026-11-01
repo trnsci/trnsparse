@@ -35,6 +35,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   complex scipy matrix became its real part (one C++ `UserWarning`, no
   error). Complex input now gives `complex64` values; real input is
   unchanged (float32) (#58).
+### Fixed
+
+- **Second derivatives of `block_sparse_attention_tiled` were wrong**
+  (silent; 0.6.0–0.12.1, the releases with attention autograd, on the
+  PyTorch backend and the PyTorch/XLA / simulator paths). The backward
+  reused the forward's softmax statistics as constants, so differentiating
+  it (`create_graph=True`: `gradgradcheck`, gradient penalties, Hessian-
+  vector products) dropped their dependence on Q and K, with no error.
+  Double backward now differentiates a graph-carrying recomputation; first-
+  order gradients are unchanged (#65).
 
 ## [0.12.1] — 2026-11-01
 

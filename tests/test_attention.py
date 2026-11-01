@@ -335,3 +335,44 @@ def test_tiled_attention_rejects_partial_block():
     mask = trnsparse.BSRMatrix.from_dense(torch.ones(200, 200), block_size=128)
     with pytest.raises(ValueError, match="multiple of mask_bsr.block_size"):
         trnsparse.block_sparse_attention_tiled(Q, K, V, mask)
+
+
+def _small_mask_bsr(n_tiles, b, pattern):
+    rp = [0] * (n_tiles + 1)
+    for r, _ in pattern:
+        rp[r + 1] += 1
+    for i in range(n_tiles):
+        rp[i + 1] += rp[i]
+    return trnsparse.BSRMatrix(
+        blocks=torch.ones(len(pattern), b, b, dtype=torch.float64),
+        block_col_indices=torch.tensor([c for _, c in sorted(pattern)]),
+        block_row_ptrs=torch.tensor(rp),
+        shape=(n_tiles * b, n_tiles * b),
+        block_size=b,
+    )
+
+
+@pytest.mark.parametrize("requires", [(True, True, True), (True, False, False)])
+def test_tiled_attention_double_backward(requires):
+    # Through 0.12.1 the backward reused the saved softmax statistics as
+    # constants, so second derivatives (gradgradcheck, gradient penalties)
+    # were silently wrong (#65).
+    prev = trnsparse.get_backend()
+    trnsparse.set_backend("pytorch")
+    try:
+        g = torch.Generator().manual_seed(60)
+        # block row 1 attends to two column blocks; block row 2 to none
+        mask = _small_mask_bsr(3, 4, [(0, 0), (1, 0), (1, 2)])
+        QKV = [torch.randn(12, 5, generator=g, dtype=torch.float64) for _ in range(3)]
+        for t, r in zip(QKV, requires, strict=True):
+            t.requires_grad_(r)
+        ins = tuple(t for t in QKV if t.requires_grad)
+
+        def fn(*xs):
+            it = iter(xs)
+            q, k, v = (next(it) if t.requires_grad else t for t in QKV)
+            return trnsparse.block_sparse_attention_tiled(q, k, v, mask)
+
+        assert torch.autograd.gradgradcheck(fn, ins)
+    finally:
+        trnsparse.set_backend(prev)
