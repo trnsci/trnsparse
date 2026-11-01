@@ -45,6 +45,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   vector products) dropped their dependence on Q and K, with no error.
   Double backward now differentiates a graph-carrying recomputation; first-
   order gradients are unchanged (#65).
+### Fixed
+
+- **`spmv` / `spmm` accepted a `y` / `C` that enlarged the output** (silent;
+  every release 0.1.1–0.12.1, all backends). `beta * y` was added with plain
+  broadcasting, so a `(m, 1)` `y` turned the `(m,)` product into `(m, m)`
+  with no error, where `torch.addmv` / `addmm` raise. Such shapes now raise
+  `ValueError`; every `y` / `C` that broadcasts to the product's shape works
+  as before (#67).
 
 ## [0.12.1] — 2026-11-01
 
