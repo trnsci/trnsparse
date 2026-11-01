@@ -15,7 +15,7 @@ exact.
 
 Contrast with CSR, which stores individual nonzero elements. The v0.2.0
 NKI path for CSR materializes the matrix into a dense `(M, K)` tile
-before the matmul (see the [SpMM path](#v020-csr-spmm-path) below) —
+before the matmul (see the [dispatch hierarchy](#nki-dispatch-hierarchy) below) —
 necessary for correctness, but it pays the full `M × K` cost whether the
 matrix is sparse or not. BSR skips this because blocks are already dense.
 
@@ -37,11 +37,14 @@ trnsparse/
 │   ├── formats.py       # CSRMatrix, COOMatrix, BSRMatrix, from_dense
 │   ├── ops.py           # spmv, spmm, bsr_spmm, screened_spmm, ...
 │   ├── screening.py     # schwarz_bounds, screen_quartets, density_screen
-│   ├── iterative.py     # cg_bsr, power_iteration_bsr, jacobi_preconditioner_bsr
+│   ├── iterative.py     # cg_bsr, cg_bsr_fused, power_iteration_bsr(_fused), chebyshev/richardson
+│   ├── multicore.py     # ShardedBSR, ShardedAttention (logical NeuronCores of one chip)
 │   └── nki/
 │       ├── __init__.py
-│       ├── kernels.py   # _bsr_spmm_kernel, _screened_spmm_kernel
-│       └── dispatch.py  # torch.autograd.Function wrappers + routing
+│       ├── kernels.py       # BSR / screened / attention / fused CG kernels
+│       ├── dispatch.py      # path selection, torch.autograd.Function wrappers (XLA/CPU)
+│       ├── _native.py       # TorchNeuron custom ops + register_autograd
+│       └── _native_attn.py  # trnsparse::bsr_attn / bsr_attn_bwd composite ops
 ├── tests/
 ├── examples/
 │   ├── sparse_fock.py             # Schwarz-screened Fock (3 paths + trnblas)
@@ -56,12 +59,17 @@ compute format. `nki/dispatch.py` exposes `HAS_NKI`,
 `set_backend("auto"|"pytorch"|"nki")`, `get_backend()`, and the NKI
 entry points.
 
-### `spmm(csr, B)` — PyTorch fallback
+### `spmm(csr, B)` — densify-then-GEMM on NKI, `torch.sparse` otherwise
 
-Routes through `torch.sparse_csr_tensor` operations. Benchmarked within
-2× of scipy at typical shapes; the NKI per-op overhead doesn't pay off
-for CSR SpMM until the matrix is large enough that the v0.2.0 CSR kernel
-(densify-then-GEMM) would dominate anyway. SpMV also stays on this path.
+On the `pytorch` backend (and under `auto` without NKI) this routes
+through `torch.sparse_csr_tensor` operations, benchmarked within 2× of
+scipy at typical shapes. Under `nki`, and under `auto` when NKI is
+available, A is densified on the host and the v0.2.0 dense GEMM kernel
+runs on the Tensor Engine (`trnsparse::spmm_dense` on the native path). It
+pays the full `M × K` cost, so on Trn2 it stays behind dense aten and far
+behind `torch.sparse` on CPU at low density ([Benchmarks](benchmarks.md)):
+for repeated products on the device, use BSR. SpMV stays on the
+`torch.sparse` path (densified on the host when `x` is on a device).
 
 ### `bsr_spmm(bsr, B)` — NKI, `_bsr_spmm_kernel`
 
@@ -159,21 +167,32 @@ extension is a follow-up if asked for.
 
 ## Known limits
 
+- **BSR block size.** The NKI kernels take `block_size=128` only. Other block
+  sizes run on the PyTorch path under `auto` and `nki` (correct, no NKI, no
+  failed compile since 0.12.0), and raise `NotImplementedError` under
+  `TRNSPARSE_REQUIRE_NKI=1`. `cg_bsr_fused` / `prepare_cg_bsr` raise
+  `ValueError` for any other block size.
 - **Row-bucketing CSR** ([#15](https://github.com/trnsci/trnsparse/issues/15)) — parked.
   Requires NKI indirect-DMA gather (not exposed as of NKI 0.3.0). The CSR PyTorch
   fallback is within 2× of scipy; that's the current story.
 - **Fused tile-level attention scores** ([#25](https://github.com/trnsci/trnsparse/issues/25)) —
-  **v0.4.4 ships the NKI kernel pair** (`_attn_stats_kernel` + `_attn_out_kernel`).
+  shipped: the NKI kernel pair in v0.4.4, the NKI backward in 0.5.1, and
+  K-tiling for `head_dim` a multiple of 128 (256, 512) in 0.6.0.
   `block_sparse_attention_tiled` routes through NKI on the `nki` backend; the
-  PyTorch two-pass reference remains on the `pytorch` backend. `head_dim ≤ 128`
-  in v0.4.4 (nc_matmul partition limit); `head_dim=256` requires K-tiling.
+  PyTorch two-pass reference remains on the `pytorch` backend. `seq_len` must
+  be a multiple of the mask's block size (`ValueError` since 0.11.0). bf16
+  inputs raise on the gather kernels used for `head_dim > 128`
+  ([#49](https://github.com/trnsci/trnsparse/issues/49)); the static path
+  (`head_dim ≤ 128`) takes bf16.
 - **Fused iterative solvers** ([#22](https://github.com/trnsci/trnsparse/issues/22)) —
-  CG blocked on `nl.affine_range` iteration-carried scalar state. **v0.4.3 ships
-  `chebyshev_bsr` and `richardson_bsr`**: fixed-K solvers with pre-computed
-  coefficients (no inner products in the loop) that have the correct structure for
-  eventual NKI fusion. The "A SBUF-resident across all iterations" win remains gated
-  on `affine_range` vector-carry support.
+  shipped in 0.11.0: `cg_bsr_fused` runs CG or block-Jacobi PCG in one launch
+  with A SBUF-resident and a device-side `nl.while_loop` convergence check, and
+  `power_iteration_bsr_fused` uses the same kernel. See
+  [Iterative solvers](iterative_solvers.md). `chebyshev_bsr` and
+  `richardson_bsr` (v0.4.3) remain host-driven loops over `bsr_spmm`.
 - **Multi-chip sharded BSR** ([#16](https://github.com/trnsci/trnsparse/issues/16)) —
-  gated on suite-level multi-chip collectives.
+  across the logical NeuronCores of one Trn2 chip, `ShardedBSR` and
+  `ShardedAttention` shipped in 0.10.0 (`trnsparse.multicore`). Sharding across
+  chips is still gated on suite-level multi-chip collectives.
 - **SpMV stays PyTorch.** Single output column on the Tensor Engine doesn't amortize
   compile + dispatch overhead.

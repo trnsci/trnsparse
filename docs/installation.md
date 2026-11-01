@@ -1,6 +1,6 @@
 # Installation
 
-## From PyPI (once published)
+## From PyPI
 
 ```bash
 pip install trnsparse
@@ -92,11 +92,21 @@ processes. The cache only versions source that belongs to an installed
 wheel (a `site-packages` tree with `.dist-info`); an editable install is
 not tracked and can get a stale kernel after you edit `kernels.py`. When
 developing with `pip install -e`, turn the cache off before starting
-Python (the test suite's `conftest.py` does this):
+Python:
 
 ```bash
 export NKI_ENABLE_TRACE_CACHE=0
 ```
+
+The test suite keeps the cache on, as users run it, but gives each session
+a fresh, empty cache directory (`NKI_TRACE_CACHE_URL`), so edits never hit
+a stale entry.
+
+The cache also ignores constants captured in a kernel's closure
+([aws-neuron/aws-neuron-sdk#1454](https://github.com/aws-neuron/aws-neuron-sdk/issues/1454));
+trnsparse's kernels take every specialising value as an argument
+(`tests/test_trace_cache_safety.py`). Set `NKI_ENABLE_TRACE_CACHE=0` if
+you write NKI kernels that a factory specialises through a closure.
 
 See the TorchNeuron
 [environment variables](https://github.com/aws-neuron/torch-neuronx/blob/main/docs/environment_variables.md)

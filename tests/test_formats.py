@@ -57,6 +57,30 @@ class TestCOO:
         expected = torch.tensor([[0, 0, 1], [2, 0, 0], [0, 3, 0]], dtype=torch.float32)
         np.testing.assert_allclose(coo.to_dense().numpy(), expected.numpy())
 
+    def test_coo_to_dense_sums_duplicates(self):
+        # Duplicate (row, col) entries are summed, like to_csr() and scipy.sparse.
+        # Through 0.12.1 to_dense kept one of them (the other was dropped).
+        sp = pytest.importorskip("scipy.sparse")
+        rows, cols, vals = [0, 1, 0, 2], [1, 2, 1, 0], [1.0, 2.0, 10.0, 3.0]
+        coo = COOMatrix(
+            values=torch.tensor(vals, dtype=torch.float64),
+            row_indices=torch.tensor(rows),
+            col_indices=torch.tensor(cols),
+            shape=(3, 3),
+        )
+        expected = sp.coo_matrix((vals, (rows, cols)), shape=(3, 3)).toarray()
+        np.testing.assert_allclose(coo.to_dense().numpy(), expected)
+        np.testing.assert_allclose(coo.to_csr().to_dense().numpy(), expected)
+
+    def test_csr_with_duplicates_to_coo_to_dense(self):
+        csr = CSRMatrix(
+            values=torch.tensor([5.0, 7.0, 1.0]),
+            col_indices=torch.tensor([1, 1, 0]),
+            row_ptrs=torch.tensor([0, 2, 3]),
+            shape=(2, 2),
+        )
+        np.testing.assert_allclose(csr.to_coo().to_dense().numpy(), csr.to_dense().numpy())
+
 
 class TestTranspose:
     def test_transpose(self):
@@ -64,3 +88,26 @@ class TestTranspose:
         csr = trnsparse.from_dense(A)
         csr_t = trnsparse.sparse_transpose(csr)
         np.testing.assert_allclose(csr_t.to_dense().numpy(), A.T.numpy())
+
+
+class TestFromScipy:
+    def test_complex_keeps_imaginary_part(self):
+        # Through 0.12.1 complex input was cast to float32, dropping the
+        # imaginary part (#58).
+        sp = pytest.importorskip("scipy.sparse")
+        M = sp.random(15, 11, density=0.4, random_state=0, format="csr")
+        M = (M + 1j * sp.random(15, 11, density=0.4, random_state=1, format="csr")).tocsr()
+        A = trnsparse.from_scipy(M)
+        assert A.dtype == torch.complex64
+        np.testing.assert_allclose(A.to_dense().numpy(), M.toarray(), rtol=1e-6, atol=1e-6)
+        x = np.random.default_rng(2).standard_normal(11).astype(np.complex64)
+        np.testing.assert_allclose(
+            trnsparse.spmv(A, torch.from_numpy(x)).numpy(), M @ x, rtol=1e-5, atol=1e-5
+        )
+
+    def test_real_stays_float32(self):
+        sp = pytest.importorskip("scipy.sparse")
+        M = sp.random(6, 6, density=0.5, random_state=3, format="csr")
+        A = trnsparse.from_scipy(M)
+        assert A.dtype == torch.float32
+        np.testing.assert_allclose(A.to_dense().numpy(), M.toarray(), rtol=1e-6)
