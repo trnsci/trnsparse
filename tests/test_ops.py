@@ -191,3 +191,42 @@ class TestEpilogueShape:
         C = torch.full(cshape, 2.0)
         out = trnsparse.spmm(self.A, self.B, C=C, beta=0.5)
         torch.testing.assert_close(out, torch.addmm(C, self.D, self.B, beta=0.5))
+
+
+class TestIntegerDtypeOnDensePath:
+    """The device dense path (no torch sparse CSR) keeps an integer product's
+    dtype under the default alpha=1.0 / beta=1.0 (#79). Forced on CPU here."""
+
+    @pytest.fixture
+    def dense_path(self, monkeypatch):
+        import trnsparse.ops as ops
+
+        monkeypatch.setattr(ops, "_torch_sparse_ok", lambda *a: False)
+
+    @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+    def test_spmv_spmm_keep_int_dtype(self, dense_path, dtype):
+        g = torch.Generator().manual_seed(0)
+        Ad = torch.randint(-5, 6, (37, 29), generator=g).to(dtype)
+        Ad[torch.rand(37, 29, generator=g) < 0.7] = 0
+        A = trnsparse.from_dense(Ad)
+        x = torch.randint(-5, 6, (29,), generator=g).to(dtype)
+        B = torch.randint(-5, 6, (29, 6), generator=g).to(dtype)
+        y = torch.randint(-5, 6, (37,), generator=g).to(dtype)
+        C = torch.randint(-5, 6, (37, 6), generator=g).to(dtype)
+        for got, want in [
+            (trnsparse.spmv(A, x), Ad @ x),
+            (trnsparse.spmv(A, x, y=y, beta=1.0), Ad @ x + y),
+            (trnsparse.spmm(A, B), Ad @ B),
+            (trnsparse.spmm(A, B, C=C, beta=1.0), Ad @ B + C),
+        ]:
+            assert got.dtype == dtype
+            assert torch.equal(got, want)
+
+    def test_float_alpha_still_scales(self, dense_path):
+        Ad = torch.tensor([[1.0, 0.0], [0.0, 2.0]])
+        A = trnsparse.from_dense(Ad)
+        x = torch.tensor([3.0, 4.0])
+        y = torch.tensor([1.0, 1.0])
+        torch.testing.assert_close(
+            trnsparse.spmv(A, x, alpha=0.5, y=y, beta=-2.0), 0.5 * (Ad @ x) - 2.0 * y
+        )
