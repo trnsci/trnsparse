@@ -22,6 +22,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - README: known platform issue note for #1454.
 ### Fixed
 
+- **`bsr_diagonal` returned length m for a tall matrix** (silent; every
+  release 0.3.2–0.12.1, every backend). For a rectangular (m, n) BSR matrix
+  with m > n the result was zero-padded to length m; it now has length
+  min(m, n), as `torch.diagonal` and scipy do. Square and wide matrices are
+  unchanged (#74).
 - **`COOMatrix.to_dense` dropped duplicate entries** (silent; every release
   0.1.1–0.12.1, backend-independent). Repeated `(row, col)` entries were
   assigned rather than summed, so all but one was lost, while `to_csr()`,
