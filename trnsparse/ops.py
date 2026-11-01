@@ -79,8 +79,27 @@ def spmv(
 
     result = alpha * _csr_matmul(A, x)
     if y is not None and beta != 0.0:
+        _check_epilogue_shape("spmv", "y", y, result)
         result = result + beta * y
     return result
+
+
+def _check_epilogue_shape(op: str, name: str, t: torch.Tensor, result: torch.Tensor) -> None:
+    """`t` must broadcast *to* the product's shape, as in torch.addmv / addmm.
+
+    Through 0.12.1 a `y` / `C` that enlarged the result by broadcasting (a
+    `(m, 1)` y against an `(m,)` product gave an `(m, m)` output) was
+    accepted silently (#67).
+    """
+    try:
+        ok = torch.broadcast_shapes(t.shape, result.shape) == result.shape
+    except RuntimeError:
+        ok = False
+    if not ok:
+        raise ValueError(
+            f"{op}: {name} of shape {tuple(t.shape)} does not broadcast to the "
+            f"product's shape {tuple(result.shape)}"
+        )
 
 
 def spmm(
@@ -115,6 +134,7 @@ def spmm(
     else:
         result = alpha * _csr_matmul(A, B)
     if C is not None and beta != 0.0:
+        _check_epilogue_shape("spmm", "C", C, result)
         result = result + beta * C
     return result
 

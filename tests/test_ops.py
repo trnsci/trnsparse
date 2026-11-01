@@ -154,3 +154,40 @@ class TestNnzPerRow:
         csr = trnsparse.from_dense(A)
         nnz = trnsparse.nnz_per_row(csr)
         np.testing.assert_array_equal(nnz.numpy(), [2, 0, 3])
+
+
+class TestEpilogueShape:
+    """y / C must broadcast *to* the product's shape (torch.addmv / addmm rule).
+
+    Through 0.12.1 a y of shape (m, 1) turned spmv's (m,) result into (m, m)
+    without an error (#67).
+    """
+
+    def setup_method(self):
+        g = torch.Generator().manual_seed(67)
+        self.D = torch.randn(12, 10, generator=g)
+        self.A = trnsparse.from_dense(self.D)
+        self.x = torch.randn(10, generator=g)
+        self.B = torch.randn(10, 4, generator=g)
+
+    def test_spmv_rejects_enlarging_y(self):
+        with pytest.raises(ValueError, match="does not broadcast"):
+            trnsparse.spmv(self.A, self.x, y=torch.ones(12, 1), beta=1.0)
+
+    def test_spmm_rejects_enlarging_c(self):
+        with pytest.raises(ValueError, match="does not broadcast"):
+            trnsparse.spmm(self.A, self.B, C=torch.ones(1, 12, 4), beta=1.0)
+        with pytest.raises(ValueError, match="does not broadcast"):
+            trnsparse.spmm(self.A, self.x, C=torch.ones(12, 1), beta=1.0)
+
+    @pytest.mark.parametrize("yshape", [(12,), (1,), ()])
+    def test_spmv_broadcasting_y_still_works(self, yshape):
+        y = torch.full(yshape, 2.0)
+        out = trnsparse.spmv(self.A, self.x, y=y, beta=0.5)
+        torch.testing.assert_close(out, torch.addmv(y.expand(12), self.D, self.x, beta=0.5))
+
+    @pytest.mark.parametrize("cshape", [(12, 4), (12, 1), (4,), ()])
+    def test_spmm_broadcasting_c_still_works(self, cshape):
+        C = torch.full(cshape, 2.0)
+        out = trnsparse.spmm(self.A, self.B, C=C, beta=0.5)
+        torch.testing.assert_close(out, torch.addmm(C, self.D, self.B, beta=0.5))
