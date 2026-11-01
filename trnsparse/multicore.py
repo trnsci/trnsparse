@@ -217,11 +217,14 @@ class ShardedBSR:
         """Assemble per-core outputs into C (rows in A's order) on `device`."""
         bs = self.block_size
         n_cols = outs[0].shape[-1]
-        C = torch.zeros(self.shape[0], n_cols, dtype=outs[0].dtype)
+        # Block rows cover A's rows padded up to the block size; the partial
+        # last block row is sliced off at the end.
+        m_pad = -(-self.shape[0] // bs) * bs
+        C = torch.zeros(m_pad, n_cols, dtype=outs[0].dtype)
         for rows, o in zip(self.rows, outs, strict=True):
             o = o.detach().cpu().reshape(len(rows), bs, n_cols)
             C.view(-1, bs, n_cols)[torch.tensor(rows, dtype=torch.long)] = o
-        return C.to(device)
+        return C[: self.shape[0]].to(device)
 
 
 class ShardedAttention:
@@ -241,6 +244,10 @@ class ShardedAttention:
     def __init__(self, mask_bsr: BSRMatrix, devices: Sequence[torch.device] | None = None):
         if mask_bsr.block_size != _d._TILE_M:
             raise ValueError(f"ShardedAttention needs block_size {_d._TILE_M}")
+        if mask_bsr.shape[0] % _d._TILE_M:
+            raise ValueError(
+                f"ShardedAttention needs seq_len ({mask_bsr.shape[0]}) to be a multiple of {_d._TILE_M}"
+            )
         devices = list(devices) if devices is not None else logical_cores()
         ptrs = mask_bsr.block_row_ptrs.cpu().tolist()
         cols = mask_bsr.block_col_indices.cpu().tolist()

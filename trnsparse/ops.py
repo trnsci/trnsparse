@@ -674,6 +674,16 @@ def block_sparse_attention_tiled(
         (seq_len, head_dim) attention output.
     """
     seq_len, head_dim = Q.shape
+    b = mask_bsr.block_size
+    if seq_len % b:
+        # A partial last block row/column is not supported on any backend:
+        # the PyTorch reference left the tail query rows zero and the NKI
+        # gather raised an opaque view error. Pad Q/K/V and mask yourself
+        # (padded keys must be masked out, not zero-padded).
+        raise ValueError(
+            f"block_sparse_attention_tiled needs seq_len ({seq_len}) to be a "
+            f"multiple of mask_bsr.block_size ({b})"
+        )
 
     if scale is None:
         scale = head_dim**-0.5

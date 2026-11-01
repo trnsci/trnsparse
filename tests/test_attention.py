@@ -5,6 +5,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
 import torch
 
 import trnsparse
@@ -325,3 +326,12 @@ class TestAttnTiledGrad:
             assert V.grad is not None and V.grad.shape == V.shape
         finally:
             trnsparse.set_backend(prev)
+
+
+def test_tiled_attention_rejects_partial_block():
+    # seq_len 200 with block 128: the reference used to leave rows 128..199
+    # zero (silently wrong) and the NKI gather raised a view error.
+    Q = K = V = torch.randn(200, 16)
+    mask = trnsparse.BSRMatrix.from_dense(torch.ones(200, 200), block_size=128)
+    with pytest.raises(ValueError, match="multiple of mask_bsr.block_size"):
+        trnsparse.block_sparse_attention_tiled(Q, K, V, mask)

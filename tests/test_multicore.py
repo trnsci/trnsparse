@@ -204,3 +204,28 @@ def test_sharded_bsr_grad_neuron(nki_backend, pretransposed):
     got = sum(r.grad.cpu().double() for r in reps)
     ref = A.to_dense().double().T @ torch.ones(A.shape[0], 128, dtype=torch.float64)
     torch.testing.assert_close(got, ref, atol=1e-3, rtol=1e-4)
+
+
+@pytest.mark.parametrize("m,n", [(1, 1), (200, 129), (1000, 300)])
+def test_sharded_bsr_gather_partial_block_row(m, n):
+    # A's rows need not be a multiple of the block size: the partial last
+    # block row is sliced off in gather (it raised a view error before).
+    g = torch.Generator().manual_seed(1)
+    dense = torch.randn(m, n, generator=g, dtype=torch.float64)
+    A = trnsparse.BSRMatrix.from_dense(dense, block_size=P)
+    B = torch.randn(n, 7, generator=g, dtype=torch.float64)
+    prev = trnsparse.get_backend()
+    trnsparse.set_backend("pytorch")
+    try:
+        S = ShardedBSR(A, devices=[torch.device("cpu")] * 3, pretransposed=False)
+        C = S.gather(S.spmm(B))
+    finally:
+        trnsparse.set_backend(prev)
+    assert C.shape == (m, 7)
+    torch.testing.assert_close(C, dense @ B)
+
+
+def test_sharded_attention_rejects_partial_block():
+    mask = trnsparse.BSRMatrix.from_dense(torch.ones(200, 200), block_size=P)
+    with pytest.raises(ValueError, match="multiple of 128"):
+        ShardedAttention(mask, devices=[torch.device("cpu")])
