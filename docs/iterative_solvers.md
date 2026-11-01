@@ -53,6 +53,11 @@ x, iters, rel = trnsparse.cg_bsr_fused(op, b, tol=1e-5, max_iter=2000)
 X, iters, rel = trnsparse.cg_bsr_fused(op, B)  # B: (n, R), R independent solves
 ```
 
+A must be a `BSRMatrix` with `block_size=128` (any other block size raises
+`ValueError`). The unfused solvers (`cg_bsr`, `power_iteration_bsr`,
+`chebyshev_bsr`, `richardson_bsr`) take any block size, but only 128 runs
+`bsr_spmm` on NKI; other sizes run each matvec on the PyTorch path.
+
 What the kernel does on the NeuronCore:
 
 - **A's stored blocks are DMA'd into SBUF once** and every iteration

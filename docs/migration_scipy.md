@@ -16,7 +16,7 @@ when you port code across.
 | `eye(n, format='csr')` | `eye_sparse(n, dtype=torch.float32)` | Identity CSR. |
 | `A @ x` (SpMV) | `spmv(A, x)` | Function call, not operator; supports `alpha` / `beta` scaling. |
 | `A @ B` (SpMM) | `spmm(A, B)` | Same; supports `alpha` / `beta`. |
-| `A @ x` with symmetric A | `spmv_symmetric(A, x)` | Exploits symmetry for ~2× throughput when you can guarantee it. |
+| `A @ x` with symmetric A | `spmv_symmetric(A, x, uplo="upper")` | Only the `uplo` triangle is referenced (as in BLAS `symv`), so A may store one triangle (half the memory) or the full matrix. |
 | `alpha * A + beta * B` | `sparse_add(A, B, alpha=alpha, beta=beta)` | Combined scale + add. |
 | `alpha * A` | `sparse_scale(A, alpha)` | In-place-style scalar scaling. |
 | `A.T` | `sparse_transpose(A)` | Returns a new CSRMatrix. |

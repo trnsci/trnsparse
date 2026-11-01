@@ -2,29 +2,56 @@
 
 ## Formats
 
-- `CSRMatrix(indptr, indices, data, shape)` — compressed sparse row
-  - `.from_dense(dense, threshold=0)` — construct by thresholding a dense tensor
+- `CSRMatrix(values, col_indices, row_ptrs, shape)` — compressed sparse row
   - `.to_dense()` — materialize back to a dense `torch.Tensor`
-  - `.transpose()` — transpose to CSR (via CSC)
-  - `.nnz`, `.shape`, `.dtype`, `.device`
-- `COOMatrix(rows, cols, vals, shape)` — coordinate format
+  - `.nnz`, `.shape`, `.dtype`, `.density`
+- `COOMatrix(values, row_indices, col_indices, shape)` — coordinate format
   - `.to_csr()` / `CSRMatrix.to_coo()` — roundtrip conversions
+- `BSRMatrix(blocks, block_col_indices, block_row_ptrs, shape, block_size=128)`
+  — block-sparse row, the NKI compute format
+  - `.from_dense(dense, block_size=128, threshold=0)`, `.from_csr(csr, ...)`,
+    `.to_dense()`, `.to_csr()`
+  - The NKI kernels take `block_size=128` only. Other block sizes run on the
+    PyTorch path (correct, no NKI), or raise `NotImplementedError` under
+    `TRNSPARSE_REQUIRE_NKI=1`.
+- `from_dense(dense, threshold=0)` — CSR from a dense tensor
+- `from_scipy(sp_matrix)`, `eye_sparse(n)`
 
 ## Ops
 
-- `spmv(A, x)` — sparse matrix × dense vector
-- `spmv_symmetric(A, x)` — for symmetric A; skips duplicate work
-- `spmm(A, B)` — sparse matrix × dense matrix (gather-matmul-scatter on NKI)
+- `spmv(A, x, alpha=1.0, y=None, beta=0.0)` — sparse matrix × dense vector
+- `spmv_symmetric(A, x, alpha=1.0, uplo="upper")` — symmetric A; only the
+  `uplo` triangle is referenced, as in BLAS `symv`, so A may store one
+  triangle or the full matrix (0.12.1). A matrix that stores only the
+  opposite triangle still uses it, with a `DeprecationWarning` asking for
+  the matching `uplo`.
+- `spmm(A, B, alpha=1.0, C=None, beta=0.0)` — sparse matrix × dense matrix
+  (on NKI: A densified on the host, then a dense GEMM on the Tensor Engine)
+- `bsr_spmm(A, B)` — BSR × dense, one `nc_matmul` per stored block
+- `screened_spmm(A, diag_integrals, B, threshold)` — fused Schwarz-screened SpMM
+- `block_sparse_attention_tiled(Q, K, V, mask_bsr, scale=None)` — two-pass
+  block-sparse attention with autograd; see
+  [Sparse attention](sparse_attention.md). `seq_len` must be a multiple of
+  `mask_bsr.block_size` (`ValueError` otherwise, since 0.11.0).
 - `sparse_add(A, B, alpha=1.0, beta=1.0)` — `α A + β B`
-- `sparse_scale(A, s)` — scalar multiply
-- `transpose(A)` — transpose of CSR / COO
+- `sparse_scale(A, alpha)` — scalar multiply
+- `sparse_transpose(A)` — transpose of a CSR matrix
+- `nnz_per_row(A)`
+
+## Iterative solvers
+
+`cg_bsr`, `cg_bsr_fused` / `prepare_cg_bsr` (`FusedCGOperator`),
+`chebyshev_bsr`, `chebyshev_coeffs`, `richardson_bsr`,
+`power_iteration_bsr`, `power_iteration_bsr_fused`,
+`jacobi_preconditioner_bsr`, `bsr_diagonal`. See
+[Iterative solvers](iterative_solvers.md).
 
 ## Screening
 
 - `schwarz_bounds(shell_pair_integrals)` — Cauchy-Schwarz bounds $Q_{pq} = \sqrt{(pq|pq)}$
 - `screen_quartets(Q, threshold)` — keep only quartets with $Q_{pq}Q_{rs} > \text{threshold}$
 - `density_screen(Q, P, threshold)` — density-weighted screening
-- `sparsity_stats(mask)` — density, nnz, per-row nnz distribution
+- `sparsity_stats(Q, threshold=1e-10)` — shell, pair and quartet counts and the sparsity fraction
 
 ## Dispatch
 
