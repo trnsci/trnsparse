@@ -314,12 +314,19 @@ def from_dense(A: torch.Tensor, threshold: float = 0.0) -> CSRMatrix:
 
 
 def from_scipy(sp_matrix) -> CSRMatrix:
-    """Convert scipy.sparse matrix to CSRMatrix."""
+    """Convert scipy.sparse matrix to CSRMatrix.
+
+    Values are stored in single precision: float32 for real input,
+    complex64 for complex input (through 0.12.1 complex input was cast to
+    float32, which discarded the imaginary part, #58).
+    """
+    import numpy as np
     import scipy.sparse as sp
 
     csr = sp.csr_matrix(sp_matrix)
+    dtype = torch.complex64 if np.iscomplexobj(csr.data) else torch.float32
     return CSRMatrix(
-        values=torch.tensor(csr.data, dtype=torch.float32),
+        values=torch.tensor(csr.data, dtype=dtype),
         col_indices=torch.tensor(csr.indices, dtype=torch.long),
         row_ptrs=torch.tensor(csr.indptr, dtype=torch.long),
         shape=csr.shape,

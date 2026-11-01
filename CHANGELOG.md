@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`from_scipy` discarded the imaginary part of complex matrices** (silent;
+  every release 0.1.1–0.12.1). Values were always cast to float32, so a
+  complex scipy matrix became its real part (one C++ `UserWarning`, no
+  error). Complex input now gives `complex64` values; real input is
+  unchanged (float32) (#58).
+
 ## [0.12.1] — 2026-11-01
 
 Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
