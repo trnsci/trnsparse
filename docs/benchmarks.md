@@ -837,3 +837,185 @@ exceeds the iterations' time). Reproduce with `bench_cg_fused_trn2.py
 - **One process per logical core.** The column matvec doubles the
   single-core rate (294 against 147 solves/s). Going to 2 and 4 cores
   scales 2.15x and 2.38x, limited by the 2 shared host CPUs as in #40.
+
+
+## Trn2: fused CG fixed per-iteration cost (#22)
+
+Same machine, matrices, pinning and method as the sections above (SDK
+2.33, one logical core, host on 2 CPUs, tol 1e-5). "#41" is `main` after
+#41; "new" is this change with the default (standard) recurrence;
+"Chronopoulos–Gear" is the opt-in `recurrence="chronopoulos_gear"` (plain
+CG only). LNC=1 runs on one physical core (`NEURON_LOGICAL_NC_CONFIG=1`).
+Time to tolerance is a warm median of 9 solves; per-iteration times are
+(t(576) − t(64)) / 512 with tol = 0, median of 7. True residual and error
+are against the fp64 A and an fp64 direct solve.
+
+#### Where one plain CG iteration goes (n = 4096, 256 blocks, LNC=2, device profile, slower core)
+
+| step | #41 (µs) | new (µs) |
+|---|---:|---:|
+| matvec (TensorE, ~131 blocks on this core) | 10.3 | 9.3 (column groups balanced) |
+| finish the matvec: PSUM copies, transposes, copy | 2.2 (4 + 4 + 1 ops) | 0.95 (1 + 1 + 1) |
+| exchange 1 | 2.9 (partial p.Ap, default DMA) | 0.85 (rows of A p, GpSimd DMA) |
+| p.Ap (multiply-reduce, ones matmul) | 0.9 | 0.6 |
+| step size, x and r updates | 1.2 | 0.65 (x moved into the next matvec) |
+| exchange 2 (+ copies) | 2.4 (rows of r) | — |
+| r.r | 1.0 | 0.6 |
+| beta, p update | 0.55 | 0.5 |
+| **fixed part** | **~10.8** | **~4.4** |
+
+At LNC=1 the fixed part is about 3.5 µs (#41: about 8 µs).
+
+#### µs per plain CG iteration ((t(576) − t(64)) / 512)
+
+| n | blocks | #41 LNC=2 | new LNC=2 | C–G LNC=2 | #41 LNC=2 no split | new LNC=2 no split | #41 LNC=1 | new LNC=1 | C–G LNC=1 | new vs #41 (LNC=2 / LNC=1) |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| 2048 | 256 | 19.5 | 14.6 | 13.7 | 23.1 | 20.5 | 21.9 | 20.1 | 18.5 | 1.33x / 1.09x |
+| 4096 | 256 | 21.9 | 15.3 | 14.8 | 26.0 | 21.1 | 25.5 | 20.2 | 19.0 | 1.43x / 1.26x |
+| 4096 | 512 | 31.7 | 24.3 | 23.3 | 71.9 | 67.9 | 68.3 | 62.4 | 61.7 | 1.30x / 1.09x |
+| 8192 | 512 | 31.0 | 24.1 | 22.9 | 63.2 | 63.2 | 58.7 | 57.6 | 56.6 | 1.29x / 1.02x |
+| 8192 | 1024 | 87.0 | 67.9 | 67.8 | 186.0 | 176.6 | 168.2 | 155.4 | 154.1 | 1.28x / 1.08x |
+
+#### µs per PCG iteration ((t(576) − t(64)) / 512)
+
+| n | blocks | #41 LNC=2 | new LNC=2 | #41 LNC=1 | new LNC=1 | new vs #41 (LNC=2 / LNC=1) |
+|---:|---:|---:|---:|---:|---:|---|
+| 2048 | 256 | 22.9 | 18.4 | 26.2 | 23.2 | 1.24x / 1.13x |
+| 4096 | 256 | 27.2 | 20.3 | 31.4 | 23.8 | 1.34x / 1.32x |
+| 4096 | 512 | 36.7 | 29.8 | 72.1 | 65.1 | 1.23x / 1.11x |
+| 8192 | 512 | 37.3 | 30.5 | 77.9 | 68.8 | 1.22x / 1.13x |
+| 8192 | 1024 | 91.7 | 78.4 | 170.5 | 166.2 | 1.17x / 1.03x |
+
+#### Plain CG, LNC=2 (ms to tol 1e-5, warm median of 9)
+
+| n | blocks | κ | #41 | new | speedup | Chronopoulos–Gear | C–G speedup | iters (#41 / new / C–G) | true res (#41 / new / C–G) | err vs fp64 (#41 / new / C–G) |
+|---:|---:|---:|---:|---:|---:|---:|---:|---|---|---|
+| 1024 | 16 | 1e+03 | 2.31 | 1.72 | 1.34x | 1.40 | 1.66x | 117 / 118 / 123 | 1.9e-05 / 1.9e-05 / 2.0e-05 | 3.6e-06 / 3.5e-06 / 1.5e-05 |
+| 1024 | 32 | 1e+03 | 1.40 | 0.96 | 1.46x | 1.09 | 1.28x | 36 / 36 / 37 | 6.0e-06 / 9.0e-06 / 5.1e-06 | 3.8e-06 / 4.0e-06 / 5.9e-06 |
+| 1024 | 64 | 1e+03 | 2.53 | 1.79 | 1.41x | 1.84 | 1.38x | 116 / 120 / 126 | 1.5e-05 / 1.9e-05 / 2.0e-05 | 3.7e-06 / 3.5e-06 / 1.7e-05 |
+| 2048 | 32 | 1e+03 | 1.31 | 1.14 | 1.15x | 1.17 | 1.12x | 25 / 25 / 25 | 6.2e-06 / 5.4e-06 / 5.6e-06 | 1.1e-06 / 1.1e-06 / 2.6e-06 |
+| 2048 | 64 | 1e+03 | 1.50 | 1.28 | 1.18x | 1.29 | 1.16x | 33 / 33 / 33 | 6.9e-06 / 6.6e-06 / 6.7e-06 | 3.1e-06 / 2.7e-06 / 5.0e-06 |
+| 2048 | 128 | 1e+03 | 2.05 | 1.73 | 1.18x | 1.65 | 1.24x | 61 / 62 / 63 | 9.2e-06 / 8.4e-06 / 7.0e-06 | 6.1e-06 / 4.2e-06 / 4.6e-06 |
+| 2048 | 256 | 1e+03 | 3.47 | 2.85 | 1.22x | 2.90 | 1.20x | 128 / 127 / 134 | 1.5e-05 / 1.3e-05 / 2.7e-05 | 3.5e-06 / 3.5e-06 / 1.9e-05 |
+| 4096 | 64 | 1e+03 | 1.43 | 1.29 | 1.10x | 1.23 | 1.16x | 29 / 29 / 29 | 8.7e-06 / 8.8e-06 / 8.6e-06 | 5.1e-06 / 5.1e-06 / 1.2e-05 |
+| 4096 | 128 | 1e+03 | 1.94 | 1.53 | 1.27x | 1.51 | 1.28x | 53 / 54 / 53 | 8.5e-06 / 7.3e-06 / 8.7e-06 | 6.1e-06 / 5.5e-06 / 6.1e-06 |
+| 4096 | 256 | 1e+03 | 2.53 | 2.16 | 1.18x | 2.07 | 1.22x | 66 / 66 / 66 | 8.0e-06 / 8.0e-06 / 8.4e-06 | 5.1e-06 / 5.1e-06 / 5.8e-06 |
+| 4096 | 512 | 1e+03 | 4.85 | 4.12 | 1.18x | 3.86 | 1.25x | 117 / 117 / 120 | 8.9e-06 / 9.2e-06 / 7.6e-06 | 4.4e-06 / 4.3e-06 / 4.7e-06 |
+| 8192 | 122 | 1e+03 | 1.75 | 1.54 | 1.13x | 1.27 | 1.37x | 34 / 34 / 34 | 9.8e-06 / 9.1e-06 / 9.9e-06 | 4.2e-06 / 4.0e-06 / 1.1e-05 |
+| 8192 | 256 | 1e+03 | 2.13 | 1.79 | 1.19x | 1.84 | 1.16x | 48 / 48 / 48 | 7.0e-06 / 6.8e-06 / 7.6e-06 | 8.5e-06 / 8.4e-06 / 8.7e-06 |
+| 8192 | 512 | 1e+03 | 3.47 | 3.08 | 1.13x | 3.01 | 1.15x | 75 / 76 / 76 | 8.0e-06 / 7.7e-06 / 7.2e-06 | 1.0e-05 / 1.0e-05 / 9.7e-06 |
+| 8192 | 1024 | 1e+03 | 11.6 | 9.43 | 1.23x | 9.38 | 1.24x | 116 / 115 / 116 | 9.4e-06 / 9.7e-06 / 9.2e-06 | 9.7e-06 / 1.0e-05 / 9.8e-06 |
+| 2048 | 64 | 1e+05 | 1.57 | 1.40 | 1.13x | 1.34 | 1.18x | 43 / 43 / 41 | 5.0e-05 / 4.4e-05 / 1.1e-04 | 2.3e-04 / 1.6e-04 / 2.0e-04 |
+| 4096 | 128 | 1e+05 | 1.98 | 1.79 | 1.11x | 1.78 | 1.11x | 67 / 67 / 66 | 1.4e-05 / 1.5e-05 / 3.9e-05 | 1.2e-04 / 1.6e-04 / 6.8e-04 |
+| 8192 | 256 | 1e+05 | 6.99 | 2.15 | 3.25x | 2.09 | 3.35x | 60 / 60 / 59 | 1.3e-05 / 1.5e-05 / 2.8e-05 | 2.8e-04 / 3.5e-04 / 2.0e-05 |
+| 8192 | 1024 | 1e+05 | 20.1 | 16.1 | 1.25x | 16.0 | 1.25x | 213 / 214 / 214 | 1.0e-05 / 1.2e-05 / 3.5e-05 | 1.5e-05 / 1.2e-05 / 4.1e-05 |
+
+#### Block-Jacobi PCG, LNC=2 (ms to tol 1e-5, warm median of 9)
+
+| n | blocks | κ | #41 | new | speedup | iters (#41 / new) | true res (#41 / new) | err vs fp64 (#41 / new) |
+|---:|---:|---:|---:|---:|---:|---|---|---|
+| 1024 | 16 | 1e+03 | 2.27 | 1.93 | 1.18x | 98 / 98 | 2.0e-05 / 1.2e-05 | 6.4e-06 / 6.4e-06 |
+| 1024 | 32 | 1e+03 | 1.33 | 0.97 | 1.37x | 26 / 26 | 9.5e-06 / 9.4e-06 | 5.3e-06 / 5.3e-06 |
+| 1024 | 64 | 1e+03 | 2.59 | 2.30 | 1.13x | 112 / 114 | 1.2e-05 / 2.3e-05 | 6.4e-06 / 6.0e-06 |
+| 2048 | 32 | 1e+03 | 1.37 | 1.20 | 1.14x | 21 / 21 | 7.2e-06 / 7.3e-06 | 1.8e-06 / 2.8e-06 |
+| 2048 | 64 | 1e+03 | 1.46 | 1.48 | 0.99x | 27 / 27 | 3.6e-06 / 3.6e-06 | 2.0e-06 / 2.4e-06 |
+| 2048 | 128 | 1e+03 | 2.13 | 1.83 | 1.16x | 50 / 50 | 9.1e-06 / 9.0e-06 | 6.5e-06 / 6.5e-06 |
+| 2048 | 256 | 1e+03 | 4.60 | 4.02 | 1.14x | 157 / 154 | 1.2e-05 / 1.2e-05 | 5.3e-06 / 5.9e-06 |
+| 4096 | 64 | 1e+03 | 1.47 | 1.36 | 1.08x | 24 / 24 | 6.1e-06 / 6.3e-06 | 2.7e-06 / 2.7e-06 |
+| 4096 | 128 | 1e+03 | 1.98 | 1.78 | 1.11x | 43 / 44 | 1.0e-05 / 7.2e-06 | 5.6e-06 / 3.3e-06 |
+| 4096 | 256 | 1e+03 | 2.53 | 2.23 | 1.13x | 49 / 49 | 9.8e-06 / 9.7e-06 | 5.0e-06 / 4.9e-06 |
+| 4096 | 512 | 1e+03 | 4.79 | 3.85 | 1.24x | 85 / 82 | 7.3e-06 / 9.8e-06 | 4.1e-06 / 6.4e-06 |
+| 8192 | 122 | 1e+03 | 1.82 | 1.67 | 1.09x | 30 / 30 | 6.0e-06 / 6.0e-06 | 3.7e-06 / 3.8e-06 |
+| 8192 | 256 | 1e+03 | 2.42 | 2.26 | 1.07x | 41 / 41 | 9.4e-06 / 9.5e-06 | 2.0e-05 / 2.0e-05 |
+| 8192 | 512 | 1e+03 | 3.47 | 3.09 | 1.12x | 61 / 61 | 7.8e-06 / 7.9e-06 | 8.7e-06 / 8.7e-06 |
+| 8192 | 1024 | 1e+03 | 8.27 | 7.27 | 1.14x | 76 / 76 | 7.8e-06 / 8.1e-06 | 1.1e-05 / 1.1e-05 |
+| 2048 | 64 | 1e+05 | 1.63 | 1.47 | 1.11x | 33 / 33 | 3.5e-05 / 3.3e-05 | 2.3e-04 / 1.3e-04 |
+| 4096 | 128 | 1e+05 | 2.21 | 1.93 | 1.14x | 54 / 54 | 1.5e-05 / 1.8e-05 | 1.1e-04 / 1.6e-04 |
+| 8192 | 256 | 1e+05 | 7.99 | 2.35 | 3.39x | 54 / 54 | 1.5e-05 / 1.3e-05 | 3.2e-04 / 3.6e-04 |
+| 8192 | 1024 | 1e+05 | 13.4 | 11.8 | 1.13x | 132 / 131 | 1.3e-05 / 1.2e-05 | 1.8e-05 / 9.6e-06 |
+
+#### Plain CG, LNC=1 (ms to tol 1e-5, warm median of 9)
+
+| n | blocks | κ | #41 | new | speedup | Chronopoulos–Gear | C–G speedup | iters (#41 / new / C–G) | true res (#41 / new / C–G) | err vs fp64 (#41 / new / C–G) |
+|---:|---:|---:|---:|---:|---:|---:|---:|---|---|---|
+| 1024 | 16 | 1e+03 | 1.80 | 1.63 | 1.11x | 1.56 | 1.15x | 117 / 121 / 123 | 1.8e-05 / 1.4e-05 / 1.6e-05 | 3.7e-06 / 3.1e-06 / 1.5e-05 |
+| 1024 | 32 | 1e+03 | 1.24 | 1.25 | 0.99x | 1.20 | 1.03x | 36 / 35 / 37 | 5.9e-06 / 8.4e-06 / 4.8e-06 | 3.8e-06 / 4.4e-06 / 6.8e-06 |
+| 1024 | 64 | 1e+03 | 2.16 | 1.97 | 1.10x | 1.85 | 1.17x | 120 / 120 / 126 | 1.9e-05 / 1.9e-05 / 2.0e-05 | 3.5e-06 / 3.5e-06 / 1.7e-05 |
+| 2048 | 32 | 1e+03 | 1.21 | 1.18 | 1.03x | 1.15 | 1.05x | 25 / 25 / 25 | 5.4e-06 / 5.5e-06 / 5.4e-06 | 1.1e-06 / 1.1e-06 / 2.6e-06 |
+| 2048 | 64 | 1e+03 | 1.38 | 1.30 | 1.06x | 1.27 | 1.08x | 33 / 33 / 33 | 6.6e-06 / 6.7e-06 / 6.7e-06 | 2.7e-06 / 2.7e-06 / 5.0e-06 |
+| 2048 | 128 | 1e+03 | 1.73 | 1.77 | 0.98x | 1.64 | 1.06x | 62 / 61 / 63 | 8.0e-06 / 8.9e-06 / 7.2e-06 | 4.9e-06 / 5.6e-06 / 4.7e-06 |
+| 2048 | 256 | 1e+03 | 3.71 | 3.55 | 1.04x | 3.60 | 1.03x | 127 / 127 / 134 | 1.3e-05 / 1.3e-05 / 2.7e-05 | 3.5e-06 / 3.5e-06 / 1.9e-05 |
+| 4096 | 64 | 1e+03 | 1.28 | 1.20 | 1.06x | 1.11 | 1.16x | 29 / 29 / 29 | 9.6e-06 / 8.8e-06 / 9.9e-06 | 4.5e-06 / 5.1e-06 / 9.7e-06 |
+| 4096 | 128 | 1e+03 | 1.91 | 1.75 | 1.09x | 1.59 | 1.20x | 54 / 54 / 53 | 7.0e-06 / 8.0e-06 / 8.9e-06 | 5.4e-06 / 5.2e-06 / 6.3e-06 |
+| 4096 | 256 | 1e+03 | 2.77 | 2.43 | 1.14x | 2.45 | 1.13x | 66 / 66 / 66 | 8.4e-06 / 8.9e-06 / 8.4e-06 | 5.0e-06 / 5.0e-06 / 5.2e-06 |
+| 4096 | 512 | 1e+03 | 9.40 | 8.54 | 1.10x | 8.55 | 1.10x | 120 / 120 / 120 | 6.1e-06 / 6.1e-06 / 9.9e-06 | 2.9e-06 / 2.9e-06 / 4.8e-06 |
+| 8192 | 122 | 1e+03 | 1.64 | 1.63 | 1.00x | 1.50 | 1.09x | 34 / 34 / 34 | 7.8e-06 / 8.6e-06 / 9.5e-06 | 3.8e-06 / 4.1e-06 / 1.1e-05 |
+| 8192 | 256 | 1e+03 | 2.28 | 2.03 | 1.12x | 2.09 | 1.09x | 48 / 48 / 48 | 7.2e-06 / 7.4e-06 / 7.6e-06 | 8.1e-06 / 8.5e-06 / 8.5e-06 |
+| 8192 | 512 | 1e+03 | 5.74 | 5.73 | 1.00x | 5.70 | 1.01x | 75 / 75 / 76 | 8.3e-06 / 8.3e-06 / 7.6e-06 | 1.0e-05 / 1.0e-05 / 1.0e-05 |
+| 8192 | 1024 | 1e+03 | 21.4 | 20.0 | 1.07x | 20.1 | 1.06x | 115 / 115 / 116 | 9.7e-06 / 9.7e-06 / 9.2e-06 | 1.0e-05 / 1.0e-05 / 9.8e-06 |
+| 2048 | 64 | 1e+05 | 1.95 | 1.45 | 1.35x | 1.33 | 1.46x | 43 / 42 / 41 | 4.1e-05 / 3.8e-05 / 1.0e-04 | 1.5e-04 / 2.5e-04 / 2.0e-04 |
+| 4096 | 128 | 1e+05 | 2.60 | 2.02 | 1.29x | 2.04 | 1.28x | 67 / 67 / 92 | 1.6e-05 / 1.7e-05 / 3.8e-05 | 2.1e-05 / 5.9e-05 / 2.1e-04 |
+| 8192 | 256 | 1e+05 | 3.09 | 2.49 | 1.24x | 2.40 | 1.28x | 59 / 60 / 59 | 1.6e-05 / 1.5e-05 / 2.7e-05 | 4.3e-04 / 3.7e-04 / 2.6e-04 |
+| 8192 | 1024 | 1e+05 | 37.7 | 35.0 | 1.08x | 34.9 | 1.08x | 214 / 214 / 214 | 1.2e-05 / 1.2e-05 / 3.5e-05 | 1.2e-05 / 1.2e-05 / 4.1e-05 |
+
+#### Block-Jacobi PCG, LNC=1 (ms to tol 1e-5, warm median of 9)
+
+| n | blocks | κ | #41 | new | speedup | iters (#41 / new) | true res (#41 / new) | err vs fp64 (#41 / new) |
+|---:|---:|---:|---:|---:|---:|---|---|---|
+| 1024 | 16 | 1e+03 | 1.98 | 1.80 | 1.10x | 98 / 98 | 1.9e-05 / 1.1e-05 | 6.2e-06 / 6.3e-06 |
+| 1024 | 32 | 1e+03 | 1.21 | 1.19 | 1.02x | 26 / 26 | 9.5e-06 / 9.5e-06 | 5.3e-06 / 5.3e-06 |
+| 1024 | 64 | 1e+03 | 2.58 | 2.26 | 1.14x | 114 / 114 | 2.4e-05 / 2.4e-05 | 5.9e-06 / 5.9e-06 |
+| 2048 | 32 | 1e+03 | 1.18 | 1.17 | 1.00x | 21 / 21 | 7.2e-06 / 7.2e-06 | 2.0e-06 / 2.0e-06 |
+| 2048 | 64 | 1e+03 | 1.44 | 1.23 | 1.17x | 27 / 27 | 3.6e-06 / 3.6e-06 | 2.1e-06 / 2.0e-06 |
+| 2048 | 128 | 1e+03 | 1.85 | 1.82 | 1.02x | 51 / 51 | 9.8e-06 / 8.7e-06 | 4.4e-06 / 3.6e-06 |
+| 2048 | 256 | 1e+03 | 5.38 | 4.92 | 1.09x | 161 / 161 | 1.4e-05 / 1.4e-05 | 4.5e-06 / 4.5e-06 |
+| 4096 | 64 | 1e+03 | 1.33 | 1.24 | 1.07x | 24 / 24 | 5.8e-06 / 5.5e-06 | 2.6e-06 / 2.7e-06 |
+| 4096 | 128 | 1e+03 | 2.06 | 1.82 | 1.13x | 44 / 43 | 4.9e-06 / 9.8e-06 | 3.1e-06 / 5.6e-06 |
+| 4096 | 256 | 1e+03 | 2.70 | 2.35 | 1.15x | 50 / 49 | 6.1e-06 / 8.1e-06 | 4.1e-06 / 4.6e-06 |
+| 4096 | 512 | 1e+03 | 7.42 | 6.78 | 1.10x | 82 / 82 | 9.0e-06 / 9.0e-06 | 6.4e-06 / 6.4e-06 |
+| 8192 | 122 | 1e+03 | 1.88 | 1.61 | 1.17x | 30 / 30 | 6.0e-06 / 6.0e-06 | 4.0e-06 / 4.1e-06 |
+| 8192 | 256 | 1e+03 | 2.71 | 2.44 | 1.11x | 41 / 41 | 9.7e-06 / 9.7e-06 | 2.0e-05 / 2.0e-05 |
+| 8192 | 512 | 1e+03 | 6.02 | 5.55 | 1.08x | 61 / 61 | 7.9e-06 / 7.9e-06 | 8.7e-06 / 8.7e-06 |
+| 8192 | 1024 | 1e+03 | 14.5 | 14.1 | 1.03x | 76 / 76 | 8.1e-06 / 8.1e-06 | 1.1e-05 / 1.1e-05 |
+| 2048 | 64 | 1e+05 | 2.00 | 1.40 | 1.43x | 33 / 33 | 3.5e-05 / 3.2e-05 | 2.6e-04 / 1.7e-04 |
+| 4096 | 128 | 1e+05 | 2.55 | 2.00 | 1.28x | 54 / 54 | 1.5e-05 / 1.4e-05 | 1.3e-05 / 6.4e-05 |
+| 8192 | 256 | 1e+05 | 3.47 | 2.68 | 1.30x | 53 / 53 | 1.3e-05 / 1.3e-05 | 2.6e-04 / 3.0e-04 |
+| 8192 | 1024 | 1e+05 | 24.1 | 23.6 | 1.02x | 131 / 131 | 1.2e-05 / 1.2e-05 | 1.5e-06 / 1.5e-06 |
+
+### Reading the fixed-cost tables
+
+- **The fixed cost per plain CG iteration fell from about 11 µs to about
+  4.4 µs at LNC=2, and from about 8 µs to about 3.5 µs at LNC=1.** The
+  biggest items were the exchanges (one per plain CG step instead of
+  two, through GpSimd's SBUF-to-SBUF DMA, with no copies thanks to the
+  segment layout) and the matvec tail (one PSUM copy and one transpose
+  per chunk instead of four, from the spread source vectors).
+- **Per iteration** the new kernel is 1.28–1.43x faster at LNC=2 split
+  for plain CG and 1.17–1.34x for PCG; at LNC=1, 1.02–1.26x (plain) and
+  1.03–1.32x (PCG). The matvec itself, about 270 ns per block on each of
+  four concurrent column groups, now dominates from about 128 resident
+  blocks per core; the row order that balances the groups takes 1–2 µs
+  off at 256–512 blocks.
+- **Streamed blocks.** When A does not fit in SBUF (n = 8192 with 512
+  blocks on one core, 1024 blocks) the HBM stream sets the pace. There the
+  kernel keeps the original row order and chunks of at most 32 rows,
+  which measured faster than one large chunk (a first version with the
+  balanced order and one 64-row chunk was 5–10% slower than #41 on these
+  cases at LNC=1; the shipped rule is 1.02–1.13x faster).
+- **Time to tolerance** changes by 0.98–1.46x (the low end is within run-to-run noise). It includes the launch and the
+  host-to-device and device-to-host copies (about 0.8–1 ms), which this
+  change does not touch, so the gain is largest where iterations
+  dominate. Two #41 entries at n = 8192, 256 blocks, κ = 1e5, LNC=2
+  (7.0 and 8.0 ms) are host-side outliers that persisted over 9 runs;
+  the 3.3x there is not a kernel effect.
+- **Accuracy is unchanged** for the default: iteration counts are within
+  ±3 and the true residuals and errors against fp64 match #41 within
+  run-to-run variation (both are fp32 with a different summation order).
+- **Chronopoulos–Gear** saves about 1 µs per iteration (0.1–1.6 µs in the
+  per-iteration table) but is less accurate: the true residual is up to
+  2–3x and the error up to 5x those of standard CG, and at n = 4096,
+  128 blocks, κ = 1e5 on one core it needed 92 iterations against 67. It
+  stays opt-in.
+- **PSUM allocation.** The production kernels no longer fall back to
+  neuronx-cc allocation and scheduling (#41 noted the fallback); the
+  per-scope PSUM tiles were worth about 0.3 µs per iteration.

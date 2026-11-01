@@ -615,7 +615,8 @@ def cg_bsr_fused(
             so the two dot products r.r and (A r).r form one reduction phase
             and only one of them waits for the matvec. In exact arithmetic it
             is CG; in floating point the recursive residual drifts further
-            from b - A x, so the attainable accuracy can be slightly worse
+            from b - A x: on the Trn2 benchmarks the true residual is up to
+            2-3x and the error up to 5x that of "standard" at the same tol
             (see docs/iterative_solvers.md). The host path runs the same
             recurrence.
 

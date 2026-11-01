@@ -186,10 +186,11 @@ ready while the matvec runs: only one dot product (delta) sits between
 the matvec and the next r update, against two in standard CG. In exact
 arithmetic it is CG. In floating point the recurrence for s drifts from
 A p, so the recursive residual can drift further from b - A x and the
-attainable accuracy is somewhat worse; on the benchmark matrices (κ up
-to 1e5, tol 1e-5) the true residual and the iteration counts match
-standard CG (`benchmarks.md`), but it stays opt-in. The host path runs
-the same recurrence.
+attainable accuracy is worse. On the benchmark matrices (tol 1e-5) the
+iteration counts match standard CG within a few percent, but the true
+residual is up to 2–3x larger and the error against fp64 up to 5x larger
+in some cases (`benchmarks.md`), so it stays opt-in. It saves about 1 µs
+per iteration. The host path runs the same recurrence.
 
 ### What limits it
 
@@ -206,7 +207,7 @@ Measured on Trn2 (see `benchmarks.md`):
   150–300 ns each: the PSUM copy, transpose and copy that finish each
   matvec, the exchange, two dot products (multiply-reduce on VectorE, sum
   over partitions on TensorE), the step sizes, and the r and p updates.
-  The Chronopoulos–Gear recurrence takes about 1 µs more off.
+  The Chronopoulos–Gear recurrence (opt-in) takes about 1 µs more off.
 - Blocks past the SBUF budget stream from HBM (64 KiB per fp32 block), so
   residency matters: at n = 8192 with 1024 blocks, the streamed blocks set
   the pace.
