@@ -475,6 +475,19 @@ def _bf16_split_vec(v: torch.Tensor) -> torch.Tensor:
     return hi + (v - hi).to(torch.bfloat16).to(v.dtype)
 
 
+def _require_real_float(fn: str, name: str, t: torch.Tensor | None) -> None:
+    """The fused solvers compute in real floating point; refuse anything else.
+
+    Through 0.13.0 complex inputs lost their imaginary part and integer / bool
+    results were truncated, silently, on every backend (#85).
+    """
+    if t is not None and not t.dtype.is_floating_point:
+        raise TypeError(
+            f"{fn}: {name} must be a real floating-point tensor "
+            f"(float16, bfloat16, float32 or float64), got {t.dtype}"
+        )
+
+
 class FusedCGOperator:
     """An SPD BSR matrix prepared for `cg_bsr_fused`.
 
@@ -493,6 +506,7 @@ class FusedCGOperator:
     """
 
     def __init__(self, A: BSRMatrix, preconditioner: str | None, device):
+        _require_real_float("cg_bsr_fused / prepare_cg_bsr", "A.blocks", A.blocks)
         if A.block_size != _P:
             raise ValueError(f"cg_bsr_fused needs block_size=128, got {A.block_size}")
         m, n = A.shape
@@ -716,7 +730,12 @@ def cg_bsr_fused(
         `(x, iters, rel_residual)` like `cg_bsr`, plus the info dict when
         `return_info`. rel_residual is the recursive ||r|| / ||b||. For a
         2-D b, iters and rel_residual are per-column tensors.
+
+    Raises:
+        TypeError: A, b or x0 is complex, integer or bool (on every backend).
     """
+    _require_real_float("cg_bsr_fused", "b", b)
+    _require_real_float("cg_bsr_fused", "x0", x0)
     op = (
         A
         if isinstance(A, FusedCGOperator)
@@ -902,7 +921,11 @@ def power_iteration_bsr_fused(
     Returns:
         `(eigenvalue, eigenvector, iters)` like `power_iteration_bsr`, plus
         the info dict when `return_info`.
+
+    Raises:
+        TypeError: A or v0 is complex, integer or bool (on every backend).
     """
+    _require_real_float("power_iteration_bsr_fused", "v0", v0)
     op = A if isinstance(A, FusedCGOperator) else prepare_cg_bsr(A, device=_accel_device(v0))
     n, T = op.n, op.n_tiles
     if matvec == "auto":

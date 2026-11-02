@@ -29,6 +29,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `tol` / `max_iter` / `M`, giving `grad_b = lam` and
   `grad_A = -lam x^H` on the stored blocks. `x0` and `M` no longer receive
   gradients. Forward values are unchanged. Affects 0.3.2 through 0.13.0.
+- **`cg_bsr_fused` / `power_iteration_bsr_fused` gave wrong results for
+  complex, integer and bool inputs** (silent, #85). Both pack A and the
+  vectors into real float tiles, so on every backend (including
+  `set_backend("pytorch")`) a complex A or b lost its imaginary part, and an
+  integer or bool b gave a truncated x of b's dtype. They (and
+  `prepare_cg_bsr`) now raise `TypeError` for a non-real-float `A.blocks`,
+  `b`, `x0` or `v0`, before any backend runs. Affects 0.11.0 through 0.13.0.
 
 ## [0.13.0] — 2026-11-02
 
