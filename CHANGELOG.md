@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0] — 2026-11-02
+
+Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
+
+Headline: **correctness fixes — upgrade recommended.** `COOMatrix.to_dense` dropped duplicate entries (#56); `from_scipy` dropped the imaginary part (#58); attention second derivatives were wrong (#65); `spmv`/`spmm` accepted a broadcasting y/C (#67); `chebyshev_coeffs` was not the Chebyshev polynomial for K ≥ 2 (#73); `bsr_diagonal` padded tall matrices (#74); on device, complex `bsr_spmm` dropped the imaginary part (#78), integer `spmv`/`spmm` returned float32 (#79), and an undersized attention mask was accepted (#82). New: bf16 and head_dim > 128 gather attention (#49), and Schwarz-screened tile skipping that beats dense aten for large screened products (#89).
+
 ### Added
 
 - **`screened_spmm` skips screened-out tiles (#61).** On the native
