@@ -86,6 +86,52 @@ class TestCgBsr:
         assert iters == 0
         assert rel == 0.0
 
+    def test_breakdown_on_first_step(self):
+        """p . A p = 0 at k=0 (A = 0): no step, x = x0, iters 0, rel 1 (#86)."""
+        A = trnsparse.BSRMatrix.from_dense(torch.zeros(128, 128), block_size=128)
+        b = torch.ones(128)
+        x, iters, rel = trnsparse.cg_bsr(A, b)
+        torch.testing.assert_close(x, torch.zeros(128))
+        assert iters == 0
+        assert rel == pytest.approx(1.0)
+
+    def test_exact_x0_with_zero_tol(self):
+        """x0 already solves A x = b and tol=0: breakdown at k=0 returns x0 (#71)."""
+        A = trnsparse.BSRMatrix.from_dense(2.0 * torch.eye(16, dtype=torch.float64), block_size=8)
+        b = torch.ones(16, dtype=torch.float64)
+        x0 = torch.full((16,), 0.5, dtype=torch.float64)
+        x, iters, rel = trnsparse.cg_bsr(A, b, x0=x0, tol=0.0, max_iter=50)
+        torch.testing.assert_close(x, x0)
+        assert iters == 0
+        assert rel == 0.0
+
+    def test_max_iter_zero(self):
+        """max_iter=0 returns (x0, 0, ||b - A x0|| / ||b||) (#71)."""
+        # Local generator: the global RNG state is left alone for other tests.
+        gen = torch.Generator().manual_seed(5)
+        Mr = torch.randn(64, 64, dtype=torch.float64, generator=gen)
+        Ad = Mr @ Mr.T + 64 * torch.eye(64, dtype=torch.float64)
+        A = trnsparse.BSRMatrix.from_dense(Ad, block_size=8)
+        b = torch.randn(64, dtype=torch.float64, generator=gen)
+        x0 = torch.randn(64, dtype=torch.float64, generator=gen)
+        x, iters, rel = trnsparse.cg_bsr(A, b, x0=x0, max_iter=0)
+        torch.testing.assert_close(x, x0)
+        assert iters == 0
+        ref = (torch.linalg.norm(b - Ad @ x0) / torch.linalg.norm(b)).item()
+        assert rel == pytest.approx(ref, rel=1e-12)
+
+    def test_breakdown_reports_steps_taken(self):
+        """A = I with tol=0: one step solves exactly, then p = 0 breaks down.
+
+        The reported count is the steps taken (1), not max_iter (#71).
+        """
+        A = trnsparse.BSRMatrix.from_dense(torch.eye(16, dtype=torch.float64), block_size=8)
+        b = torch.arange(1.0, 17.0, dtype=torch.float64)
+        x, iters, rel = trnsparse.cg_bsr(A, b, tol=0.0, max_iter=500)
+        torch.testing.assert_close(x, b)
+        assert iters == 1
+        assert rel == 0.0
+
 
 class TestCgBsrAutograd:
     """cg_bsr differentiates as the exact solve A^{-1} b (#70)."""
