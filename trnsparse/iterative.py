@@ -11,9 +11,11 @@ kept local to avoid a trnsolver runtime dep.
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Callable
 
 import torch
+from torch.autograd.function import once_differentiable
 
 from .formats import BSRMatrix
 from .ops import bsr_spmm
@@ -92,10 +94,17 @@ def cg_bsr(
     Returns:
         `(x, iters, rel_residual)` — solution, iteration count, final
         relative residual.
-    """
-    n = b.shape[0]
-    matvec = _bsr_matvec(A)
 
+    Autograd: when `b` or `A.blocks` requires grad, `x` is differentiated
+    as the exact solve `A^{-1} b` (implicit differentiation, as
+    `torch.linalg.solve` does). Backward runs a second CG solve,
+    `A lam = grad_x`, with the same `tol`, `max_iter` and `M`, so the
+    gradient is accurate to the solve tolerance; `grad_b = lam` and
+    `grad_A = -lam x^H` on the stored blocks. `x0` and `M` get no
+    gradient (the exact solution does not depend on them). Through 0.13.0
+    the gradient went through the CG iterations with frozen step sizes and
+    was silently wrong (#70).
+    """
     if M is None:
         precond: Callable[[torch.Tensor], torch.Tensor] | None = None
     elif callable(M):
@@ -105,6 +114,32 @@ def cg_bsr(
 
         def precond(r: torch.Tensor) -> torch.Tensor:
             return torch.mv(M_tensor, r)
+
+    needs_grad = torch.is_grad_enabled() and (
+        b.requires_grad
+        or A.blocks.requires_grad
+        or (x0 is not None and x0.requires_grad)
+        or (isinstance(M, torch.Tensor) and M.requires_grad)
+    )
+    if not needs_grad:
+        return _cg_bsr_loop(A, b, x0, tol, max_iter, precond)
+    info: list = []
+    A_const = dataclasses.replace(A, blocks=A.blocks.detach())
+    x0_const = x0.detach() if x0 is not None else None
+    x = _CGBSRSolve.apply(A.blocks, b, A_const, x0_const, tol, max_iter, precond, info)
+    return x, info[0], info[1]
+
+
+def _cg_bsr_loop(
+    A: BSRMatrix,
+    b: torch.Tensor,
+    x0: torch.Tensor | None,
+    tol: float,
+    max_iter: int,
+    precond: Callable[[torch.Tensor], torch.Tensor] | None,
+) -> tuple[torch.Tensor, int, float]:
+    n = b.shape[0]
+    matvec = _bsr_matvec(A)
 
     x = x0.clone() if x0 is not None else torch.zeros(n, dtype=b.dtype, device=b.device)
     r = b - matvec(x)
@@ -138,6 +173,45 @@ def cg_bsr(
         rz = rz_new
 
     return x, max_iter, r_norm / b_norm
+
+
+class _CGBSRSolve(torch.autograd.Function):
+    """`x = A^{-1} b` with the gradient of the exact solve (implicit differentiation).
+
+    Backward solves the adjoint system `A^H lam = g` with the same CG
+    settings (A is SPD / Hermitian, so `A^H = A`), then
+    `grad_b = lam` and `grad_A = -lam x^H`, restricted to the stored blocks.
+    """
+
+    @staticmethod
+    def forward(ctx, blocks, b, A, x0, tol, max_iter, precond, info):
+        x, iters, rel = _cg_bsr_loop(A, b.detach(), x0, tol, max_iter, precond)
+        info.extend([iters, rel])
+        ctx.A, ctx.tol, ctx.max_iter, ctx.precond = A, tol, max_iter, precond
+        ctx.save_for_backward(x)
+        return x
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx, g):
+        (x,) = ctx.saved_tensors
+        A = ctx.A
+        lam, _, _ = _cg_bsr_loop(A, g, None, ctx.tol, ctx.max_iter, ctx.precond)
+        grad_blocks = grad_b = None
+        if ctx.needs_input_grad[1]:
+            grad_b = lam
+        if ctx.needs_input_grad[0]:
+            bs = A.block_size
+            m, n = A.shape
+            Mt, Nt = -(-m // bs), -(-n // bs)
+            lam_t = torch.nn.functional.pad(lam, (0, Mt * bs - lam.shape[0])).reshape(Mt, bs)
+            x_t = torch.nn.functional.pad(x, (0, Nt * bs - x.shape[0])).reshape(Nt, bs)
+            ptrs = A.block_row_ptrs.to(device=lam.device, dtype=torch.long)
+            rows = torch.repeat_interleave(torch.arange(Mt, device=lam.device), ptrs.diff())
+            cols = A.block_col_indices.to(device=lam.device, dtype=torch.long)
+            grad_blocks = -(lam_t[rows].unsqueeze(2) * x_t[cols].conj().unsqueeze(1))
+            grad_blocks = grad_blocks.to(dtype=A.blocks.dtype, device=A.blocks.device)
+        return grad_blocks, grad_b, None, None, None, None, None, None
 
 
 def jacobi_preconditioner_bsr(

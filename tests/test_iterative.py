@@ -87,6 +87,72 @@ class TestCgBsr:
         assert rel == 0.0
 
 
+class TestCgBsrAutograd:
+    """cg_bsr differentiates as the exact solve A^{-1} b (#70)."""
+
+    @staticmethod
+    def _randn(*shape, seed=0):
+        gen = torch.Generator().manual_seed(seed)
+        return torch.randn(*shape, dtype=torch.float64, generator=gen)
+
+    @staticmethod
+    def _spd(n=64, bs=8):
+        # Local generator: the global RNG state is left alone for other tests.
+        gen = torch.Generator().manual_seed(3)
+        d = torch.linspace(1.0, 50.0, n, dtype=torch.float64)
+        Q = torch.linalg.qr(torch.randn(n, n, dtype=torch.float64, generator=gen))[0]
+        Ad = Q @ torch.diag(d) @ Q.T
+        return Ad, d, Q, trnsparse.BSRMatrix.from_dense(Ad, block_size=bs)
+
+    def test_grad_b_one_step_convergence(self):
+        # b along an eigenvector: CG stops after one step, where the old
+        # frozen-step-size graph gave a gradient ~20% off A^{-1} g.
+        Ad, _, Q, A = self._spd()
+        b = Q[:, -1].clone().requires_grad_()
+        x, iters, _ = trnsparse.cg_bsr(A, b, tol=1e-12, max_iter=500)
+        assert iters == 1
+        assert x.requires_grad
+        g = self._randn(64, seed=1)
+        (x * g).sum().backward()
+        torch.testing.assert_close(b.grad, torch.linalg.solve(Ad, g), rtol=1e-8, atol=1e-8)
+
+    def test_grad_blocks_matches_dense_solve(self):
+        Ad, _, Q, A = self._spd()
+        rhs = Q[:, -1].clone()
+        blk = A.blocks.clone().requires_grad_()
+        A2 = trnsparse.BSRMatrix(blk, A.block_col_indices, A.block_row_ptrs, A.shape, A.block_size)
+        x, _, _ = trnsparse.cg_bsr(A2, rhs, tol=1e-12, max_iter=500)
+        g = self._randn(64, seed=1)
+        (x * g).sum().backward()
+
+        Ad_leaf = Ad.clone().requires_grad_()
+        (torch.linalg.solve(Ad_leaf, rhs) * g).sum().backward()
+        ref = trnsparse.BSRMatrix.from_dense(Ad_leaf.grad, block_size=8)
+        # same block structure (dense matrix -> every block stored)
+        assert torch.equal(ref.block_col_indices, A.block_col_indices)
+        torch.testing.assert_close(blk.grad, ref.blocks, rtol=1e-7, atol=1e-9)
+
+    def test_values_and_info_unchanged_by_grad(self):
+        _, _, _, A = self._spd()
+        b = self._randn(64, seed=2)
+        x0, it0, r0 = trnsparse.cg_bsr(A, b, tol=1e-10)
+        x1, it1, r1 = trnsparse.cg_bsr(A, b.clone().requires_grad_(), tol=1e-10)
+        assert torch.equal(x0, x1.detach()) and (it0, r0) == (it1, r1)
+
+    def test_gradcheck(self):
+        _, _, _, A = self._spd(16, 4)
+        blk = A.blocks.clone().requires_grad_()
+        b = self._randn(16, seed=4).requires_grad_()
+
+        def f(blk, b):
+            M = trnsparse.BSRMatrix(blk, A.block_col_indices, A.block_row_ptrs, A.shape, 4)
+            return trnsparse.cg_bsr(M, b, tol=1e-14, max_iter=200)[0]
+
+        # Perturbing single block entries makes A nonsymmetric, where CG is
+        # not a solve; gradcheck b (A is covered by the dense-solve test above).
+        assert torch.autograd.gradcheck(lambda b: f(blk.detach(), b), (b,))
+
+
 class TestPowerIterationBsr:
     def test_dominant_eigenvalue_diagonal(self):
         """Diagonal matrix: dominant eigenvalue is max(diag); eigenvector
