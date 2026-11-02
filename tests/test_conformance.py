@@ -362,21 +362,14 @@ def test_coo_duplicates_sum(dtype):
     assert_close(ts.spmv(coo.to_csr(), D(torch.ones(3, dtype=dtype))), ref.sum(1), dtype)
 
 
-_SCIPY_DTYPE_XFAIL = pytest.mark.xfail(
-    strict=True,
-    reason="trnsci/trnsparse#69 needs decision: from_scipy stores float32/complex64 "
-    "whatever the scipy dtype",
-)
-
-
 @pytest.mark.parametrize(
     "npdt",
     [
         np.float32,
         np.complex64,
-        pytest.param(np.float64, marks=_SCIPY_DTYPE_XFAIL),
-        pytest.param(np.complex128, marks=_SCIPY_DTYPE_XFAIL),
-        pytest.param(np.int64, marks=_SCIPY_DTYPE_XFAIL),
+        np.float64,
+        np.complex128,
+        np.int64,
     ],
     ids=lambda d: d.__name__,
 )
