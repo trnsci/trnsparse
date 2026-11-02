@@ -20,8 +20,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `NKI_TRACE_CACHE_URL` directory per session (no stale editable-install
   traces). `NKI_ENABLE_TRACE_CACHE=0` still turns it off.
 - README: known platform issue note for #1454.
+
 ### Fixed
 
+- **`bsr_spmm` dropped the imaginary part of complex operands on the NKI
+  backend** (silent, #78). The static-structure kernel path cast complex
+  blocks and `B` to fp32 and the result back to complex, so the imaginary
+  part was zero and the value was wrong. Affects 0.8.0 through 0.12.1 on
+  Trainium with `block_size=128`. Complex operands now run as real kernel
+  launches: one per real part of A, against `[Re B | Im B]`. Autograd works
+  through them. Found by the conformance suite on Trn2 (trnsci/trnsci#35).
+- **`spmv` / `spmm` returned float32 for integer operands on the device**
+  (silent dtype change, #79). The default `alpha=1.0` (and `beta=1.0`) were
+  applied as `alpha * product`. A Python float times an integer tensor
+  promotes, so int32/int64 products on a `neuron` operand came back float32.
+  Affects every release with the device dense CSR path, through 0.12.1. A
+  scale of 1 is now skipped. Found by the conformance suite on Trn2
 - **`block_sparse_attention_tiled` accepted a mask smaller than `seq_len` on
   the NKI path** (silent, #82). With a `(256, 256)` mask and `seq_len = 384`,
   the native `bsr_attn` op returned output rows 256..383 that no mask block
@@ -49,14 +63,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   worst-case residual after K steps was up to ~3x the Chebyshev bound
   (K = 7). The coefficients now follow Saad's three-term recurrence
   (Alg. 12.1) and the residual is T_K((d - lam)/c) / T_K(d/c) (#73).
-### Fixed
 
 - **`from_scipy` discarded the imaginary part of complex matrices** (silent;
   every release 0.1.1–0.12.1). Values were always cast to float32, so a
   complex scipy matrix became its real part (one C++ `UserWarning`, no
   error). Complex input now gives `complex64` values; real input is
   unchanged (float32) (#58).
-### Fixed
 
 - **Second derivatives of `block_sparse_attention_tiled` were wrong**
   (silent; 0.6.0–0.12.1, the releases with attention autograd, on the
@@ -66,7 +78,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   vector products) dropped their dependence on Q and K, with no error.
   Double backward now differentiates a graph-carrying recomputation; first-
   order gradients are unchanged (#65).
-### Fixed
 
 - **`spmv` / `spmm` accepted a `y` / `C` that enlarged the output** (silent;
   every release 0.1.1–0.12.1, all backends). `beta * y` was added with plain
@@ -74,6 +85,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with no error, where `torch.addmv` / `addmm` raise. Such shapes now raise
   `ValueError`; every `y` / `C` that broadcasts to the product's shape works
   as before (#67).
+
+
+- **bf16 Q / K / V raised on the gather attention kernels** (loud; #49).
+  Affects released versions **0.4.4 through 0.12.1** with `backend="nki"`
+  (or `"auto"` on Neuron): every bf16 call that took the gather kernels,
+  i.e. `head_dim > 128` (K-tiled, since 0.6.0), the XLA path, or the native
+  path with the static structure off. The weights @ V, dS @ K, dSᵀ @ Q and
+  Pᵀ @ dO matmuls paired fp32 P / dS with bf16 operands, and NKI rejects
+  mixed fp32 / bf16 `nc_matmul` operands ("if one input is tfloat32/float32,
+  both must be"). With `TRNSPARSE_REQUIRE_NKI=1` the call raised. Without it,
+  the call fell back to the PyTorch path, which gives correct results but
+  runs off the NKI path. The gather kernels now handle precision like the
+  static kernels: one operand dtype per call (bf16 when Q, K, V (and dO) are
+  all bf16, else fp32); fp32 scores, softmax statistics, D and PSUM; and P /
+  dS rounded to the operand dtype before their matmul. The scale and D are
+  computed on the host in fp32. fp32 and fp64 inputs give the same values as
+  before.
+- **`head_dim` above 128 that is not a multiple of 128 (e.g. 192) raised on
+  the NKI attention path** (`AssertionError` in the gather, released 0.6.0
+  through 0.12.1). It is now zero-padded to the next multiple of 128 for the
+  K-tiled kernels and sliced back; zero columns change no score and no
+  gradient (#49).
 
 ## [0.12.1] — 2026-11-01
 

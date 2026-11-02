@@ -56,6 +56,13 @@ def _csr_matmul(A: CSRMatrix, X: torch.Tensor) -> torch.Tensor:
     return _csr_to_dense_host(A).to(X.device) @ X
 
 
+def _scaled(s: float, t: torch.Tensor) -> torch.Tensor:
+    """`s * t`, but `t` itself when `s == 1`: a Python float times an integer
+    tensor promotes to float, so the default `alpha=1.0` turned integer
+    products on the device into float32 (#79)."""
+    return t if s == 1 else s * t
+
+
 def spmv(
     A: CSRMatrix,
     x: torch.Tensor,
@@ -77,10 +84,10 @@ def spmv(
     m, n = A.shape
     assert x.shape[0] == n, f"Dimension mismatch: A is {A.shape}, x is {x.shape}"
 
-    result = alpha * _csr_matmul(A, x)
+    result = _scaled(alpha, _csr_matmul(A, x))
     if y is not None and beta != 0.0:
         _check_epilogue_shape("spmv", "y", y, result)
-        result = result + beta * y
+        result = result + _scaled(beta, y)
     return result
 
 
@@ -130,12 +137,12 @@ def spmm(
     assert B.shape[0] == n, f"Dimension mismatch: A is {A.shape}, B is {B.shape}"
 
     if _use_nki():
-        result = alpha * nki_spmm(A, B)
+        result = _scaled(alpha, nki_spmm(A, B))
     else:
-        result = alpha * _csr_matmul(A, B)
+        result = _scaled(alpha, _csr_matmul(A, B))
     if C is not None and beta != 0.0:
         _check_epilogue_shape("spmm", "C", C, result)
-        result = result + beta * C
+        result = result + _scaled(beta, C)
     return result
 
 
@@ -791,9 +798,12 @@ def block_sparse_attention_tiled(
         scale: Optional QK scale (default: head_dim ** -0.5).
 
     Note:
-        On the NKI backend, head_dim must be ≤ 128 (single tile) or a
-        multiple of 128 (K-tiling, e.g., 256 or 512). The PyTorch backend
-        accepts any head_dim.
+        On the NKI backend, head_dim ≤ 128 runs as a single tile and larger
+        head_dims are K-tiled in 128-column chunks (e.g. 256 or 512; others,
+        such as 192, are zero-padded to the next multiple of 128). fp32 and
+        bf16 Q / K / V are supported on every NKI path; bf16 needs all three
+        in bf16 (a mixed call runs in fp32), with fp32 scores, statistics and
+        accumulation. The PyTorch backend accepts any head_dim.
 
         Placement (native TorchNeuron): the mask's `block_row_ptrs` /
         `block_col_indices` stay on the host; Q, K, V may be on the host or
