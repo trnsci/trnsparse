@@ -101,6 +101,24 @@ def bsr_spmm_static_t(
     return _k._bsr_spmm_static_t_kernel(blocks_t, b, tuple(row_ptrs), tuple(cols))
 
 
+@nki_op(
+    "trnsparse::screened_tiles_keyed",
+    mutates_args={},
+    fake_fn=lambda a, q_col, q_row, thr, b, key: b.new_empty((a.shape[0], b.shape[1])),
+)
+def screened_tiles_keyed(
+    a: torch.Tensor,
+    q_col: torch.Tensor,
+    q_row: torch.Tensor,
+    thr: torch.Tensor,
+    b: torch.Tensor,
+    key: int,
+) -> torch.Tensor:
+    # Screened SpMM with tile skipping (#61): the kept-tile classification is
+    # the registered structure `key`; A, B, the bounds and tau are tensors.
+    return _k._screened_tiles_keyed_kernel(a, q_col, q_row, thr, b, int(key))
+
+
 def _fake_keyed_spmm(blocks, b, key):
     return b.new_empty(((len(_k._STRUCTURES[key][0]) - 1) * _P, b.shape[1]))
 
@@ -433,6 +451,22 @@ def _screened_spmm_backward(ctx, grad):
 spmm_dense.register_autograd(_spmm_dense_backward, setup_context=_save_inputs)
 bsr_spmm.register_autograd(_bsr_spmm_backward, setup_context=_save_inputs)
 screened_spmm.register_autograd(_screened_spmm_backward, setup_context=_save_inputs)
+
+
+def _screened_tiles_backward(ctx, grad):
+    a, q_col, q_row, thr, b = ctx.saved_tensors
+    mask = ((q_col * q_row) > thr[:1, :1]).to(a.dtype)
+    grad = grad.to(a.dtype)
+    grad_a = (grad @ b.T) * mask if ctx.needs_input_grad[0] else None
+    grad_b = (a * mask).T @ grad if ctx.needs_input_grad[4] else None
+    return grad_a, None, None, None, grad_b, None
+
+
+def _save_screened_tiles(ctx, inputs, output):
+    ctx.save_for_backward(*inputs[:5])
+
+
+screened_tiles_keyed.register_autograd(_screened_tiles_backward, setup_context=_save_screened_tiles)
 bsr_spmm_static.register_autograd(_bsr_spmm_static_backward, setup_context=_save_static)
 
 
@@ -491,6 +525,7 @@ OPS = {
     "attn_fwd_static": attn_fwd_static,
     "attn_bwd_static": attn_bwd_static,
     "screened_spmm": screened_spmm,
+    "screened_tiles_keyed": screened_tiles_keyed,
     "attn_stats": attn_stats,
     "attn_out": attn_out,
     "attn_bwd_dq": attn_bwd_dq,

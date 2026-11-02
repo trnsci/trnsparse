@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`screened_spmm` skips screened-out tiles (#61).** On the native
+  TorchNeuron path the host classifies each 128 x 128 tile of `A` from the
+  Schwarz bounds alone (skip / full / partial, exact in fp32) and one keyed
+  kernel loads, transposes and multiplies only the kept tiles; partial
+  tiles get the element mask on chip. `A` stays dense on the device and
+  nothing is gathered. The plan (classification, key, device bounds) is
+  cached while the same bound tensor is reused. New keyword
+  `symmetric=True` (for `A == A.T`, as for the pair-index ERI matrix) skips
+  the Tensor Engine transposes. On Trn2 (LNC=2) at n = 8192, N = 512 it is
+  faster than dense aten `A @ B` up to 80% of tiles kept in fp32 (5.9x at
+  5%) and up to ~65% in bf16; at n = 4096 up to ~75% (fp32) / not in bf16;
+  at n <= 2048 the ~0.25 ms launch floor loses to aten. It beats
+  `(A * mask) @ B` and the previous fused kernel at every density for
+  n >= 4096. Results are in
+  docs/benchmarks.md. `TRNSPARSE_SCREEN_SKIP_TILES=0` restores the
+  all-tiles fused kernel. `trnsparse.nki.dispatch.screened_tile_structure`
+  exposes the classification.
+
 - **Guard against the NKI trace-cache closure bug ([aws-neuron/aws-neuron-sdk#1454](https://github.com/aws-neuron/aws-neuron-sdk/issues/1454),
   trnsci/trnsci#35).** `tests/test_trace_cache_safety.py` (CPU) finds every
   `@nki.jit` kernel and fails if its body, or a helper it calls, reads a
@@ -22,6 +40,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - README: known platform issue note for #1454.
 
 ### Fixed
+
+- `screened_spmm` with a 1-D `B` on the NKI backend raised `ValueError`
+  (pre-existing on main; found by the conformance suite on Trn2 during #61).
 
 - **`bsr_spmm` dropped the imaginary part of complex operands on the NKI
   backend** (silent, #78). The static-structure kernel path cast complex

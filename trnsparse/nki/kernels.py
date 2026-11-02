@@ -82,10 +82,10 @@ def _row_block_counts(ptrs) -> list[int]:
 
 
 # Registered static structures, keyed by content hash (`register_structure`).
-_STRUCTURES: dict[int, tuple[tuple[int, ...], tuple[int, ...]]] = {}
+_STRUCTURES: dict[int, tuple[tuple[int, ...], ...]] = {}
 
 
-def register_structure(row_ptrs, cols) -> int:
+def register_structure(row_ptrs, cols, *extra) -> int:
     """Key for a block structure, for the `*_keyed_kernel`s.
 
     The key is the first 62 bits of the SHA-256 of the structure, so equal
@@ -94,9 +94,11 @@ def register_structure(row_ptrs, cols) -> int:
     """
     rp = tuple(int(x) for x in row_ptrs)
     cl = tuple(int(x) for x in cols)
-    digest = hashlib.sha256(repr((rp, cl)).encode()).digest()
+    ex = tuple(tuple(int(x) for x in e) for e in extra)
+    # Without extras the hash input is unchanged from earlier releases.
+    digest = hashlib.sha256(repr((rp, cl) + ex if ex else (rp, cl)).encode()).digest()
     key = int.from_bytes(digest[:8], "big") >> 2
-    _STRUCTURES.setdefault(key, (rp, cl))
+    _STRUCTURES.setdefault(key, (rp, cl) + ex)
     return key
 
 
@@ -1019,6 +1021,211 @@ if HAS_NKI:
     @nki.jit
     def _attn_fwd_keyed_kernel(q_t, k_t, v, key):
         return _attn_fwd_static_body(q_t, k_t, v, *_STRUCTURES[key])
+
+    # ── Schwarz-screened SpMM with tile skipping (#61) ───────────────────────
+    #
+    # C = (A * mask) @ B, mask[i, j] = Q[i] Q[j] > tau, for a dense A. The
+    # bounds are a host vector, so the host classifies every 128 x 128 tile
+    # (m, k) of A exactly: "skip" when the largest pair bound in the tile,
+    # max(Q_m) max(Q_k), is <= tau (every element is masked), "full" when
+    # the smallest, min(Q_m) min(Q_k), is > tau (none is), else "partial".
+    # Only that tile classification is a compile-time key; A stays dense on
+    # the device and nothing is gathered or copied out. Skipped tiles cost
+    # nothing: no DMA, no transpose, no matmul. Kept tiles are loaded with
+    # `nl.load`, transposed on the Tensor Engine, and the partial ones get
+    # the element mask in the transposed frame (k on partitions) on the way
+    # out of PSUM, recomputed on chip from the bounds:
+    # mask^T[k, m] = (Q[m] * Q[k] > tau), the same fp32 product and compare
+    # as the reference. Bounds and tau are kernel arguments (#1454).
+
+    # Block rows per group: one PSUM accumulator each; the rest of PSUM
+    # holds the transposes.
+    _SCREEN_GROUP = 7
+    # Kept tiles of a group held in SBUF at once.
+    _SCREEN_GROUP_MAX_TILES = 160
+    # Adjacent kept tiles per A DMA, and transposes per PSUM bank.
+    _SCREEN_RUN = 16
+    _SCREEN_T_PER_BANK = 4
+
+    def _screened_tiles_body(a, q_col, q_row, thr, b, row_ptrs, cols, partial, sym=(0,)):
+        """Screened C = (A * mask) @ B over the kept tiles of A only.
+
+        Shapes:
+            a:      (M_pad, M_pad)   dense, fp32 or bf16 (same dtype as b)
+            q_col:  (M_pad, 1)  fp32 Q, one value per partition
+            q_row:  (1, M_pad)  fp32 Q as a row
+            thr:    (128, 1)    fp32 tau, replicated per partition
+            b:      (M_pad, N)  N <= 512 or a multiple of 512
+            row_ptrs, cols: kept tiles per block row (BSR-style tuples)
+            partial: tuple of 0/1 per kept tile (1: apply the element mask)
+            sym:    (1,) when the caller guarantees A == A^T: tile (m, k) of
+                    A^T is then tile (k, m) of A, loaded as it is, with no
+                    Tensor Engine transpose (the Schwarz mask is symmetric)
+        Returns:
+            out:    (M_pad, N), b's dtype
+        """
+        _, N = b.shape
+        M_tiles = len(row_ptrs) - 1
+        TILE_N = N if N <= _TILE_N else _TILE_N
+        n_prog, pid = _program_split()
+        if M_tiles * (N // TILE_N) < n_prog and TILE_N % (n_prog * 64) == 0:
+            TILE_N //= n_prog
+        n_nt = N // TILE_N
+        counts = _row_block_counts(row_ptrs)
+        units = [(m, nt) for m in range(M_tiles) for nt in range(n_nt)]
+        costs = [counts[m] if counts[m] else _EMPTY_UNIT_COST for m, _ in units]
+
+        out = nl.ndarray((M_tiles * _TILE_M, N), dtype=b.dtype, buffer=nl.shared_hbm)
+        any_partial = any(partial)
+        if any_partial:
+            thr_t = nl.load(thr[:, :])
+
+        groups = []
+        cur, cur_tiles, cur_nt = [], 0, None
+        for u in _assign_units(costs, n_prog, pid):
+            m, nt = units[u]
+            if counts[m] == 0:
+                nl.store(
+                    out[m * _TILE_M : (m + 1) * _TILE_M, nt * TILE_N : (nt + 1) * TILE_N],
+                    value=nl.zeros((_TILE_M, TILE_N), dtype=b.dtype),
+                )
+                continue
+            if cur and (
+                nt != cur_nt
+                or len(cur) == _SCREEN_GROUP
+                or cur_tiles + counts[m] > _SCREEN_GROUP_MAX_TILES
+            ):
+                groups.append((cur_nt, cur))
+                cur, cur_tiles = [], 0
+            cur.append(m)
+            cur_tiles += counts[m]
+            cur_nt = nt
+        if cur:
+            groups.append((cur_nt, cur))
+
+        def load_row(m, a_of):
+            """Kept tiles of block row m, transposed (k on partitions), into `a_of`.
+
+            Runs of adjacent kept tiles arrive in one DMA of up to
+            `_SCREEN_RUN` tiles (sorted bounds keep a contiguous prefix of
+            each row). Partial tiles get the element mask in the natural
+            frame (m on partitions): mask[m, k] = Q[m] * Q[k] > tau. Up to
+            four tiles are transposed into one PSUM bank and leave it in one
+            copy.
+            """
+            r0 = m * _TILE_M
+            lo = row_ptrs[m]
+            hi = row_ptrs[m + 1]
+            if sym[0]:
+                # A symmetric: A[m-tile, k-tile]^T = A[k-tile, m-tile], k on
+                # partitions as loaded; mask^T[k, m] = Q[k] * Q[m] > tau. A run
+                # of adjacent kept k-tiles arrives in one strided DMA.
+                n_cols = a.shape[1]
+                runs = []
+                for idx in range(lo, hi):
+                    if runs and cols[idx] == cols[runs[-1][-1]] + 1 and len(runs[-1]) < _SCREEN_RUN:
+                        runs[-1].append(idx)
+                    else:
+                        runs.append([idx])
+                if any(partial[i] for i in range(lo, hi)):
+                    q_mr = nl.broadcast_to(
+                        nl.load(q_row[:, r0 : r0 + _TILE_M]), shape=(_TILE_K, _TILE_M)
+                    )
+                for run in runs:
+                    k0 = cols[run[0]] * _TILE_K
+                    L = len(run)
+                    t = nl.ndarray((_TILE_K, L, _TILE_M), dtype=a.dtype, buffer=nl.sbuf)
+                    src = a.ap(
+                        pattern=[[n_cols, _TILE_K], [_TILE_K * n_cols, L], [1, _TILE_M]],
+                        offset=k0 * n_cols + r0,
+                    )
+                    nisa.dma_copy(dst=t, src=src)
+                    for i, idx in enumerate(run):
+                        if partial[idx]:
+                            kc = cols[idx] * _TILE_K
+                            q_k = nl.load(q_col[kc : kc + _TILE_K, :])
+                            mask = nl.ndarray((_TILE_K, _TILE_M), dtype=nl.float32, buffer=nl.sbuf)
+                            nisa.tensor_scalar(
+                                mask,
+                                q_mr,
+                                op0=nl.multiply,
+                                operand0=q_k,
+                                op1=nl.greater,
+                                operand1=thr_t,
+                            )
+                            nisa.tensor_tensor(t[:, i, :], t[:, i, :], mask, op=nl.multiply)
+                        a_of[idx] = (t, i)
+                return
+            runs = []
+            for idx in range(lo, hi):
+                if runs and cols[idx] == cols[runs[-1][-1]] + 1 and len(runs[-1]) < _SCREEN_RUN:
+                    runs[-1].append(idx)
+                else:
+                    runs.append([idx])
+            if any(partial[i] for i in range(lo, hi)):
+                q_m = nl.load(q_col[r0 : r0 + _TILE_M, :])
+            for run in runs:
+                k0 = cols[run[0]] * _TILE_K
+                width = len(run) * _TILE_K
+                a_nat = nl.load(a[r0 : r0 + _TILE_M, k0 : k0 + width])
+                for i, idx in enumerate(run):
+                    if partial[idx]:
+                        c0 = i * _TILE_K
+                        kc = cols[idx] * _TILE_K
+                        q_k = nl.broadcast_to(
+                            nl.load(q_row[:, kc : kc + _TILE_K]), shape=(_TILE_M, _TILE_K)
+                        )
+                        mask = nl.ndarray((_TILE_M, _TILE_K), dtype=nl.float32, buffer=nl.sbuf)
+                        nisa.tensor_scalar(
+                            mask, q_k, op0=nl.multiply, operand0=q_m, op1=nl.greater, operand1=thr_t
+                        )
+                        nisa.tensor_tensor(
+                            a_nat[:, c0 : c0 + _TILE_K],
+                            a_nat[:, c0 : c0 + _TILE_K],
+                            mask,
+                            op=nl.multiply,
+                        )
+                for s0 in range(0, len(run), _SCREEN_T_PER_BANK):
+                    sub = run[s0 : s0 + _SCREEN_T_PER_BANK]
+                    t_ps = nl.ndarray((_TILE_K, len(sub) * _TILE_M), dtype=a.dtype, buffer=nl.psum)
+                    for i in range(len(sub)):
+                        c0 = (s0 + i) * _TILE_K
+                        nisa.nc_transpose(
+                            t_ps[:, i * _TILE_M : (i + 1) * _TILE_M],
+                            a_nat[:, c0 : c0 + _TILE_K],
+                            engine=nisa.engine.tensor,
+                        )
+                    a_t = nl.ndarray((_TILE_K, len(sub) * _TILE_M), dtype=a.dtype, buffer=nl.sbuf)
+                    nisa.tensor_copy(a_t, t_ps)
+                    for i, idx in enumerate(sub):
+                        a_of[idx] = (a_t, i * _TILE_M)
+
+        for nt, rows in groups:
+            n0 = nt * TILE_N
+            psums = [nl.zeros((_TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum) for _ in rows]
+            a_of = {}
+            by_col = {}
+            for r, m in enumerate(rows):
+                load_row(m, a_of)
+                for idx in range(row_ptrs[m], row_ptrs[m + 1]):
+                    by_col.setdefault(cols[idx], []).append((r, idx))
+            for j in sorted(by_col):
+                b_tile = nl.load(b[j * _TILE_K : (j + 1) * _TILE_K, n0 : n0 + TILE_N])
+                for r, idx in by_col[j]:
+                    a_t, i0 = a_of[idx]
+                    stat = a_t[:, i0, :] if sym[0] else a_t[:, i0 : i0 + _TILE_M]
+                    nisa.nc_matmul(psums[r], stat, b_tile, accumulate=True)
+            for r, m in enumerate(rows):
+                nl.store(
+                    out[m * _TILE_M : (m + 1) * _TILE_M, n0 : n0 + TILE_N],
+                    value=nl.copy(psums[r], dtype=b.dtype),
+                )
+
+        return out
+
+    @nki.jit
+    def _screened_tiles_keyed_kernel(a, q_col, q_row, thr, b, key):
+        return _screened_tiles_body(a, q_col, q_row, thr, b, *_STRUCTURES[key])
 
     @nki.jit
     def _attn_bwd_static_kernel(

@@ -50,6 +50,7 @@ KEYED_OPS = {
     "attn_fwd_keyed",
     "cg_bsr_keyed",
     "power_bsr_keyed",
+    "screened_tiles_keyed",
 }
 STATIC_OPS |= KEYED_OPS
 AUTOGRAD_OPS = {
@@ -59,6 +60,7 @@ AUTOGRAD_OPS = {
     "bsr_spmm_static",
     "bsr_spmm_keyed",
     "bsr_spmm_t_keyed",
+    "screened_tiles_keyed",
 }
 COMPOSITE_OPS = {"bsr_attn", "bsr_attn_bwd"}
 P = 128
@@ -246,6 +248,20 @@ def _ref_screened_spmm(a, q, threshold_sqrt, b):
     return (a * mask.to(a.dtype)) @ b
 
 
+def _ref_screened_tiles_keyed(a, q_col, q_row, thr, b, key):
+    """Kept tiles only (the structure must cover every unscreened element)."""
+    row_ptrs, cols, partial = kernels._STRUCTURES[key][:3]
+    mask = ((q_col * q_row) > thr[:1, :1]).to(a.dtype)
+    out = torch.zeros(a.shape[0], b.shape[1], dtype=b.dtype)
+    for m in range(len(row_ptrs) - 1):
+        r = slice(m * P, (m + 1) * P)
+        for idx in range(row_ptrs[m], row_ptrs[m + 1]):
+            c = slice(cols[idx] * P, (cols[idx] + 1) * P)
+            t = a[r, c] * mask[r, c] if partial[idx] else a[r, c]
+            out[r] += t @ b[c]
+    return out
+
+
 @pytest.fixture
 def cpu_native(monkeypatch):
     """Run the native path on CPU: real custom ops backed by torch references."""
@@ -270,6 +286,7 @@ def cpu_native(monkeypatch):
         ("_bsr_spmm_keyed_kernel", _ref_bsr_spmm_keyed),
         ("_bsr_spmm_t_keyed_kernel", _ref_bsr_spmm_t_keyed),
         ("_attn_fwd_keyed_kernel", _ref_attn_fwd_keyed),
+        ("_screened_tiles_keyed_kernel", _ref_screened_tiles_keyed),
     ):
         # `kernels` for the op bodies; `dispatch` because the host wrappers
         # name the kernel (only imported there when nki is installed).
@@ -1075,6 +1092,37 @@ class TestNativePathOnCpu:
         ref.sum().backward()
         torch.testing.assert_close(Am.grad, A_ref.grad)
         torch.testing.assert_close(B.grad, B_ref.grad, atol=1e-4, rtol=1e-4)
+
+    @pytest.mark.parametrize("n,N", [(300, 7), (520, 600)])
+    def test_screened_tile_skipping(self, cpu_native, monkeypatch, n, N):
+        """Decaying bounds: some tiles skipped, some partial; parity with the mask."""
+        calls = []
+        real = kernels._screened_tiles_keyed_kernel
+
+        def spy(*args):
+            calls.append(kernels._STRUCTURES[args[-1]])
+            return real(*args)
+
+        monkeypatch.setattr(kernels, "_screened_tiles_keyed_kernel", spy)
+        g = torch.Generator().manual_seed(11)
+        Q = torch.exp(-6 * torch.sort(torch.rand(n, generator=g)).values)
+        A = torch.randn(n, n, generator=g)
+        B = torch.randn(n, N, generator=g)
+        tau = float(torch.median(torch.outer(Q, Q)))
+        C = trnsparse.screened_spmm(A, Q * Q, B, threshold=tau * tau)
+        mask = (torch.outer(Q, Q) > tau).float()
+        torch.testing.assert_close(C, (A * mask) @ B, atol=1e-4, rtol=1e-4)
+        row_ptrs, cols, partial = calls[0][:3]
+        nt = (n + P - 1) // P
+        assert 0 < len(cols) < nt * nt and any(partial)
+        # A second call with the same bounds reuses the cached plan.
+        trnsparse.screened_spmm(A, Q * Q, B, threshold=tau * tau)
+        assert len(calls) == 2 and calls[1] is calls[0]
+
+    def test_screened_all_screened_out(self, cpu_native):
+        A = torch.randn(200, 200)
+        C = trnsparse.screened_spmm(A, torch.full((200,), 1e-3), torch.randn(200, 5), 1.0)
+        assert C.shape == (200, 5) and torch.count_nonzero(C) == 0
 
 
 @needs_custom_op

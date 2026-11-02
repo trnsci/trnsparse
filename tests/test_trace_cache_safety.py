@@ -61,6 +61,7 @@ ALLOWED: dict[tuple[str, str, str], str] = {
         for k in (
             "_bsr_spmm_keyed_kernel",
             "_bsr_spmm_t_keyed_kernel",
+            "_screened_tiles_keyed_kernel",
             "_attn_fwd_keyed_kernel",
             "_power_bsr_keyed_kernel",
             "_cg_bsr_keyed_kernel",

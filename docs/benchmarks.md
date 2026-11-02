@@ -290,11 +290,180 @@ interpolation between measured densities):
   than dense aten `(A * mask) @ B` on the device: the fused kernel does not
   pay on Trn2 in fp32. It has no tile skipping, so it never benefits from
   screening sparsity.
+  (Superseded by tile skipping, #61: see the screened section below.)
 - **CSR SpMM** (host structure) is now 4–11× faster at ≤ 1% density
   (device scatter of nnz triplets instead of a full dense H2D copy), but
   stays far behind `torch.sparse` on CPU at low density and behind dense
   aten when A is already dense on the device. On Trainium, use BSR.
 
+
+## Trn2: Schwarz-screened SpMM with tile skipping (#61)
+
+**Setup.** `trn2.3xlarge`, one logical NeuronCore (`NEURON_RT_VISIBLE_CORES=2`
+at LNC=2; physical core 4 at LNC=1), shared chip (other agents on the other
+cores). Neuron SDK 2.33 venv: `torch` 2.14.0, `torch-neuronx` 2.14, `nki`
+0.7.0. Host `taskset -c 4,10`, `OMP_NUM_THREADS=2`. Script:
+`benchmarks/bench_screened_tiles_trn2.py`. Warm medians of 10 calls (ms),
+`torch.neuron.synchronize()` after each; operands already on the device.
+
+**Inputs.** Chemistry-shaped: bounds `Q` sorted and decaying
+(`Q = exp(-8 x)`, shells ordered by extent), symmetric `A` with
+`|A_ij| <= Q_i Q_j`, `tau` set so the stated fraction of 128 x 128 tiles
+survives. *partial* = kept tiles that need the element mask.
+
+**Columns.** *tiles*: `screened_spmm` (this change). *tiles sym*: with
+`symmetric=True` (no Tensor Engine transposes). *fused main*: the previous
+all-tiles fused kernel (`TRNSPARSE_SCREEN_SKIP_TILES=0`; fp32 only, it does
+not lower for bf16 `A` with fp32 bounds). *dense aten*: `A @ B`, no
+screening. *masked aten*: `(A * mask) @ B` with the mask already on the
+device. *best/dense*: min(tiles, tiles sym) / dense aten, below 1 is a win.
+*par err*: max relative error against the fp64 masked product
+`(A64 * mask) @ B64` (bf16: the output rounding). *bound ratio*:
+`||C - A64 B64||_F / (tau sqrt(#dropped) ||B||_F)`, the screening error over
+the Schwarz threshold-times-norm bound (below 1 means within it).
+
+### LNC=2, width 512, trace cache off
+
+| n | width | dtype | kept tiles | partial | tiles (ms) | tiles sym (ms) | fused main (ms) | dense aten (ms) | masked aten (ms) | best/dense | par err | bound ratio |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 2048 | 512 | fp32 | 5% | 6 | **0.27** | **0.26** | 1.28 | 0.23 | 0.41 | 1.15 | 2.0e-07 | 0.00 |
+| 2048 | 512 | fp32 | 20% | 15 | **0.27** | **0.29** | 1.26 | 0.22 | 0.42 | 1.23 | 2.1e-07 | 0.00 |
+| 2048 | 512 | fp32 | 50% | 29 | **0.34** | **0.33** | 1.18 | 0.22 | 0.42 | 1.52 | 3.4e-07 | 0.00 |
+| 2048 | 512 | fp32 | 80% | 21 | **0.37** | **0.36** | 1.21 | 0.22 | 0.43 | 1.61 | 3.4e-07 | 0.00 |
+| 2048 | 512 | bf16 | 5% | 6 | **0.25** | **0.26** | n/a | 0.13 | 0.28 | 1.87 | 3.1e-03 | 0.00 |
+| 2048 | 512 | bf16 | 20% | 15 | **0.27** | **0.27** | n/a | 0.14 | 0.28 | 1.94 | 2.5e-03 | 0.00 |
+| 2048 | 512 | bf16 | 50% | 29 | **0.28** | **0.28** | n/a | 0.13 | 0.29 | 2.12 | 3.3e-03 | 0.00 |
+| 2048 | 512 | bf16 | 80% | 21 | **0.29** | **0.29** | n/a | 0.13 | 0.29 | 2.18 | 3.1e-03 | 0.07 |
+| 4096 | 512 | fp32 | 5% | 17 | **0.29** | **0.30** | 2.44 | 0.61 | 1.03 | 0.48 | 2.5e-07 | 0.00 |
+| 4096 | 512 | fp32 | 20% | 37 | **0.40** | **0.36** | 2.40 | 0.61 | 1.03 | 0.59 | 4.3e-07 | 0.00 |
+| 4096 | 512 | fp32 | 50% | 59 | **0.55** | **0.52** | 2.47 | 0.62 | 1.04 | 0.83 | 4.7e-07 | 0.00 |
+| 4096 | 512 | fp32 | 80% | 41 | **0.72** | **0.63** | 2.50 | 0.62 | 1.05 | 1.03 | 5.3e-07 | 0.00 |
+| 4096 | 512 | bf16 | 5% | 17 | **0.27** | **0.28** | n/a | 0.25 | 0.52 | 1.08 | 2.5e-03 | 0.00 |
+| 4096 | 512 | bf16 | 20% | 37 | **0.30** | **0.31** | n/a | 0.25 | 0.51 | 1.22 | 2.4e-03 | 0.00 |
+| 4096 | 512 | bf16 | 50% | 59 | **0.36** | **0.36** | n/a | 0.25 | 0.51 | 1.44 | 2.4e-03 | 0.00 |
+| 4096 | 512 | bf16 | 80% | 41 | **0.40** | **0.37** | n/a | 0.25 | 0.51 | 1.50 | 2.4e-03 | 0.06 |
+| 8192 | 512 | fp32 | 5% | 35 | **0.42** | **0.38** | 9.33 | 2.25 | 4.40 | 0.17 | 2.9e-07 | 0.00 |
+| 8192 | 512 | fp32 | 20% | 77 | **0.75** | **0.70** | 9.31 | 2.27 | 4.41 | 0.31 | 5.8e-07 | 0.00 |
+| 8192 | 512 | fp32 | 50% | 119 | **1.42** | **1.27** | 9.30 | 2.27 | 4.35 | 0.56 | 7.1e-07 | 0.00 |
+| 8192 | 512 | fp32 | 80% | 81 | **2.05** | **1.80** | 9.08 | 2.25 | 4.38 | 0.80 | 7.7e-07 | 0.00 |
+| 8192 | 512 | bf16 | 5% | 35 | **0.33** | **0.50** | n/a | 0.68 | 1.50 | 0.48 | 3.1e-03 | 0.00 |
+| 8192 | 512 | bf16 | 20% | 77 | **0.45** | **0.40** | n/a | 0.68 | 1.51 | 0.58 | 3.2e-03 | 0.00 |
+| 8192 | 512 | bf16 | 50% | 119 | **0.64** | **0.57** | n/a | 0.68 | 1.52 | 0.84 | 3.0e-03 | 0.00 |
+| 8192 | 512 | bf16 | 80% | 81 | **0.80** | **0.78** | n/a | 0.68 | 1.51 | 1.15 | 3.0e-03 | 0.05 |
+
+### LNC=2, width 128
+
+| n | width | dtype | kept tiles | partial | tiles (ms) | tiles sym (ms) | fused main (ms) | dense aten (ms) | masked aten (ms) | best/dense | par err | bound ratio |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 4096 | 128 | fp32 | 5% | 17 | **0.29** | **0.30** | 2.00 | 0.28 | 0.70 | 1.04 | 2.3e-07 | 0.00 |
+| 4096 | 128 | fp32 | 20% | 37 | **0.34** | **0.33** | 1.87 | 0.27 | 0.70 | 1.22 | 3.8e-07 | 0.00 |
+| 4096 | 128 | fp32 | 50% | 59 | **0.41** | **0.37** | 1.85 | 0.27 | 0.70 | 1.36 | 4.7e-07 | 0.00 |
+| 4096 | 128 | fp32 | 80% | 41 | **0.44** | **0.41** | 1.95 | 0.28 | 0.71 | 1.45 | 5.4e-07 | 0.00 |
+| 4096 | 128 | bf16 | 5% | 17 | **0.29** | **0.28** | n/a | 0.17 | 0.44 | 1.68 | 2.5e-03 | 0.00 |
+| 4096 | 128 | bf16 | 20% | 37 | **0.32** | **0.33** | n/a | 0.17 | 0.43 | 1.89 | 2.4e-03 | 0.00 |
+| 4096 | 128 | bf16 | 50% | 59 | **0.36** | **0.35** | n/a | 0.16 | 0.44 | 2.12 | 2.5e-03 | 0.00 |
+| 4096 | 128 | bf16 | 80% | 41 | **0.35** | **0.37** | n/a | 0.17 | 0.43 | 2.05 | 2.5e-03 | 0.06 |
+| 8192 | 128 | fp32 | 5% | 35 | **0.34** | **0.34** | 5.27 | 0.82 | 2.86 | 0.41 | 3.7e-07 | 0.00 |
+| 8192 | 128 | fp32 | 20% | 77 | **0.49** | **0.45** | 5.30 | 0.83 | 2.96 | 0.54 | 7.4e-07 | 0.00 |
+| 8192 | 128 | fp32 | 50% | 119 | **0.79** | **0.68** | 5.22 | 0.82 | 2.90 | 0.83 | 8.8e-07 | 0.00 |
+| 8192 | 128 | fp32 | 80% | 81 | **0.97** | **0.94** | 5.24 | 0.83 | 2.95 | 1.14 | 9.1e-07 | 0.00 |
+| 8192 | 128 | bf16 | 5% | 35 | **0.34** | **0.33** | n/a | 0.41 | 1.26 | 0.82 | 2.9e-03 | 0.00 |
+| 8192 | 128 | bf16 | 20% | 77 | **0.40** | **0.39** | n/a | 0.41 | 1.22 | 0.96 | 2.7e-03 | 0.00 |
+| 8192 | 128 | bf16 | 50% | 119 | **0.57** | **0.54** | n/a | 0.40 | 1.24 | 1.35 | 3.1e-03 | 0.00 |
+| 8192 | 128 | bf16 | 80% | 81 | **0.63** | **0.65** | n/a | 0.41 | 1.24 | 1.55 | 3.1e-03 | 0.05 |
+
+### LNC=1 (one physical core), width 512
+
+| n | width | dtype | kept tiles | partial | tiles (ms) | tiles sym (ms) | fused main (ms) | dense aten (ms) | masked aten (ms) | best/dense | par err | bound ratio |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 2048 | 512 | fp32 | 5% | 6 | **0.28** | **0.26** | 1.39 | 0.34 | 0.57 | 0.75 | 2.0e-07 | 0.00 |
+| 2048 | 512 | fp32 | 20% | 15 | **0.34** | **0.32** | 1.14 | 0.36 | 0.58 | 0.88 | 2.1e-07 | 0.00 |
+| 2048 | 512 | fp32 | 50% | 29 | **0.43** | **0.37** | 1.36 | 0.34 | 0.57 | 1.10 | 3.4e-07 | 0.00 |
+| 2048 | 512 | fp32 | 80% | 21 | **0.49** | **0.43** | 1.31 | 0.34 | 0.57 | 1.26 | 3.4e-07 | 0.00 |
+| 2048 | 512 | bf16 | 5% | 6 | **0.25** | **0.26** | n/a | 0.16 | 0.32 | 1.51 | 3.1e-03 | 0.00 |
+| 2048 | 512 | bf16 | 20% | 15 | **0.28** | **0.27** | n/a | 0.16 | 0.31 | 1.74 | 2.5e-03 | 0.00 |
+| 2048 | 512 | bf16 | 50% | 29 | **0.31** | **0.30** | n/a | 0.15 | 0.31 | 1.97 | 3.3e-03 | 0.00 |
+| 2048 | 512 | bf16 | 80% | 21 | **0.32** | **0.30** | n/a | 0.16 | 0.31 | 1.87 | 3.1e-03 | 0.07 |
+| 4096 | 512 | fp32 | 5% | 17 | **0.35** | **0.31** | 2.57 | 1.10 | 1.72 | 0.29 | 2.5e-07 | 0.00 |
+| 4096 | 512 | fp32 | 20% | 37 | **0.51** | **0.45** | 2.45 | 1.10 | 1.72 | 0.42 | 4.3e-07 | 0.00 |
+| 4096 | 512 | fp32 | 50% | 59 | **0.80** | **0.72** | 2.54 | 1.10 | 1.72 | 0.65 | 4.7e-07 | 0.00 |
+| 4096 | 512 | fp32 | 80% | 41 | **1.11** | **0.99** | 2.54 | 1.10 | 1.71 | 0.90 | 5.3e-07 | 0.00 |
+| 4096 | 512 | bf16 | 5% | 17 | **0.29** | **0.29** | n/a | 0.40 | 0.74 | 0.73 | 2.5e-03 | 0.00 |
+| 4096 | 512 | bf16 | 20% | 37 | **0.36** | **0.34** | n/a | 0.38 | 0.73 | 0.88 | 2.4e-03 | 0.00 |
+| 4096 | 512 | bf16 | 50% | 59 | **0.48** | **0.42** | n/a | 0.38 | 0.73 | 1.10 | 2.4e-03 | 0.00 |
+| 4096 | 512 | bf16 | 80% | 41 | **0.52** | **0.47** | n/a | 0.38 | 0.73 | 1.23 | 2.4e-03 | 0.06 |
+| 8192 | 512 | fp32 | 5% | 35 | **0.55** | **0.50** | 7.55 | 4.44 | 7.88 | 0.11 | 2.9e-07 | 0.00 |
+| 8192 | 512 | fp32 | 20% | 77 | **1.18** | **1.04** | 7.42 | 4.42 | 7.93 | 0.24 | 5.8e-07 | 0.00 |
+| 8192 | 512 | fp32 | 50% | 119 | **2.49** | **2.14** | 7.48 | 4.43 | 7.90 | 0.48 | 7.1e-07 | 0.00 |
+| 8192 | 512 | fp32 | 80% | 81 | **3.74** | **3.31** | 7.43 | 4.43 | 7.91 | 0.75 | 7.7e-07 | 0.00 |
+| 8192 | 512 | bf16 | 5% | 35 | **0.40** | **0.38** | n/a | 1.22 | 2.49 | 0.31 | 3.1e-03 | 0.00 |
+| 8192 | 512 | bf16 | 20% | 77 | **0.59** | **0.51** | n/a | 1.22 | 2.46 | 0.42 | 3.2e-03 | 0.00 |
+| 8192 | 512 | bf16 | 50% | 119 | **0.98** | **0.80** | n/a | 1.22 | 2.46 | 0.66 | 3.0e-03 | 0.00 |
+| 8192 | 512 | bf16 | 80% | 81 | **1.26** | **1.28** | n/a | 1.22 | 2.47 | 1.03 | 3.0e-03 | 0.05 |
+
+### LNC=2, width 512, trace cache on (`NKI_ENABLE_TRACE_CACHE=1`, fresh cache dir)
+
+| n | width | dtype | kept tiles | partial | tiles (ms) | tiles sym (ms) | fused main (ms) | dense aten (ms) | masked aten (ms) | best/dense | par err | bound ratio |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 4096 | 512 | fp32 | 5% | 17 | **0.31** | **0.35** | 2.76 | 0.62 | 1.04 | 0.50 | 2.5e-07 | 0.00 |
+| 4096 | 512 | fp32 | 20% | 37 | **0.41** | **0.38** | 2.51 | 0.62 | 1.04 | 0.61 | 4.3e-07 | 0.00 |
+| 4096 | 512 | fp32 | 50% | 59 | **0.56** | **0.53** | 2.45 | 0.62 | 1.04 | 0.86 | 4.7e-07 | 0.00 |
+| 4096 | 512 | fp32 | 80% | 41 | **0.71** | **0.66** | 2.49 | 0.62 | 1.05 | 1.07 | 5.3e-07 | 0.00 |
+| 4096 | 512 | bf16 | 5% | 17 | **0.28** | **0.28** | n/a | 0.25 | 0.52 | 1.11 | 2.5e-03 | 0.00 |
+| 4096 | 512 | bf16 | 20% | 37 | **0.32** | **0.30** | n/a | 0.25 | 0.53 | 1.22 | 2.4e-03 | 0.00 |
+| 4096 | 512 | bf16 | 50% | 59 | **0.37** | **0.35** | n/a | 0.24 | 0.53 | 1.43 | 2.4e-03 | 0.00 |
+| 4096 | 512 | bf16 | 80% | 41 | **0.40** | **0.38** | n/a | 0.24 | 0.52 | 1.58 | 2.4e-03 | 0.06 |
+| 8192 | 512 | fp32 | 5% | 35 | **0.43** | **0.40** | 9.30 | 2.27 | 4.42 | 0.17 | 2.9e-07 | 0.00 |
+| 8192 | 512 | fp32 | 20% | 77 | **0.75** | **0.70** | 9.47 | 2.26 | 4.37 | 0.31 | 5.8e-07 | 0.00 |
+| 8192 | 512 | fp32 | 50% | 119 | **1.43** | **1.24** | 9.48 | 2.27 | 4.35 | 0.55 | 7.1e-07 | 0.00 |
+| 8192 | 512 | fp32 | 80% | 81 | **2.08** | **1.82** | 9.49 | 2.25 | 4.28 | 0.81 | 7.7e-07 | 0.00 |
+| 8192 | 512 | bf16 | 5% | 35 | **0.36** | **0.32** | n/a | 0.68 | 1.51 | 0.47 | 3.1e-03 | 0.00 |
+| 8192 | 512 | bf16 | 20% | 77 | **0.44** | **0.42** | n/a | 0.69 | 1.52 | 0.61 | 3.2e-03 | 0.00 |
+| 8192 | 512 | bf16 | 50% | 119 | **0.65** | **0.58** | n/a | 0.68 | 1.52 | 0.85 | 3.0e-03 | 0.00 |
+| 8192 | 512 | bf16 | 80% | 81 | **0.80** | **0.80** | n/a | 0.69 | 1.52 | 1.16 | 3.0e-03 | 0.05 |
+
+### Reading the screened tables
+
+- **Where it wins.** At LNC=2, n = 8192, N = 512 the tile path beats dense
+  aten `A @ B` up to 80% of tiles kept in fp32 (5.9x at 5%, 1.8x at 50%)
+  and up to about 65% in bf16 (2.1x at 5%). At n = 4096 it wins in fp32
+  up to about 75% and loses in bf16. Against what callers ran before
+  (`(A * mask) @ B`, or main's fused kernel) it wins everywhere at
+  n >= 4096. With width 128 at n = 8192 it wins up to about 65% (fp32)
+  and 20% (bf16). At LNC=1 dense aten runs on one physical core and the
+  crossover moves out: fp32 wins at every density at n >= 4096 (and up to
+  about 35% at 2048), bf16 up to about 35% at 4096 and 75% at 8192.
+- **Where it loses, and why (profile).** At LNC=2, n <= 2048 and narrow B
+  (width 128 at 4096) lose at every density. The floor is the launch: a
+  `trnsparse::` NKI op with a trivial 128 x 128 kernel costs 0.21 ms on this
+  box, the screened op alone 0.26 ms at 4096 / 5%, against 0.13-0.23 ms
+  for the whole dense aten product. The host side is ~0.03 ms with the plan
+  cached (tile classification 0.09 ms, structure hash 0.02 ms and three
+  small H2D copies 0.13 ms on the first call per bound tensor). Above the
+  floor the cost is per kept tile: at 8192 / 512 / 50% about 0.69 us
+  (fp32) and 0.31 us (bf16) per tile across both cores, against 0.55 us and
+  0.17 us per tile for dense aten. A kept tile costs more than an aten tile
+  because it is transposed on the Tensor Engine (the matmul's stationary
+  operand needs k on partitions) and leaves PSUM through a copy; in bf16 the
+  extra DMA and copy instructions matter more than the 128-column transpose.
+- **What was tried.** One DMA per kept tile: fp32 1.94 ms, bf16 1.23 ms at
+  8192 / 50%. One DMA per run of adjacent kept tiles (sorted bounds keep a
+  contiguous prefix per row) plus four transposes per PSUM bank and one
+  copy out: 1.42 / 0.63 ms. `symmetric=True` (strided DMA of the mirrored
+  tiles, no transposes): 1.24-1.27 / 0.57 ms. Row groups of 4, 6 and 7
+  block rows (B-tile reuse) and an SBUF-resident B panel changed nothing
+  measurable.
+- **Accuracy.** fp32 parity with the fp64 masked product is 2e-7 to 9e-7
+  (dense-aten level); bf16 is the bf16 output rounding. The screening
+  error is within the Schwarz bound in every case (ratio <= 0.10).
+  The tile classification is exact (`screened_tile_structure`: a skipped
+  tile has every element screened out, a full tile none), so the result is
+  the masked product, not an approximation of it.
+- **Compile.** One compile per distinct tile pattern (1-6 s at these sizes,
+  then NEFF-cached). Fock builds and iterative methods reuse one pattern.
+- **Trace cache.** On and off give the same times and errors: the bounds and
+  tau are kernel arguments and the pattern is a content-hash key
+  (aws-neuron-sdk#1454).
 
 ## Trn2: across the logical NeuronCores of one chip (#30)
 
