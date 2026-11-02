@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`cg_bsr` gave silently wrong gradients** (#70). The CG step sizes were
+  taken with `.item()`, so autograd differentiated a frozen-coefficient
+  polynomial in `A` applied to `b`, not the solve: with `b` along an
+  eigenvector (one-step convergence) `b.grad` was ~20% off `A^{-1} g`, and
+  `A.blocks.grad` had the same problem. `cg_bsr` now differentiates as the
+  exact solve (implicit differentiation, like `torch.linalg.solve`):
+  backward runs a second CG solve `A lam = grad_x` with the same
+  `tol` / `max_iter` / `M`, giving `grad_b = lam` and
+  `grad_A = -lam x^H` on the stored blocks. `x0` and `M` no longer receive
+  gradients. Forward values are unchanged. Affects 0.3.2 through 0.13.0.
+
 ## [0.13.0] — 2026-11-02
 
 Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.

@@ -1318,13 +1318,6 @@ def test_autograd_cg_bsr_generic_b():
         assert_close(bb.grad, torch.linalg.solve(Ad, g), tol=1e-6)
 
 
-_CG_GRAD_XFAIL = pytest.mark.xfail(
-    strict=True,
-    reason="trnsci/trnsparse#70 needs decision: cg_bsr gradients use frozen (.item()) step sizes",
-)
-
-
-@_CG_GRAD_XFAIL
 def test_autograd_cg_bsr_wrt_b_eigenvector():
     # b along an eigenvector: CG converges in one step, so the frozen-coefficient
     # graph is far from A^{-1}. Correct (implicit) gradients, or no graph at all, pass.
@@ -1337,7 +1330,6 @@ def test_autograd_cg_bsr_wrt_b_eigenvector():
         assert_close(bb.grad, torch.linalg.solve(Ad, g), tol=1e-6)
 
 
-@_CG_GRAD_XFAIL
 def test_autograd_cg_bsr_wrt_blocks():
     A, Ad = spd_bsr(64, 8, band=2)
     rhs = torch.linalg.eigh(Ad)[1][:, -1].clone()
