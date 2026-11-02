@@ -56,6 +56,13 @@ def _csr_matmul(A: CSRMatrix, X: torch.Tensor) -> torch.Tensor:
     return _csr_to_dense_host(A).to(X.device) @ X
 
 
+def _scaled(s: float, t: torch.Tensor) -> torch.Tensor:
+    """`s * t`, but `t` itself when `s == 1`: a Python float times an integer
+    tensor promotes to float, so the default `alpha=1.0` turned integer
+    products on the device into float32 (#79)."""
+    return t if s == 1 else s * t
+
+
 def spmv(
     A: CSRMatrix,
     x: torch.Tensor,
@@ -77,10 +84,10 @@ def spmv(
     m, n = A.shape
     assert x.shape[0] == n, f"Dimension mismatch: A is {A.shape}, x is {x.shape}"
 
-    result = alpha * _csr_matmul(A, x)
+    result = _scaled(alpha, _csr_matmul(A, x))
     if y is not None and beta != 0.0:
         _check_epilogue_shape("spmv", "y", y, result)
-        result = result + beta * y
+        result = result + _scaled(beta, y)
     return result
 
 
@@ -130,12 +137,12 @@ def spmm(
     assert B.shape[0] == n, f"Dimension mismatch: A is {A.shape}, B is {B.shape}"
 
     if _use_nki():
-        result = alpha * nki_spmm(A, B)
+        result = _scaled(alpha, nki_spmm(A, B))
     else:
-        result = alpha * _csr_matmul(A, B)
+        result = _scaled(alpha, _csr_matmul(A, B))
     if C is not None and beta != 0.0:
         _check_epilogue_shape("spmm", "C", C, result)
-        result = result + beta * C
+        result = result + _scaled(beta, C)
     return result
 
 

@@ -29,6 +29,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Trainium with `block_size=128`. Complex operands now run as real kernel
   launches: one per real part of A, against `[Re B | Im B]`. Autograd works
   through them. Found by the conformance suite on Trn2 (trnsci/trnsci#35).
+- **`spmv` / `spmm` returned float32 for integer operands on the device**
+  (silent dtype change, #79). The default `alpha=1.0` (and `beta=1.0`) were
+  applied as `alpha * product`. A Python float times an integer tensor
+  promotes, so int32/int64 products on a `neuron` operand came back float32.
+  Affects every release with the device dense CSR path, through 0.12.1. A
+  scale of 1 is now skipped. Found by the conformance suite on Trn2
+  (trnsci/trnsci#35).
 - **`bsr_diagonal` returned length m for a tall matrix** (silent; every
   release 0.3.2–0.12.1, every backend). For a rectangular (m, n) BSR matrix
   with m > n the result was zero-padded to length m; it now has length
