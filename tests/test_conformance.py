@@ -352,21 +352,14 @@ def test_coo_duplicates_sum(dtype):
     assert_close(ts.spmv(coo.to_csr(), D(torch.ones(3, dtype=dtype))), ref.sum(1), dtype)
 
 
-_SCIPY_DTYPE_XFAIL = pytest.mark.xfail(
-    strict=True,
-    reason="trnsci/trnsparse#69 needs decision: from_scipy stores float32/complex64 "
-    "whatever the scipy dtype",
-)
-
-
 @pytest.mark.parametrize(
     "npdt",
     [
         np.float32,
         np.complex64,
-        pytest.param(np.float64, marks=_SCIPY_DTYPE_XFAIL),
-        pytest.param(np.complex128, marks=_SCIPY_DTYPE_XFAIL),
-        pytest.param(np.int64, marks=_SCIPY_DTYPE_XFAIL),
+        np.float64,
+        np.complex128,
+        np.int64,
     ],
     ids=lambda d: d.__name__,
 )
@@ -1318,13 +1311,6 @@ def test_autograd_cg_bsr_generic_b():
         assert_close(bb.grad, torch.linalg.solve(Ad, g), tol=1e-6)
 
 
-_CG_GRAD_XFAIL = pytest.mark.xfail(
-    strict=True,
-    reason="trnsci/trnsparse#70 needs decision: cg_bsr gradients use frozen (.item()) step sizes",
-)
-
-
-@_CG_GRAD_XFAIL
 def test_autograd_cg_bsr_wrt_b_eigenvector():
     # b along an eigenvector: CG converges in one step, so the frozen-coefficient
     # graph is far from A^{-1}. Correct (implicit) gradients, or no graph at all, pass.
@@ -1337,7 +1323,6 @@ def test_autograd_cg_bsr_wrt_b_eigenvector():
         assert_close(bb.grad, torch.linalg.solve(Ad, g), tol=1e-6)
 
 
-@_CG_GRAD_XFAIL
 def test_autograd_cg_bsr_wrt_blocks():
     A, Ad = spd_bsr(64, 8, band=2)
     rhs = torch.linalg.eigh(Ad)[1][:, -1].clone()

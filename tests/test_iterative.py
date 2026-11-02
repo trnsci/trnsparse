@@ -87,6 +87,72 @@ class TestCgBsr:
         assert rel == 0.0
 
 
+class TestCgBsrAutograd:
+    """cg_bsr differentiates as the exact solve A^{-1} b (#70)."""
+
+    @staticmethod
+    def _randn(*shape, seed=0):
+        gen = torch.Generator().manual_seed(seed)
+        return torch.randn(*shape, dtype=torch.float64, generator=gen)
+
+    @staticmethod
+    def _spd(n=64, bs=8):
+        # Local generator: the global RNG state is left alone for other tests.
+        gen = torch.Generator().manual_seed(3)
+        d = torch.linspace(1.0, 50.0, n, dtype=torch.float64)
+        Q = torch.linalg.qr(torch.randn(n, n, dtype=torch.float64, generator=gen))[0]
+        Ad = Q @ torch.diag(d) @ Q.T
+        return Ad, d, Q, trnsparse.BSRMatrix.from_dense(Ad, block_size=bs)
+
+    def test_grad_b_one_step_convergence(self):
+        # b along an eigenvector: CG stops after one step, where the old
+        # frozen-step-size graph gave a gradient ~20% off A^{-1} g.
+        Ad, _, Q, A = self._spd()
+        b = Q[:, -1].clone().requires_grad_()
+        x, iters, _ = trnsparse.cg_bsr(A, b, tol=1e-12, max_iter=500)
+        assert iters == 1
+        assert x.requires_grad
+        g = self._randn(64, seed=1)
+        (x * g).sum().backward()
+        torch.testing.assert_close(b.grad, torch.linalg.solve(Ad, g), rtol=1e-8, atol=1e-8)
+
+    def test_grad_blocks_matches_dense_solve(self):
+        Ad, _, Q, A = self._spd()
+        rhs = Q[:, -1].clone()
+        blk = A.blocks.clone().requires_grad_()
+        A2 = trnsparse.BSRMatrix(blk, A.block_col_indices, A.block_row_ptrs, A.shape, A.block_size)
+        x, _, _ = trnsparse.cg_bsr(A2, rhs, tol=1e-12, max_iter=500)
+        g = self._randn(64, seed=1)
+        (x * g).sum().backward()
+
+        Ad_leaf = Ad.clone().requires_grad_()
+        (torch.linalg.solve(Ad_leaf, rhs) * g).sum().backward()
+        ref = trnsparse.BSRMatrix.from_dense(Ad_leaf.grad, block_size=8)
+        # same block structure (dense matrix -> every block stored)
+        assert torch.equal(ref.block_col_indices, A.block_col_indices)
+        torch.testing.assert_close(blk.grad, ref.blocks, rtol=1e-7, atol=1e-9)
+
+    def test_values_and_info_unchanged_by_grad(self):
+        _, _, _, A = self._spd()
+        b = self._randn(64, seed=2)
+        x0, it0, r0 = trnsparse.cg_bsr(A, b, tol=1e-10)
+        x1, it1, r1 = trnsparse.cg_bsr(A, b.clone().requires_grad_(), tol=1e-10)
+        assert torch.equal(x0, x1.detach()) and (it0, r0) == (it1, r1)
+
+    def test_gradcheck(self):
+        _, _, _, A = self._spd(16, 4)
+        blk = A.blocks.clone().requires_grad_()
+        b = self._randn(16, seed=4).requires_grad_()
+
+        def f(blk, b):
+            M = trnsparse.BSRMatrix(blk, A.block_col_indices, A.block_row_ptrs, A.shape, 4)
+            return trnsparse.cg_bsr(M, b, tol=1e-14, max_iter=200)[0]
+
+        # Perturbing single block entries makes A nonsymmetric, where CG is
+        # not a solve; gradcheck b (A is covered by the dense-solve test above).
+        assert torch.autograd.gradcheck(lambda b: f(blk.detach(), b), (b,))
+
+
 class TestPowerIterationBsr:
     def test_dominant_eigenvalue_diagonal(self):
         """Diagonal matrix: dominant eigenvalue is max(diag); eigenvector
@@ -531,6 +597,66 @@ class TestCgBsrFused:
         order = cg_row_order(ptrs, 0, 15)
         loads = [sum(counts[order[i]] for i in range(g, 15, 4)) for g in range(4)]
         assert max(loads) <= 13 < 33  # i % 4 puts 30 + 3 blocks on group 0
+
+
+class TestFusedSolverDtypes:
+    """Complex / integer / bool inputs raise TypeError on every backend (#85).
+
+    Through 0.13.0 the fused solvers packed everything into real float tiles:
+    complex inputs lost their imaginary part and integer / bool results were
+    truncated to b's dtype.
+    """
+
+    BAD = [torch.complex64, torch.complex128, torch.int64, torch.int32, torch.bool]
+
+    @pytest.fixture(params=["auto", "pytorch", "nki"])
+    def backend(self, request):
+        prev = trnsparse.get_backend()
+        try:
+            trnsparse.set_backend(request.param)
+        except RuntimeError as e:  # nki not installed
+            pytest.skip(str(e))
+        yield request.param
+        trnsparse.set_backend(prev)
+
+    @staticmethod
+    def _A(dtype=torch.float64):
+        return trnsparse.BSRMatrix.from_dense(_block_spd(1).to(dtype), block_size=128)
+
+    @pytest.mark.parametrize("dtype", BAD, ids=str)
+    def test_cg_b(self, backend, dtype):
+        with pytest.raises(TypeError, match="b must be a real floating-point"):
+            trnsparse.cg_bsr_fused(self._A(), torch.ones(128, dtype=dtype))
+
+    @pytest.mark.parametrize("dtype", BAD, ids=str)
+    def test_cg_x0(self, backend, dtype):
+        b = torch.ones(128, dtype=torch.float64)
+        with pytest.raises(TypeError, match="x0 must be a real floating-point"):
+            trnsparse.cg_bsr_fused(self._A(), b, x0=torch.zeros(128, dtype=dtype))
+
+    @pytest.mark.parametrize("dtype", [torch.complex128, torch.int64], ids=str)
+    def test_cg_A(self, backend, dtype):
+        b = torch.ones(128, dtype=torch.float64)
+        with pytest.raises(TypeError, match="A.blocks must be a real floating-point"):
+            trnsparse.cg_bsr_fused(self._A(dtype), b)
+        with pytest.raises(TypeError, match="A.blocks must be a real floating-point"):
+            trnsparse.prepare_cg_bsr(self._A(dtype))
+
+    @pytest.mark.parametrize("dtype", BAD, ids=str)
+    def test_power_v0(self, backend, dtype):
+        with pytest.raises(TypeError, match="v0 must be a real floating-point"):
+            trnsparse.power_iteration_bsr_fused(self._A(), v0=torch.ones(128, dtype=dtype))
+
+    @pytest.mark.parametrize("dtype", [torch.complex128, torch.int64], ids=str)
+    def test_power_A(self, backend, dtype):
+        with pytest.raises(TypeError, match="A.blocks must be a real floating-point"):
+            trnsparse.power_iteration_bsr_fused(self._A(dtype))
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float64], ids=str)
+    def test_real_float_still_runs(self, dtype):
+        A = self._A(dtype)
+        x, _, _ = trnsparse.cg_bsr_fused(A, torch.ones(128, dtype=dtype), tol=1e-6)
+        assert x.dtype == dtype
 
 
 class TestPowerIterationFused:
