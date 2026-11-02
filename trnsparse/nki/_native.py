@@ -507,6 +507,31 @@ bsr_spmm_t_keyed.register_autograd(_bsr_spmm_t_keyed_backward, setup_context=_sa
 # autograd link is attached in _native_attn.
 
 
+# Fused kernel-matrix product (#93). No autograd: the GP solves use the
+# operator in CG only; gradients through K come with hyperparameter fitting.
+@nki_op(
+    "trnsparse::kmv_self",
+    mutates_args={},
+    fake_fn=lambda x, v, params, kind, group: v.new_empty((x.shape[0], v.shape[1])),
+)
+def kmv_self(
+    x: torch.Tensor, v: torch.Tensor, params: torch.Tensor, kind: int, group: int
+) -> torch.Tensor:
+    # (K(X, X) + noise I) V; kind / group are compile-time, params a tensor.
+    return _k._kmv_self_kernel(x, v, params, int(kind), int(group))
+
+
+@nki_op(
+    "trnsparse::kmv_cross",
+    mutates_args={},
+    fake_fn=lambda x, y, v, params, kind, group: v.new_empty((x.shape[0], v.shape[1])),
+)
+def kmv_cross(
+    x: torch.Tensor, y: torch.Tensor, v: torch.Tensor, params: torch.Tensor, kind: int, group: int
+) -> torch.Tensor:
+    return _k._kmv_cross_kernel(x, y, v, params, int(kind), int(group))
+
+
 # Composite attention ops (forward/backward over Q, K, V with host mask
 # structure). Registered once per process; see `_native_attn.py`.
 from . import _native_attn  # noqa: E402
@@ -532,4 +557,6 @@ OPS = {
     "attn_bwd_dkdv": attn_bwd_dkdv,
     "bsr_attn": _native_attn.bsr_attn,
     "bsr_attn_bwd": _native_attn.bsr_attn_bwd,
+    "kmv_self": kmv_self,
+    "kmv_cross": kmv_cross,
 }

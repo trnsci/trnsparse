@@ -1524,6 +1524,50 @@ def test_public_api_covered():
         "density_screen", "sparsity_stats", "cg_bsr", "cg_bsr_fused", "prepare_cg_bsr", "FusedCGOperator",
         "chebyshev_bsr", "chebyshev_coeffs", "richardson_bsr", "power_iteration_bsr",
         "power_iteration_bsr_fused", "jacobi_preconditioner_bsr", "bsr_diagonal", "HAS_NKI", "set_backend",
-        "get_backend",
+        "get_backend", "kernel_matmul", "kernel_matmul_reference", "KernelOperator", "KERNELS",
     }  # fmt: skip
     assert set(ts.__all__) == covered
+
+
+# ── Fused kernel-matrix product (#93) ────────────────────────────────────────
+
+
+@pytest.mark.parametrize("kernel", ["rbf", "matern12", "matern32", "matern52"])
+@pytest.mark.parametrize(
+    "n,m,d,R", [(1, 1, 3, 1), (127, 129, 3, 7), (1000, 513, 3, 64), (129, 4097, 16, 1)]
+)
+def test_kernel_matmul_conformance(kernel, n, m, d, R):
+    g = torch.Generator().manual_seed(n + 3 * m)
+    X = torch.rand(n, d, generator=g, dtype=torch.float64).float()
+    Y = torch.rand(m, d, generator=g, dtype=torch.float64).float()
+    V = rand_vec((m, R), torch.float32, n + m)
+    ell = 0.5 * d**0.5
+    ref = ts.kernel_matmul_reference(X, Y, V, kernel, ell, 1.5)
+    got = ts.kernel_matmul(D(X), D(Y), D(V), kernel, ell, 1.5)
+    assert H(got).device.type == "cpu" and got.device == D(V).device
+    assert_close(got, ref, torch.float32, tol=2e-5)
+    if n == m or n == 1:
+        Vs = rand_vec((n, R), torch.float32, 7 * n)
+        ref_s = ts.kernel_matmul_reference(X, None, Vs, kernel, ell, 1.5, noise=1e-2)
+        got_s = ts.kernel_matmul(D(X), None, D(Vs), kernel, ell, 1.5, noise=1e-2)
+        # Matern-1/2 has a cusp at r = 0: near-coincident points see the
+        # fp32 expansion error under a square root (see kernel_matmul).
+        assert_close(got_s, ref_s, torch.float32, tol=5e-3 if kernel == "matern12" else 2e-5)
+
+
+def test_kernel_operator_conformance_and_determinism():
+    g = torch.Generator().manual_seed(11)
+    X = torch.rand(2000, 3, generator=g, dtype=torch.float64).float() + 3.0
+    V = rand_vec((2000, 33), torch.float32, 12)
+    op = ts.KernelOperator(X, "rbf", 0.2, 1.0, noise=1e-4, device=D(V).device)
+    ref = ts.kernel_matmul_reference(X, None, V, "rbf", 0.2, 1.0, noise=1e-4)
+    a = op(D(V))
+    assert_close(a, ref, torch.float32, tol=2e-5)
+    assert torch.equal(H(a), H(op(D(V))))  # bit-identical across runs
+    Xs = torch.rand(300, 3, generator=g, dtype=torch.float64).float() + 3.0
+    assert_close(
+        op.cross(Xs, D(V)),
+        ts.kernel_matmul_reference(Xs, X, V, "rbf", 0.2, 1.0),
+        torch.float32,
+        tol=2e-5,
+    )

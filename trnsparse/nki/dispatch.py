@@ -1777,3 +1777,81 @@ def nki_bsr_attn_bwd(
         return _block_sparse_attn_backward(
             Q, K, V, O, dO, mask_bsr, scale, row_max=row_max, row_denom=row_denom
         )
+
+
+# ── Fused kernel-matrix product K(X, Y) @ V (#93) ────────────────────────────
+#
+# Eager native launches go through a `torch_neuronx.wrap_nki` handle built
+# once per kernel (the trnblas#92 pattern, aws-neuron-sdk#1456): the custom-op
+# layer and nki `Kernel.__call__` rebuild a handle on every call, about
+# 0.08 ms. A CG iteration is one launch, so that floor is per iteration.
+# TRNSPARSE_NKI_EAGER_HANDLE=0 uses the `trnsparse::kmv_*` custom ops instead.
+
+_EAGER_HANDLE = os.environ.get("TRNSPARSE_NKI_EAGER_HANDLE", "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+)
+_eager_handles: dict[int, tuple] = {}
+
+
+def _eager_handle(kernel):
+    """Cached `torch_neuronx.wrap_nki(kernel)`, or None when unavailable."""
+    entry = _eager_handles.get(id(kernel))
+    if entry is not None:
+        return entry[1]
+    try:
+        import torch_neuronx
+
+        wrap = getattr(torch_neuronx, "wrap_nki", None)
+    except ImportError:
+        wrap = None
+    handle = wrap(kernel) if wrap is not None and hasattr(kernel, "func") else None
+    _eager_handles[id(kernel)] = (kernel, handle)
+    return handle
+
+
+def _eager_ok(tensors) -> bool:
+    if not _EAGER_HANDLE or torch.compiler.is_compiling():  # torch >= 2.3 (native path: 2.14)
+        return False
+    return all(
+        type(t) is torch.Tensor and t.device.type == _NEURON_DEVICE and not t.requires_grad
+        for t in tensors
+    )
+
+
+def nki_kernel_matmul(
+    x: torch.Tensor,
+    y: torch.Tensor | None,
+    v: torch.Tensor,
+    params: torch.Tensor,
+    kind: int,
+    group: int,
+) -> torch.Tensor:
+    """One launch of the fused kernel-matrix product (see `kernels._kmv_body`).
+
+    x (n, d), y (m, d) or None (Y = X, noise added), v (m, R) and params
+    (128, 4) are fp32 and contiguous, prepared by `trnsparse.kernel_matmul`.
+    The result is fp32 on v's device. Raises on any kernel-path failure;
+    the caller decides whether to fall back.
+    """
+    from . import kernels as _k
+
+    self_op = y is None
+    kernel = _k._kmv_self_kernel if self_op else _k._kmv_cross_kernel
+    tensors = (x, v, params) if self_op else (x, y, v, params)
+    if _use_simulator():
+        out = nki.simulate(kernel)(*(_sim_np(t) for t in tensors), int(kind), int(group))
+        return _sim_torch(out, v.device)
+    xs, orig = _to_device(*tensors)
+    if _get_dispatch_path() == "native":
+        handle = _eager_handle(kernel) if _eager_ok(xs) else None
+        if handle is not None:
+            out = handle(*xs, int(kind), int(group))
+        else:
+            op = _get_native_ops()["kmv_self" if self_op else "kmv_cross"]
+            out = op(*xs, int(kind), int(group))
+    else:
+        out = kernel(*xs, int(kind), int(group))
+    return out.to(orig)

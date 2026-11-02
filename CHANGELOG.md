@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`kernel_matmul` / `KernelOperator`: fused kernel-matrix product
+  K(X, Y) @ V that never forms K** (#93, for trnsci/trnsci#109). RBF and
+  Matern-1/2, 3/2, 5/2; per-dimension lengthscales; `noise * V` on the
+  square operator. One NKI launch per application: squared distances as a
+  TensorEngine matmul on augmented coordinates into PSUM, the kernel
+  function on ScalarE straight from PSUM, the product with V on the
+  TensorEngine. Coordinates are augmented and transposed on chip
+  (`nl.load` + `nisa.nc_transpose`); tile loops are rolled
+  (`nl.fori_loop`), so trace and compile time do not grow with n; ragged
+  n, m and R are handled in the kernel. Both physical cores at LNC=2 with
+  the same control flow on each, and bit-identical results at LNC=1 and
+  LNC=2. Hyperparameters are a tensor argument (aws-neuron-sdk#1454).
+  Eager launches use a cached `torch_neuronx.wrap_nki` handle (the
+  trnblas#92 pattern). CPU tests: PyTorch path against float64
+  `torch.cdist`; `nki.simulate` at LNC=1/2, MLIR verify and (with
+  neuronx-cc) NEFF compile with NKI allocation at LNC=1/2.
+  `benchmarks/bench_kernel_matmul_trn2.py` measures kernel entries/s
+  against aten on the device and the host CPU at 2 threads and all vCPUs.
+  `tile_mask` is reserved and raises for now.
+
 ### Fixed
 
 - **`from_scipy` downcast float64 and integer matrices to float32** (silent,
