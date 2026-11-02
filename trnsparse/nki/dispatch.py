@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import sys
 import warnings
 
 import numpy as np
@@ -296,14 +297,115 @@ def _to_device(*tensors: torch.Tensor):
     return _to_xla(*tensors)
 
 
+# ── Eager call handles (native path) ─────────────────────────────────────────
+#
+# Same fix as trnblas#92. A `trnsparse::` custom-op call costs ~0.10 ms of host
+# time before the kernel is queued; an aten op costs ~0.02 ms (trn2, SDK 2.33).
+# Most of the gap is per-call work that never changes for a given kernel:
+#   - nki's `Kernel.__call__` rebuilds the torch handle on every call
+#     (`inspect.signature`, a fresh `TorchNativeKernel` hashed into the
+#     registry, LNC resolution): ~0.06 ms;
+#   - the `torch.library` custom-op layer: ~0.01-0.02 ms.
+# So eager calls on plain neuron tensors build a handle once per kernel with
+# the public `torch_neuronx.wrap_nki` and call it directly (~0.02 ms). The
+# handle is gridless, so NKI resolves the LNC grid itself.
+# Static arguments (keyed-structure ids, solver settings, structure lists) pass
+# through it with the same conversions the op body applies (`int(key)`,
+# `tuple(row_ptrs)`, `float(scale)`), listed per op in `_native.KERNELS`.
+# Only ops whose body is a single kernel call qualify: `_native.KERNELS`
+# names the kernel each one calls, and the handle wraps that kernel (looked
+# up when called, as the op body does; not the caller's), so it runs exactly
+# what the op body runs. Ops that are not listed keep the op.
+# Under torch.compile, for tensor subclasses (fake / functional), tensors that
+# require grad, and int64 inputs (the custom op applies the TorchNeuron int64
+# policy), the custom op is used as before.
+# `TRNSPARSE_NKI_EAGER_HANDLE=0` turns the fast path off.
+
+_EAGER_HANDLE_ENABLED: bool = os.environ.get(
+    "TRNSPARSE_NKI_EAGER_HANDLE", "1"
+).strip().lower() not in ("0", "false", "no", "off")
+# id(kernel) -> (kernel, handle); holding the kernel keeps its id unique.
+_eager_handles: dict[int, tuple[object, object]] = {}
+_wrap_nki: object = None  # torch_neuronx.wrap_nki, resolved on first use; False if absent
+
+
+def _eager_handle(kernel):
+    """Torch call handle for `kernel`, built once; None if unavailable."""
+    entry = _eager_handles.get(id(kernel))
+    if entry is not None:
+        return entry[1]
+    global _wrap_nki
+    if _wrap_nki is None:
+        try:
+            import torch_neuronx
+
+            _wrap_nki = getattr(torch_neuronx, "wrap_nki", False)
+        except ImportError:
+            _wrap_nki = False
+    if _wrap_nki is False or not hasattr(kernel, "func"):
+        return None  # no torch_neuronx.wrap_nki, or not an @nki.jit kernel
+    handle = _wrap_nki(kernel)
+    _eager_handles[id(kernel)] = (kernel, handle)
+    return handle
+
+
+def _eager_call_ok(tensors) -> bool:
+    """True when calling the cached handle is equivalent to the custom op."""
+    if not _EAGER_HANDLE_ENABLED or torch.compiler.is_compiling():
+        return False
+    for t in tensors:
+        if (
+            type(t) is not torch.Tensor
+            or t.device.type != _NEURON_DEVICE
+            or t.requires_grad
+            or t.dtype == torch.int64
+        ):
+            return False
+    return True
+
+
+def _native_kernel(op_name: str):
+    """`(kernel, conversions)` for the kernel the `trnsparse::<op_name>` op body
+    calls (looked up now, as the body does), or None for an op that is not a
+    single kernel call. `conversions[i]` is what the body applies to
+    positional argument i (`int`, `tuple`, `float`), or None to pass it as is."""
+    native = sys.modules.get(__package__ + "._native")  # loaded by _get_native_ops
+    entry = None if native is None else native.KERNELS.get(op_name)
+    if entry is None:
+        return None
+    kernel = getattr(entry[0], entry[1], None)
+    return None if kernel is None else (kernel, entry[2] if len(entry) > 2 else ())
+
+
+def _native_call(op_name: str, args):
+    """Run `trnsparse::<op_name>` on `args` (tensors already on the device, then
+    the op's static arguments): through the cached handle when
+    that is equivalent (see above), else the custom op."""
+    ops = _get_native_ops()
+    if _eager_call_ok([a for a in args if isinstance(a, torch.Tensor)]):
+        entry = _native_kernel(op_name)
+        handle = None if entry is None else _eager_handle(entry[0])
+        if handle is not None:
+            conv = entry[1]
+            if conv:
+                args = [
+                    conv[i](a) if i < len(conv) and conv[i] is not None else a
+                    for i, a in enumerate(args)
+                ]
+            return handle(*args)
+    return ops[op_name](*args)
+
+
 def _run(kernel, op_name: str, *device_tensors: torch.Tensor):
     """Call one kernel on operands already placed by `_to_device`.
 
     `op_name` is the `trnsparse::<op_name>` custom op used on the native
-    path; the XLA path calls `kernel` directly on torch_xla tensors.
+    path (eager calls on plain tensors skip the op layer through a cached
+    handle, see `_native_call`); the XLA path calls `kernel` directly on
+    torch_xla tensors.
     """
     if _get_dispatch_path() == "native":
-        return _get_native_ops()[op_name](*device_tensors)
+        return _native_call(op_name, device_tensors)
     return kernel(*device_tensors)
 
 
@@ -833,7 +935,7 @@ def _nki_bsr_spmm_static(A, B: torch.Tensor) -> torch.Tensor:
     blocks = A.blocks.contiguous().to(device=dev, dtype=kdt)
     b_dev = B.contiguous().to(device=dev, dtype=kdt)
     key = _kernels.register_structure(row_ptrs, cols)
-    out = _get_native_ops()["bsr_spmm_keyed"](blocks, b_dev, key)
+    out = _native_call("bsr_spmm_keyed", [blocks, b_dev, key])
     return out[:m, :out_cols].to(device=orig, dtype=out_dtype)
 
 
@@ -1253,8 +1355,8 @@ def _nki_attn_fwd_static(Q, K, V, mask_bsr, scale: float, return_stats: bool):
     q_t = (Qd.float() * scale).to(kdt).T.contiguous()
     Kd, Vd = Kd.to(kdt), Vd.to(kdt)
     key = _kernels.register_structure(row_ptrs, cols)
-    out, row_max, row_denom = _get_native_ops()["attn_fwd_keyed"](
-        q_t, Kd.T.contiguous(), Vd.contiguous(), key
+    out, row_max, row_denom = _native_call(
+        "attn_fwd_keyed", [q_t, Kd.T.contiguous(), Vd.contiguous(), key]
     )
     out, row_max, row_denom = (t.to(orig) for t in (out, row_max, row_denom))
     out = out.to(dtype)
@@ -1301,25 +1403,28 @@ def _nki_attn_bwd_static(Q, K, V, dO, O, mask_bsr, row_max, row_denom, scale: fl
     rm = row_max.to(device=dev, dtype=torch.float32).reshape(seq_len, 1)
     rinv = 1.0 / row_denom.to(device=dev, dtype=torch.float32).reshape(seq_len, 1)
     d = (dO.float() * O.float()).sum(dim=-1, keepdim=True)
-    dQ, dK, dV = _get_native_ops()["attn_bwd_static"](
-        q_s.T.contiguous(),
-        k.T.contiguous(),
-        V.to(kdt).T.contiguous(),
-        do.T.contiguous(),
-        q_s,
-        k,
-        do,
-        rm.contiguous(),
-        rinv.contiguous(),
-        d.contiguous(),
-        rm.reshape(1, seq_len).contiguous(),
-        rinv.reshape(1, seq_len).contiguous(),
-        d.reshape(1, seq_len).contiguous(),
-        row_ptrs,
-        cols,
-        col_ptrs,
-        rows,
-        float(scale),
+    dQ, dK, dV = _native_call(
+        "attn_bwd_static",
+        [
+            q_s.T.contiguous(),
+            k.T.contiguous(),
+            V.to(kdt).T.contiguous(),
+            do.T.contiguous(),
+            q_s,
+            k,
+            do,
+            rm.contiguous(),
+            rinv.contiguous(),
+            d.contiguous(),
+            rm.reshape(1, seq_len).contiguous(),
+            rinv.reshape(1, seq_len).contiguous(),
+            d.reshape(1, seq_len).contiguous(),
+            row_ptrs,
+            cols,
+            col_ptrs,
+            rows,
+            float(scale),
+        ],
     )
     return tuple(t.to(device=orig, dtype=dtype) for t in (dQ, dK, dV))
 

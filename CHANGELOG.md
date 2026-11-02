@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+
+- **Eager NKI kernel calls skip the per-call handle rebuild and the custom-op
+  layer (same fix as trnblas#92).** On the native path a `trnsparse::`
+  custom-op call cost about 0.1 ms of host time before the kernel was queued,
+  against 0.016 ms for aten. Most of it went to nki's `Kernel.__call__`,
+  which rebuilds the torch handle on every call, plus the `torch.library`
+  layer. `dispatch._run` / `_launch` and the direct keyed-op calls (keyed
+  `bsr_spmm`, attention forward and backward, fused CG and power iteration,
+  `ShardedBSR` / `ShardedAttention`) now call a `torch_neuronx.wrap_nki`
+  handle built once per kernel, with the op body's `int()` / `tuple()` /
+  `float()` conversions of the static arguments. On trn2 (LNC=2), a
+  256x256x128 `spmm_dense` launch drops from 0.126 to 0.036 ms of issue time
+  (e2e 0.201 to 0.124 ms), a keyed `bsr_spmm` from 0.255 to 0.157 ms e2e, and
+  `cg_bsr_fused` n=256 from 1.36 to 1.19 ms. Results are bit-identical.
+  `torch.compile`, requires-grad, int64 and tensor-subclass inputs, and the
+  composite `bsr_attn` / `bsr_attn_bwd` ops keep the custom op.
+  `TRNSPARSE_NKI_EAGER_HANDLE=0` turns this off;
+  `scripts/bench_eager_handle.py` measures it.
+
 ### Added
 
 - **Guard against the NKI trace-cache closure bug ([aws-neuron/aws-neuron-sdk#1454](https://github.com/aws-neuron/aws-neuron-sdk/issues/1454),

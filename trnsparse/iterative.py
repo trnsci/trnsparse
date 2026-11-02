@@ -704,7 +704,7 @@ def cg_bsr_fused(
         return out.reshape(T, _P, R)
 
     if _use_fused_kernel(op):
-        from .nki.dispatch import _get_native_ops
+        from .nki.dispatch import _native_call
 
         bt, mt, key = op._device_operands(precision)
         TR = T * R
@@ -716,18 +716,21 @@ def cg_bsr_fused(
             state[:, TR : 2 * TR] = to_tiles(X0).permute(1, 0, 2).reshape(_P, TR)
         state[:, 2 * TR] = tol * tol
         state[:, 2 * TR + 1] = float(max_iter)
-        out = _get_native_ops()["cg_bsr_keyed"](
-            bt,
-            mt,
-            state.to(bt.device),
-            key,
-            check_every,
-            1 if op.preconditioner else 0,
-            op.sbuf_kib,
-            1 if op.core_split else 0,
-            _MATVEC_MODES[info["matvec"]],
-            _PRECISIONS[precision][0],
-            _RECURRENCES[recurrence],
+        out = _native_call(
+            "cg_bsr_keyed",
+            [
+                bt,
+                mt,
+                state.to(bt.device),
+                key,
+                check_every,
+                1 if op.preconditioner else 0,
+                op.sbuf_kib,
+                1 if op.core_split else 0,
+                _MATVEC_MODES[info["matvec"]],
+                _PRECISIONS[precision][0],
+                _RECURRENCES[recurrence],
+            ],
         ).cpu()
         xt = out[:, :TR].double().reshape(_P, T, R).permute(1, 0, 2).reshape(T * _P, R)
         x = (xt[:n] * scale).to(device=b.device, dtype=out_dtype)
@@ -865,22 +868,25 @@ def power_iteration_bsr_fused(
     vt = torch.zeros(T * _P, dtype=torch.float64)
     vt[:n] = v
     if _use_fused_kernel(op):
-        from .nki.dispatch import _get_native_ops
+        from .nki.dispatch import _native_call
 
         bt, _, key = op._device_operands(precision)
         state = torch.zeros(_P, 2 * T + 2, dtype=torch.float32)
         state[:, :T] = vt.reshape(T, _P).T
         state[:, 2 * T] = tol * tol
         state[:, 2 * T + 1] = float(max_iter)
-        out = _get_native_ops()["power_bsr_keyed"](
-            bt,
-            state.to(bt.device),
-            key,
-            check_every,
-            op.sbuf_kib,
-            1 if op.core_split else 0,
-            _MATVEC_MODES[matvec],
-            _PRECISIONS[precision][0],
+        out = _native_call(
+            "power_bsr_keyed",
+            [
+                bt,
+                state.to(bt.device),
+                key,
+                check_every,
+                op.sbuf_kib,
+                1 if op.core_split else 0,
+                _MATVEC_MODES[matvec],
+                _PRECISIONS[precision][0],
+            ],
         ).cpu()
         vec = out[:, :T].double().T.reshape(-1)
         vec = vec / torch.linalg.norm(vec).clamp_min(1e-300)
