@@ -421,7 +421,37 @@ def power_iteration_bsr(
 
     Returns:
         `(eigenvalue, eigenvector, iters)`.
+
+    Autograd: when `A.blocks` or `v0` requires grad, the eigenvector is
+    differentiated as the exact unit eigenvector of `A` for the returned
+    eigenvalue (implicit differentiation of `A v = lam v`, `||v|| = 1`).
+    Backward solves the bordered system
+    `[[A^T - lam I, v], [v^T, 0]] [w; nu] = [grad_v; 0]` densely, which
+    costs O(N^3), and gives `grad_A = -w v^T` on the stored blocks. `v0`
+    gets no gradient, because the eigenvector does not depend on it. The
+    eigenvalue is a Python float and carries no gradient. Backward raises
+    `NotImplementedError` for complex `A`, where the phase of the iterate
+    is not a smooth function of `A`. Through 0.13.0 the gradient went
+    through the iterations with frozen norms and was silently wrong (#96).
     """
+    needs_grad = torch.is_grad_enabled() and (
+        A.blocks.requires_grad or (v0 is not None and v0.requires_grad)
+    )
+    if not needs_grad:
+        return _power_iteration_loop(A, v0, max_iter, tol)
+    info: list = []
+    A_const = dataclasses.replace(A, blocks=A.blocks.detach())
+    v0_const = v0.detach() if v0 is not None else None
+    v = _PowerIterationEigvec.apply(A.blocks, v0, A_const, v0_const, max_iter, tol, info)
+    return info[0], v, info[1]
+
+
+def _power_iteration_loop(
+    A: BSRMatrix,
+    v0: torch.Tensor | None,
+    max_iter: int,
+    tol: float,
+) -> tuple[float, torch.Tensor, int]:
     n = A.shape[0]
     matvec = _bsr_matvec(A)
 
@@ -442,6 +472,61 @@ def power_iteration_bsr(
         lam_prev = lam
 
     return lam, v, max_iter
+
+
+class _PowerIterationEigvec(torch.autograd.Function):
+    """Unit eigenvector `v` of `A` with the gradient of the exact eigenvector.
+
+    Differentiating `A v = lam v`, `v^T v = 1` gives the bordered system
+    `K [dv; dlam] = [-dA v; 0]` with `K = [[A - lam I, -v], [v^T, 0]]`,
+    so the vector-Jacobian product is `grad_A = -w v^T`, where
+    `[[A^T - lam I, v], [v^T, 0]] [w; nu] = [g; 0]`. The `v^T w = 0` row
+    makes the `dlam` term drop out. The system is nonsingular when `lam`
+    is a simple eigenvalue.
+    """
+
+    @staticmethod
+    def forward(ctx, blocks, v0, A, v0_const, max_iter, tol, info):
+        lam, v, iters = _power_iteration_loop(A, v0_const, max_iter, tol)
+        info.extend([lam, iters])
+        ctx.A = A
+        ctx.save_for_backward(v)
+        return v
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx, g):
+        (v,) = ctx.saved_tensors
+        A = ctx.A
+        if not ctx.needs_input_grad[0]:
+            return None, None, None, None, None, None, None
+        if v.is_complex() or A.blocks.is_complex():
+            raise NotImplementedError(
+                "power_iteration_bsr: gradients for complex A are not supported "
+                "(the phase of the iterate is not a smooth function of A)"
+            )
+        n = v.shape[0]
+        Ad = A.to_dense().to(dtype=v.dtype, device=v.device)
+        Av = Ad @ v
+        lam = torch.dot(v, Av)
+        K = torch.zeros(n + 1, n + 1, dtype=v.dtype, device=v.device)
+        K[:n, :n] = Ad.T - lam * torch.eye(n, dtype=v.dtype, device=v.device)
+        K[:n, n] = v
+        K[n, :n] = v
+        rhs = torch.cat([g.to(v.dtype), g.new_zeros(1, dtype=v.dtype)])
+        w = torch.linalg.solve(K, rhs)[:n]
+
+        bs = A.block_size
+        m, nc = A.shape
+        Mt, Nt = -(-m // bs), -(-nc // bs)
+        w_t = torch.nn.functional.pad(w, (0, Mt * bs - n)).reshape(Mt, bs)
+        v_t = torch.nn.functional.pad(v, (0, Nt * bs - n)).reshape(Nt, bs)
+        ptrs = A.block_row_ptrs.to(device=w.device, dtype=torch.long)
+        rows = torch.repeat_interleave(torch.arange(Mt, device=w.device), ptrs.diff())
+        cols = A.block_col_indices.to(device=w.device, dtype=torch.long)
+        grad_blocks = -(w_t[rows].unsqueeze(2) * v_t[cols].unsqueeze(1))
+        grad_blocks = grad_blocks.to(dtype=A.blocks.dtype, device=A.blocks.device)
+        return grad_blocks, None, None, None, None, None, None
 
 
 # ── Fused, SBUF-resident CG (#22) ───────────────────────────────────────────
