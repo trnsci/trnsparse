@@ -19,8 +19,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `symmetric=True` (for `A == A.T`, as for the pair-index ERI matrix) skips
   the Tensor Engine transposes. On Trn2 (LNC=2) at n = 8192, N = 512 it is
   faster than dense aten `A @ B` up to 80% of tiles kept in fp32 (5.9x at
-  5%) and up to ~65% in bf16; at n = 4096 up to ~80% (fp32) / not in bf16;
-  at n <= 2048 the ~0.25 ms launch floor loses to aten. Results are in
+  5%) and up to ~65% in bf16; at n = 4096 up to ~75% (fp32) / not in bf16;
+  at n <= 2048 the ~0.25 ms launch floor loses to aten. It beats
+  `(A * mask) @ B` and the previous fused kernel at every density for
+  n >= 4096. Results are in
   docs/benchmarks.md. `TRNSPARSE_SCREEN_SKIP_TILES=0` restores the
   all-tiles fused kernel. `trnsparse.nki.dispatch.screened_tile_structure`
   exposes the classification.
