@@ -379,3 +379,75 @@ class TestTwoCoreAndBf16:
         )
         assert out.dtype == torch.bfloat16
         assert rm.dtype == torch.float32 and rd.dtype == torch.float32
+
+
+class TestGatherAttentionDtypes:
+    """trnsparse#49: bf16 Q / K / V on the gather attention kernels.
+
+    The gather (non-static) kernels run for head_dim > 128, or with the
+    static structure off. bf16 used to raise in `_attn_out_kernel`
+    ("nc_matmul: ... stationary=float32, moving=bfloat16"). Checked against
+    fp64 dense attention of the rounded inputs, forward and dQ / dK / dV,
+    with `_REQUIRE_NKI` on so a kernel failure cannot fall back to PyTorch.
+    head_dim 192 is zero-padded to 256 (two K tiles); before, it raised.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _require_nki(self, monkeypatch):
+        from trnsparse.nki import dispatch
+
+        monkeypatch.setattr(dispatch, "_REQUIRE_NKI", True)
+
+    @staticmethod
+    def _check(hd, dtype, tol, scale=None, seq_len=3 * P, kv_dtype=None, seed=49):
+        g = torch.Generator().manual_seed(seed + hd)
+        mask = _block_causal_mask(seq_len)  # the #49 repro: seq 384, block-causal, block 128
+        Q, dO = (torch.randn(seq_len, hd, generator=g).to(dtype) for _ in range(2))
+        K, V = (torch.randn(seq_len, hd, generator=g).to(kv_dtype or dtype) for _ in range(2))
+        q64, k64, v64 = (t.double().requires_grad_(True) for t in (Q, K, V))
+        sc = hd**-0.5 if scale is None else scale
+        s = (q64 @ k64.T * sc).masked_fill(~mask.to_dense().bool(), float("-inf"))
+        ref = torch.softmax(s, dim=-1) @ v64
+        ref.backward(dO.double())
+
+        Qd, Kd, Vd = (t.to(DEV).requires_grad_(True) for t in (Q, K, V))
+        out = trnsparse.block_sparse_attention_tiled(Qd, Kd, Vd, mask, scale=scale)
+        assert out.dtype == dtype and out.shape == (seq_len, hd)
+        assert _rel(out, ref.detach()) < tol
+        out.backward(dO.to(DEV))
+        for got, exp in ((Qd.grad, q64.grad), (Kd.grad, k64.grad), (Vd.grad, v64.grad)):
+            assert got.shape == exp.shape
+            assert _rel(got, exp) < 5 * tol
+        return Qd, Kd, Vd
+
+    @pytest.mark.parametrize("hd", [192, 256])
+    @pytest.mark.parametrize("scale", [None, 0.5])
+    def test_bf16_forward_backward(self, hd, scale):
+        Qd, Kd, Vd = self._check(hd, torch.bfloat16, 3e-2, scale=scale)
+        assert Qd.grad.dtype == Kd.grad.dtype == Vd.grad.dtype == torch.bfloat16
+
+    @pytest.mark.parametrize("hd", [192, 256])
+    def test_fp32_forward_backward(self, hd):
+        self._check(hd, torch.float32, 1e-5)
+
+    def test_bf16_static_off(self, monkeypatch):
+        """head_dim 64 with the static structure off takes the gather kernels too."""
+        from trnsparse.nki import dispatch
+
+        monkeypatch.setattr(dispatch, "_STATIC_STRUCTURE", False)
+        self._check(64, torch.bfloat16, 3e-2)
+
+    def test_mixed_dtypes_run_fp32(self):
+        """bf16 Q with fp32 K / V: one fp32 operand dtype, output in Q's dtype."""
+        self._check(256, torch.bfloat16, 3e-2, kv_dtype=torch.float32)
+
+    @pytest.mark.parametrize("hd", [192, 256])
+    def test_bf16_stats_are_fp32(self, hd):
+        seq_len = 3 * P
+        mask = _block_causal_mask(seq_len)
+        Q, K, V = (torch.randn(seq_len, hd, dtype=torch.bfloat16).to(DEV) for _ in range(3))
+        out, rm, rd = torch.ops.trnsparse.bsr_attn(
+            Q, K, V, mask.block_col_indices, mask.block_row_ptrs, P
+        )
+        assert out.dtype == torch.bfloat16 and out.shape == (seq_len, hd)
+        assert rm.dtype == torch.float32 and rd.dtype == torch.float32
