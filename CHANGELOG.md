@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`from_scipy` downcast float64 and integer matrices to float32** (silent,
+  #69). Every real scipy matrix was stored as float32 (float64 rounded to
+  ~3e-8 relative error; int64 exact only up to 2^24) and complex128 as
+  complex64, which contradicted the "zero-copy" description in
+  docs/migration_scipy.md. The values now keep the scipy dtype, and for CSR
+  input share memory with `sp_matrix.data`. Affects 0.1.1 through 0.13.0.
+  **Behaviour change:** float64 scipy input now gives a float64 matrix, so
+  mixing it with float32 vectors (`spmv(from_scipy(M64), x32)`) raises the
+  usual torch dtype-mismatch error; cast one side (`M.astype(np.float32)`).
+  docs/migration_scipy.md no longer refers to a nonexistent `.to_scipy()`.
+- **`cg_bsr` gave silently wrong gradients** (#70). The CG step sizes were
+  taken with `.item()`, so autograd differentiated a frozen-coefficient
+  polynomial in `A` applied to `b`, not the solve: with `b` along an
+  eigenvector (one-step convergence) `b.grad` was ~20% off `A^{-1} g`, and
+  `A.blocks.grad` had the same problem. `cg_bsr` now differentiates as the
+  exact solve (implicit differentiation, like `torch.linalg.solve`):
+  backward runs a second CG solve `A lam = grad_x` with the same
+  `tol` / `max_iter` / `M`, giving `grad_b = lam` and
+  `grad_A = -lam x^H` on the stored blocks. `x0` and `M` no longer receive
+  gradients. Forward values are unchanged. Affects 0.3.2 through 0.13.0.
 - **`cg_bsr_fused` / `power_iteration_bsr_fused` gave wrong results for
   complex, integer and bool inputs** (silent, #85). Both pack A and the
   vectors into real float tiles, so on every backend (including
