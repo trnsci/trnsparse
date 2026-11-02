@@ -321,17 +321,28 @@ def from_dense(A: torch.Tensor, threshold: float = 0.0) -> CSRMatrix:
 def from_scipy(sp_matrix) -> CSRMatrix:
     """Convert scipy.sparse matrix to CSRMatrix.
 
-    Values are stored in single precision: float32 for real input,
-    complex64 for complex input (through 0.12.1 complex input was cast to
-    float32, which discarded the imaginary part, #58).
+    The values keep the scipy dtype (float64 stays float64, int64 stays
+    int64, complex128 stays complex128, ...). When the input is already CSR
+    with native-endian, writable data, the values tensor shares memory with
+    ``sp_matrix.data`` (zero-copy); otherwise they are copied. The index
+    arrays are always copied to int64.
+
+    Through 0.13.0 every real input was stored as float32 and complex input
+    as complex64 (#69); cast afterwards if single precision is wanted, e.g.
+    ``from_scipy(M.astype(np.float32))``.
     """
     import numpy as np
     import scipy.sparse as sp
 
     csr = sp.csr_matrix(sp_matrix)
-    dtype = torch.complex64 if np.iscomplexobj(csr.data) else torch.float32
+    data = csr.data
+    if not data.dtype.isnative:
+        data = data.astype(data.dtype.newbyteorder("="))
+    if not data.flags.writeable:
+        data = data.copy()
+    values = torch.from_numpy(np.ascontiguousarray(data))
     return CSRMatrix(
-        values=torch.tensor(csr.data, dtype=dtype),
+        values=values,
         col_indices=torch.tensor(csr.indices, dtype=torch.long),
         row_ptrs=torch.tensor(csr.indptr, dtype=torch.long),
         shape=csr.shape,
