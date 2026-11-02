@@ -138,6 +138,121 @@ def _nki_block_ok(op: str, block_size: int) -> bool:
     return False
 
 
+# ── Kernel operand dtypes: one guard at the kernel boundary ─────────────────
+#
+# Every NKI kernel computes in fp32 / bf16 (fp32 PSUM). float64, complex,
+# integer and bool tensors must never reach one: before 0.12.2 some did, and
+# came back as garbage, a dropped imaginary part, or the wrong dtype
+# (#78, #79, trnsci/trnsci#35). Two layers:
+#
+# 1. `_kernel_values_ok` / `_no_kernel_for_dtype`, at each public entry: which
+#    value dtypes a kernel path can take. float64 is cast to fp32 for the kernel
+#    and the result back to float64 (the documented behaviour since 0.2.0;
+#    Trainium has no fp64 datapath). Complex, integer and bool values have no
+#    kernel: they take the PyTorch path (what `set_backend("pytorch")` does),
+#    or raise `NotImplementedError` under TRNSPARSE_REQUIRE_NKI.
+# 2. `_check_kernel_operands`, enforced by every launch itself (the native op
+#    table from `_get_native_ops`, `_run` on the XLA path, `_simulate` on the
+#    simulator): each tensor operand of each op, by position, must have a dtype
+#    in `_KERNEL_OPERAND_DTYPES[op]`, else `TypeError`. A wrapper that forgets
+#    layer 1 fails loudly instead of handing a kernel an unsupported dtype.
+
+_F32 = frozenset({torch.float32})
+_MM = frozenset({torch.float32, torch.bfloat16})  # static / attention matmul operands
+_MM16 = _MM | {torch.float16}  # the gather GEMM kernels also take fp16 (as before)
+_ANYF = _MM16 | {torch.float64}  # composite ops: cast internally per kernel
+_IDX = frozenset({torch.int32, torch.int64})
+
+# Allowed dtypes per tensor operand, in argument order (non-tensor arguments
+# such as structure lists, keys and flags are skipped). Keyed by the short op
+# name used in `_native.OPS`, `_launch`, `_run` and `_simulate`.
+_KERNEL_OPERAND_DTYPES: dict[str, tuple[frozenset, ...]] = {
+    "spmm_dense": (_MM16, _MM16),
+    "bsr_spmm": (_MM16, _MM16),
+    "screened_spmm": (_MM16, _MM16, _MM16, _MM16),
+    "bsr_spmm_static": (_MM, _MM),
+    "bsr_spmm_static_t": (_MM, _MM),
+    "bsr_spmm_keyed": (_MM, _MM),
+    "bsr_spmm_t_keyed": (_MM, _MM),
+    "attn_fwd_keyed": (_MM, _MM, _MM),
+    "attn_fwd_static": (_MM, _MM, _MM),
+    "attn_bwd_static": (_MM,) * 7 + (_F32,) * 6,
+    "attn_stats": (_MM, _MM),
+    "attn_out": (_MM, _MM, _MM, _F32, _F32),
+    "attn_bwd_dq": (_MM,) * 4 + (_F32,) * 3,
+    "attn_bwd_dkdv": (_MM,) * 4 + (_F32,) * 3,
+    "cg_bsr_keyed": (_MM, _F32, _F32),
+    "power_bsr_keyed": (_MM, _F32),
+    # Composite ops (several kernel launches; each launch is checked again).
+    "bsr_attn": (_ANYF, _ANYF, _ANYF, _IDX, _IDX),
+    "bsr_attn_bwd": (_ANYF,) * 5 + (_IDX, _IDX) + (_ANYF, _ANYF),
+}
+
+# Value dtypes a kernel path takes at the public entry (float64 via a cast).
+_KERNEL_VALUE_DTYPES = _ANYF
+
+
+def _check_kernel_operands(op_name: str, args) -> None:
+    """Raise `TypeError` unless every tensor in `args` has an allowed dtype for `op_name`."""
+    allowed = _KERNEL_OPERAND_DTYPES.get(op_name)
+    if allowed is None:
+        raise TypeError(f"trnsparse kernel {op_name!r} has no operand dtype table entry")
+    tensors = [a for a in args if isinstance(a, torch.Tensor)]
+    if len(tensors) != len(allowed) or any(
+        t.dtype not in ok for t, ok in zip(tensors, allowed, strict=False)
+    ):
+        got = [str(t.dtype) for t in tensors]
+        want = [sorted(str(d) for d in ok) for ok in allowed]
+        raise TypeError(
+            f"trnsparse kernel {op_name!r}: operand dtypes {got} not allowed (expected {want})"
+        )
+
+
+def _guard_op(op_name: str, op):
+    """`op` with its operand dtypes checked on every call (see `_check_kernel_operands`)."""
+
+    def guarded(*args, **kwargs):
+        _check_kernel_operands(op_name, args)
+        return op(*args, **kwargs)
+
+    guarded.__name__ = guarded.__qualname__ = op_name
+    guarded.__wrapped__ = op
+    return guarded
+
+
+def _kernel_values_ok(*tensors: torch.Tensor) -> bool:
+    """True when every value operand can go to a kernel (float64 through a cast)."""
+    return all(t.dtype in _KERNEL_VALUE_DTYPES for t in tensors)
+
+
+def _no_kernel_for_dtype(what: str, *tensors: torch.Tensor) -> None:
+    """Under TRNSPARSE_REQUIRE_NKI, refuse value dtypes the kernels do not take.
+
+    Without it the caller runs the PyTorch path instead (as `set_backend("pytorch")`).
+    """
+    if _REQUIRE_NKI:
+        dts = sorted({str(t.dtype) for t in tensors})
+        raise NotImplementedError(
+            f"trnsparse {what}: the NKI kernels take float32/bfloat16/float16 "
+            f"(float64 through an fp32 cast) values, got {dts}. "
+            "Unset TRNSPARSE_REQUIRE_NKI to compute in torch."
+        )
+
+
+def _kernel_route(what: str, *tensors: torch.Tensor) -> bool:
+    """True: a kernel path. False: the PyTorch path (raises under REQUIRE_NKI)."""
+    if _kernel_values_ok(*tensors):
+        return True
+    _no_kernel_for_dtype(what, *tensors)
+    return False
+
+
+def _simulate(kernel, op_name: str, *tensors: torch.Tensor):
+    """`nki.simulate(kernel)` on host numpy views of `tensors`, dtype-checked."""
+    _check_kernel_operands(op_name, tensors)
+    return nki.simulate(kernel)(*(_sim_np(t) for t in tensors))
+
+
 def _round_up(n: int, multiple: int) -> int:
     return ((n + multiple - 1) // multiple) * multiple
 
@@ -244,7 +359,10 @@ def _get_native_ops() -> dict:
     if _native_ops is None:
         from . import _native
 
-        _native_ops = _native.OPS
+        missing = set(_native.OPS) - set(_KERNEL_OPERAND_DTYPES)
+        if missing:
+            raise TypeError(f"trnsparse native ops without an operand dtype entry: {missing}")
+        _native_ops = {name: _guard_op(name, op) for name, op in _native.OPS.items()}
     return _native_ops
 
 
@@ -304,6 +422,7 @@ def _run(kernel, op_name: str, *device_tensors: torch.Tensor):
     """
     if _get_dispatch_path() == "native":
         return _get_native_ops()[op_name](*device_tensors)
+    _check_kernel_operands(op_name, device_tensors)
     return kernel(*device_tensors)
 
 
@@ -488,7 +607,7 @@ def _nki_spmm_impl(A_dense: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
         if _use_simulator():
             # CPU-side: feed NumPy arrays to nki.simulate(kernel). Bypasses
             # torch_xla entirely.
-            out_np = nki.simulate(_spmm_dense_kernel)(A_feed.cpu().numpy(), B_feed.cpu().numpy())
+            out_np = _simulate(_spmm_dense_kernel, "spmm_dense", A_feed, B_feed)
             result = torch.from_numpy(np.asarray(out_np)).to(A_dense.device)
         else:
             result = _launch(_spmm_dense_kernel, "spmm_dense", A_feed, B_feed)
@@ -542,6 +661,10 @@ def nki_spmm(A, B: torch.Tensor) -> torch.Tensor:
     `register_autograd`) runs the kernel. B may live on the host or on
     `neuron`; the result is on B's device.
     """
+    if not _kernel_route("spmm", A.values, B):
+        from ..ops import _csr_matmul
+
+        return _csr_matmul(A, B)
     if _native_path():
         A_dense = _csr_to_dense_on(A, B.device)
         return _nki_spmm_impl(A_dense, B)
@@ -565,7 +688,7 @@ def _nki_bsr_spmm_impl(
         bg_feed = _kernel_input(b_gathered.contiguous())
 
         if _use_simulator():
-            out_np = nki.simulate(_bsr_spmm_kernel)(bp_feed.cpu().numpy(), bg_feed.cpu().numpy())
+            out_np = _simulate(_bsr_spmm_kernel, "bsr_spmm", bp_feed, bg_feed)
             result = torch.from_numpy(np.asarray(out_np)).to(blocks_pad.device)
         else:
             result = _launch(_bsr_spmm_kernel, "bsr_spmm", bp_feed, bg_feed)
@@ -746,7 +869,11 @@ def nki_bsr_spmm(A, B: torch.Tensor) -> torch.Tensor:
 
         return _bsr_spmm_pytorch(A, B)
     if A.blocks.is_complex() or B.is_complex():
-        return _nki_bsr_spmm_complex(A, B)
+        return _nki_bsr_spmm_complex(A, B)  # real kernel launches (#78)
+    if not _kernel_route("bsr_spmm", A.blocks, B):
+        from ..ops import _bsr_spmm_pytorch
+
+        return _bsr_spmm_pytorch(A, B)
     if _native_path():
         out_cols = B.shape[1]
         n_tiles = 1 if out_cols <= _TILE_N else -(-out_cols // _TILE_N)
@@ -898,11 +1025,8 @@ def _nki_screened_spmm_impl(
         threshold_sqrt_t = _kernel_input(threshold_sqrt_t)
 
         if _use_simulator():
-            out_np = nki.simulate(_screened_spmm_kernel)(
-                A_feed.cpu().numpy(),
-                Q_feed.cpu().numpy(),
-                threshold_sqrt_t.cpu().numpy(),
-                B_feed.cpu().numpy(),
+            out_np = _simulate(
+                _screened_spmm_kernel, "screened_spmm", A_feed, Q_feed, threshold_sqrt_t, B_feed
             )
             result = torch.from_numpy(np.asarray(out_np)).to(A.device)
         else:
@@ -974,6 +1098,10 @@ def nki_screened_spmm(
     op carries the autograd (no gradient to `diag_integrals` or
     `threshold`). The result is on B's device.
     """
+    if not _kernel_route("screened_spmm", A, B):
+        from ..ops import _screened_spmm_pytorch
+
+        return _screened_spmm_pytorch(A, diag_integrals, B, threshold)
     if _native_path():
         import math as _math
 
@@ -1153,6 +1281,10 @@ def nki_bsr_attn_tiled(
         from ..ops import _block_sparse_attn_pytorch
 
         return _block_sparse_attn_pytorch(Q, K, V, mask_bsr, scale, return_stats=return_stats)
+    if not _kernel_route("block_sparse_attention_tiled", Q, K, V):
+        from ..ops import _block_sparse_attn_pytorch
+
+        return _block_sparse_attn_pytorch(Q, K, V, mask_bsr, scale, return_stats=return_stats)
 
     if (
         _native_path()
@@ -1180,7 +1312,7 @@ def nki_bsr_attn_tiled(
 
     try:
         if _use_simulator():
-            tile_max_np, tile_sumexp_np = nki.simulate(_attn_stats_kernel)(_sim_np(qs), _sim_np(kg))
+            tile_max_np, tile_sumexp_np = _simulate(_attn_stats_kernel, "attn_stats", qs, kg)
             tile_max = _sim_torch(tile_max_np, Q.device)
             tile_sumexp = _sim_torch(tile_sumexp_np, Q.device)
             # NKI 0.3.0 keepdims: tile_max/tile_sumexp are (M_tiles, K_max, 128, 1)
@@ -1193,9 +1325,7 @@ def nki_bsr_attn_tiled(
             rm = row_max.unsqueeze(-1).contiguous()
             rd = row_denom.unsqueeze(-1).contiguous()
 
-            out_np = nki.simulate(_attn_out_kernel)(
-                _sim_np(qs), _sim_np(kg), _sim_np(vg), _sim_np(rm), _sim_np(rd)
-            )
+            out_np = _simulate(_attn_out_kernel, "attn_out", qs, kg, vg, rm, rd)
             result = _sim_torch(out_np, Q.device)
         else:
             # Q/K/V tiles cross to the device once and feed both passes.
@@ -1508,6 +1638,12 @@ def nki_bsr_attn_bwd(
         return _block_sparse_attn_backward(
             Q, K, V, O, dO, mask_bsr, scale, row_max=row_max, row_denom=row_denom
         )
+    if not _kernel_route("block_sparse_attention_tiled backward", Q, K, V, dO, O):
+        from ..ops import _block_sparse_attn_backward
+
+        return _block_sparse_attn_backward(
+            Q, K, V, O, dO, mask_bsr, scale, row_max=row_max, row_denom=row_denom
+        )
 
     if (
         _native_path()
@@ -1548,25 +1684,29 @@ def nki_bsr_attn_bwd(
 
     try:
         if _use_simulator():
-            dQ_np = nki.simulate(_attn_bwd_dq_kernel)(
-                _sim_np(rf["q_scaled"]),
-                _sim_np(rf["k_gathered"]),
-                _sim_np(rf["v_gathered"]),
-                _sim_np(rf["do_gathered"]),
-                _sim_np(rf["D_blocks"]),
-                _sim_np(rm_in),
-                _sim_np(rd_in),
+            dQ_np = _simulate(
+                _attn_bwd_dq_kernel,
+                "attn_bwd_dq",
+                rf["q_scaled"],
+                rf["k_gathered"],
+                rf["v_gathered"],
+                rf["do_gathered"],
+                rf["D_blocks"],
+                rm_in,
+                rd_in,
             )
             dQ_raw = _sim_torch(dQ_np, Q.device)
 
-            dK_np, dV_np = nki.simulate(_attn_bwd_dkdv_kernel)(
-                _sim_np(cf["k_blocks"]),
-                _sim_np(cf["v_blocks"]),
-                _sim_np(cf["q_gathered"]),
-                _sim_np(cf["do_gathered"]),
-                _sim_np(cf["D_gathered"]),
-                _sim_np(cf["row_max_gathered"]),
-                _sim_np(cf["row_denom_gathered"]),
+            dK_np, dV_np = _simulate(
+                _attn_bwd_dkdv_kernel,
+                "attn_bwd_dkdv",
+                cf["k_blocks"],
+                cf["v_blocks"],
+                cf["q_gathered"],
+                cf["do_gathered"],
+                cf["D_gathered"],
+                cf["row_max_gathered"],
+                cf["row_denom_gathered"],
             )
             dK_raw = _sim_torch(dK_np, Q.device)
             dV_raw = _sim_torch(dV_np, Q.device)

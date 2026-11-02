@@ -400,7 +400,12 @@ def screened_spmm(
         from .nki.dispatch import nki_screened_spmm
 
         return nki_screened_spmm(A, diag_integrals, B, threshold)
+    return _screened_spmm_pytorch(A, diag_integrals, B, threshold)
 
+
+def _screened_spmm_pytorch(
+    A: torch.Tensor, diag_integrals: torch.Tensor, B: torch.Tensor, threshold: float
+) -> torch.Tensor:
     # PyTorch fallback — semantic spec for the kernel.
     # Requires diag_integrals 1-D of length matching A's rows and cols
     # (common chemistry case: A is square (n, n) with a per-shell bound vector).
@@ -833,10 +838,12 @@ def block_sparse_attention_tiled(
     if scale is None:
         scale = head_dim**-0.5
 
-    from .nki.dispatch import _native_path, _nki_block_ok, _use_nki
+    from .nki.dispatch import _kernel_route, _native_path, _nki_block_ok, _use_nki
 
     # Block sizes the kernels do not take go straight to PyTorch (#46).
     use_nki = _use_nki() and _nki_block_ok("block_sparse_attention_tiled", b)
+    if use_nki and not _kernel_route("block_sparse_attention_tiled", Q, K, V):
+        use_nki = False  # complex / integer / bool: the PyTorch reference
     if use_nki and _native_path():
         from .nki.dispatch import _get_native_ops
 

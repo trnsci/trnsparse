@@ -479,8 +479,9 @@ class TestLaunchRouting:
             raise AssertionError("native ops must not load on the XLA path")
 
         monkeypatch.setattr(dispatch, "_get_native_ops", no_ops)
-        out = dispatch._launch(lambda x: x * 3, "unused", torch.ones(4, 1))
-        assert moved == [1]
+        # A real op name: the XLA launch checks its operand dtype table too.
+        out = dispatch._launch(lambda x, y: x * 3, "spmm_dense", torch.ones(4, 1), torch.ones(1, 1))
+        assert moved == [2]
         assert torch.equal(out, torch.full((4, 1), 3.0))
 
     def test_cpu_launch_keeps_pre_native_behaviour(self, monkeypatch):

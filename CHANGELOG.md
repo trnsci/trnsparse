@@ -22,6 +22,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - README: known platform issue note for #1454.
 ### Fixed
 
+- **No NKI kernel is reached with an operand dtype it does not take** (one
+  guard at the kernel boundary; trnsci/trnsci#35, the class of #78 and #79).
+  At each entry (`spmm`, `bsr_spmm`, `screened_spmm`,
+  `block_sparse_attention_tiled` forward and backward), integer and bool
+  values, and complex values except in `bsr_spmm` (real kernel launches,
+  #78), now take the PyTorch path that `set_backend("pytorch")` takes, or
+  raise `NotImplementedError` under `TRNSPARSE_REQUIRE_NKI`. Before, they went
+  into the fp32/bf16 kernels on the NKI and auto backends: complex operands of
+  `spmm` / `screened_spmm` reached the kernel unchanged, the static attention
+  kernels cast complex Q/K/V to fp32 (imaginary part dropped), the static
+  `bsr_spmm` and attention kernels cast integers to fp32 and back, and
+  REQUIRE_NKI failed with whatever error the kernel raised. float64 keeps its
+  documented route (cast to fp32 for the kernel, result back in float64;
+  #84 asks whether to change that); fp32, bf16 and fp16 are unchanged. Every
+  launch now also checks a per-kernel, per-operand dtype table itself
+  (`_KERNEL_OPERAND_DTYPES`: the native op table, `_run` on the XLA path and
+  the simulator) and raises `TypeError` naming the op and dtypes, so a future
+  wrapper without the entry check cannot hand a kernel an unsupported dtype.
+  Affects every release with NKI kernels, through 0.12.1.
 - **`bsr_spmm` dropped the imaginary part of complex operands on the NKI
   backend** (silent, #78). The static-structure kernel path cast complex
   blocks and `B` to fp32 and the result back to complex, so the imaginary
