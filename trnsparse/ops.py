@@ -357,6 +357,8 @@ def screened_spmm(
     diag_integrals: torch.Tensor,
     B: torch.Tensor,
     threshold: float,
+    *,
+    symmetric: bool = False,
 ) -> torch.Tensor:
     """Fused Schwarz-screened dense matmul: `C = (A * mask) @ B`.
 
@@ -365,12 +367,17 @@ def screened_spmm(
         Q[i]      = sqrt(|diag_integrals[i]|)
         mask[i,j] = (Q[i] * Q[j] > sqrt(threshold))
 
-    On the NKI backend, the sqrt / outer-product / threshold / mask-apply
-    / matmul chain is fused into a single `@nki.jit` kernel — one
-    dispatch, no intermediate mask tensor on HBM, no separate BSR
-    construction pass. Saves ~30-50% end-to-end vs the unfused
-    `density_screen → screen_quartets → from_dense → spmm` flow at
-    realistic Fock-build sizes.
+    On the NKI backend (native TorchNeuron path), the screen skips work:
+    the host classifies each 128 x 128 tile of `A` from the bounds alone
+    (skipped when every pair bound in it is <= sqrt(threshold), full when
+    none is, else partial), and one kernel loads, transposes and multiplies
+    only the kept tiles, applying the element mask to the partial ones on
+    chip. `A` stays dense; nothing is gathered. The classification is a
+    compile-time key (one compile per distinct pattern, cached by the
+    bound tensor while it is reused), so the cost scales with the kept
+    tiles. `TRNSPARSE_SCREEN_SKIP_TILES=0` restores the all-tiles fused
+    kernel (#19). See docs/benchmarks.md for the crossover against dense
+    aten on Trn2 (#61).
 
     On the PyTorch backend, falls back to the explicit mask materialize
     + matmul (semantic spec for the NKI kernel to match).
@@ -386,6 +393,11 @@ def screened_spmm(
         threshold: Screening threshold. Pairs with
             `Q[i] * Q[j] <= sqrt(threshold)` are zeroed in `A` before
             the matmul.
+        symmetric: Promise that `A == A.T` (true of the pair-index ERI
+            matrix `(μν|λσ)`). The kernel then reads tile `(k, m)` of `A`
+            for tile `(m, k)` of `A.T` and skips the Tensor Engine
+            transposes. The result for a non-symmetric `A` is wrong;
+            no check is made. Ignored off the NKI path.
 
     Returns:
         `C`, shape `(M, N)` = `(A * mask) @ B`.
@@ -399,7 +411,7 @@ def screened_spmm(
     if _use_nki():
         from .nki.dispatch import nki_screened_spmm
 
-        return nki_screened_spmm(A, diag_integrals, B, threshold)
+        return nki_screened_spmm(A, diag_integrals, B, threshold, symmetric)
     return _screened_spmm_pytorch(A, diag_integrals, B, threshold)
 
 

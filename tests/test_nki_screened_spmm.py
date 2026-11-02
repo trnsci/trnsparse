@@ -95,3 +95,69 @@ class TestNkiScreenedSpmmDifferentiability:
         # eps=1e-6 would measure fp32 roundoff, not the gradient. The op is
         # linear in each input, so a large eps has no truncation error.
         assert torch.autograd.gradcheck(func, (A, B), eps=1e-2, atol=1e-2, rtol=1e-2)
+
+
+def _decaying_case(n, N, kept, dtype, seed=0):
+    """Sorted, decaying Schwarz bounds with |A_ij| <= Q_i Q_j (block-screened integrals)."""
+    g = torch.Generator().manual_seed(seed)
+    Q = torch.exp(-8.0 * torch.sort(torch.rand(n, generator=g)).values)
+    A = (2 * torch.rand(n, n, generator=g) - 1) * torch.outer(Q, Q)
+    B = torch.randn(n, N, generator=g)
+    tau = float(torch.quantile(torch.outer(Q, Q).flatten()[:: max(1, n * n // 100000)], 1 - kept))
+    return A.to(dtype), Q * Q, B.to(dtype), Q, tau
+
+
+class TestNkiScreenedTileSkip:
+    """Tile-skipping path (#61) against fp64 references at awkward sizes."""
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    @pytest.mark.parametrize(
+        "n,N,kept",
+        [(200, 1, 0.5), (300, 77, 0.3), (1000, 600, 0.1), (1500, 128, 0.6), (2100, 513, 0.05)],
+    )
+    def test_matches_fp64(self, nki_backend, n, N, kept, dtype):
+        from trnsparse.nki.dispatch import screened_tile_structure
+
+        A, diag, B, Q, tau = _decaying_case(n, N, kept, dtype)
+        _, cols, _, frac = screened_tile_structure(Q, tau, n)
+        assert 0 < frac < 1  # some tiles skipped, some kept
+        got = trnsparse.screened_spmm(A.to("neuron"), diag, B.to("neuron"), tau * tau).cpu()
+        mask = torch.outer(Q, Q) > tau
+        A64, B64 = A.double(), B.double()
+        ref = (A64 * mask) @ B64
+        tol = 2e-6 if dtype == torch.float32 else 2e-2
+        assert float((got.double() - ref).abs().max() / ref.abs().max()) < tol
+        # Screening error against the unscreened fp64 product stays within
+        # the Schwarz bound tau * sqrt(#dropped) * ||B||_F (plus rounding).
+        dropped = int((~mask).sum())
+        err = float((got.double() - A64 @ B64).norm())
+        bound = tau * math.sqrt(dropped) * float(B64.norm())
+        assert err <= bound + tol * float(ref.norm())
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    @pytest.mark.parametrize("n,N,kept", [(300, 77, 0.3), (2100, 513, 0.2)])
+    def test_symmetric(self, nki_backend, n, N, kept, dtype):
+        A, diag, B, Q, tau = _decaying_case(n, N, kept, torch.float32)
+        A, B = ((A + A.T) / 2).to(dtype), B.to(dtype)
+        got = trnsparse.screened_spmm(
+            A.to("neuron"), diag, B.to("neuron"), tau * tau, symmetric=True
+        ).cpu()
+        mask = torch.outer(Q, Q) > tau
+        ref = (A.double() * mask) @ B.double()
+        tol = 2e-6 if dtype == torch.float32 else 2e-2
+        assert float((got.double() - ref).abs().max() / ref.abs().max()) < tol
+
+    def test_autograd(self, nki_backend):
+        A, diag, B, Q, tau = _decaying_case(300, 64, 0.3, torch.float32)
+        a = A.to("neuron").requires_grad_()
+        b = B.to("neuron").requires_grad_()
+        trnsparse.screened_spmm(a, diag, b, tau * tau).sum().backward()
+        m = (torch.outer(Q, Q) > tau).float()
+        g = torch.ones(300, 64)
+        torch.testing.assert_close(a.grad.cpu(), (g @ B.T) * m, atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(b.grad.cpu(), (A * m).T @ g, atol=1e-4, rtol=1e-4)
+
+    def test_everything_screened(self, nki_backend):
+        A, diag, B, Q, tau = _decaying_case(256, 64, 0.5, torch.float32)
+        got = trnsparse.screened_spmm(A.to("neuron"), diag, B.to("neuron"), 1e6).cpu()
+        assert torch.count_nonzero(got) == 0

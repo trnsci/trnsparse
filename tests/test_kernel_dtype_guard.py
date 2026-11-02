@@ -44,6 +44,7 @@ KERNEL_TAKES = {
     "spmm_dense": (MM16, MM16),
     "bsr_spmm": (MM16, MM16),
     "screened_spmm": (MM16,) * 4,
+    "screened_tiles_keyed": (MM, F32, F32, F32, MM),
     "bsr_spmm_static": (MM, MM),
     "bsr_spmm_static_t": (MM, MM),
     "bsr_spmm_keyed": (MM, MM),

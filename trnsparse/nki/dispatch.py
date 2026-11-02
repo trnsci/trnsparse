@@ -170,6 +170,7 @@ _KERNEL_OPERAND_DTYPES: dict[str, tuple[frozenset, ...]] = {
     "spmm_dense": (_MM16, _MM16),
     "bsr_spmm": (_MM16, _MM16),
     "screened_spmm": (_MM16, _MM16, _MM16, _MM16),
+    "screened_tiles_keyed": (_MM, _F32, _F32, _F32, _MM),  # A, Q col / row, tau, B
     "bsr_spmm_static": (_MM, _MM),
     "bsr_spmm_static_t": (_MM, _MM),
     "bsr_spmm_keyed": (_MM, _MM),
@@ -1045,6 +1046,130 @@ def _nki_screened_spmm_impl(
         return (A * mask.to(A.dtype)) @ B
 
 
+# Screened SpMM with tile skipping (#61, native path). Off restores the
+# all-tiles fused kernel.
+_SCREEN_SKIP_TILES = os.environ.get("TRNSPARSE_SCREEN_SKIP_TILES", "1").lower() not in (
+    "0",
+    "false",
+    "no",
+)
+
+
+def screened_tile_structure(Q: torch.Tensor, threshold_sqrt: float, n: int | None = None):
+    """Classify the 128 x 128 tiles of a Schwarz-screened square matrix.
+
+    `Q` is the bound vector (`sqrt(|diag|)`), `mask[i, j] = Q[i] Q[j] > tau`
+    with `tau = threshold_sqrt`, in fp32 as the kernel computes it. Tile
+    (m, k) is skipped when its largest pair bound `max(Q_m) max(Q_k)` is
+    <= tau, full when its smallest `min(Q_m) min(Q_k)` (over the real
+    indices; padding is zero in A) is > tau, else partial. Q >= 0 and fp32
+    rounding is monotone, so the classification is exact: a skipped tile
+    has every element masked and a full tile none.
+
+    Returns `(row_ptrs, cols, partial)` as int lists, BSR-style over the
+    kept tiles, and the kept-tile fraction.
+    """
+    q = Q.detach().to(device="cpu", dtype=torch.float32).abs().reshape(-1)
+    n = q.numel() if n is None else n
+    T = _TILE_M
+    nt = (n + T - 1) // T
+    q_pad = torch.zeros(nt * T, dtype=torch.float32)
+    q_pad[:n] = q[:n]
+    big = torch.full((nt * T,), float("inf"), dtype=torch.float32)
+    big[:n] = q[:n]
+    qmax = q_pad.reshape(nt, T).amax(dim=1)
+    qmin = big.reshape(nt, T).amin(dim=1)
+    tau = torch.tensor(threshold_sqrt, dtype=torch.float32)
+    keep = (qmax[:, None] * qmax[None, :]) > tau
+    full = (qmin[:, None] * qmin[None, :]) > tau
+    counts = keep.sum(dim=1)
+    row_ptrs = [0] + torch.cumsum(counts, 0).tolist()
+    mi, kj = keep.nonzero(as_tuple=True)
+    cols = kj.tolist()
+    partial = (~full[mi, kj]).to(torch.int64).tolist()
+    frac = float(keep.sum()) / float(nt * nt) if nt else 0.0
+    return row_ptrs, cols, partial, frac
+
+
+# Screening plans by bound vector (#61): the tile classification, its key
+# and the device copies of Q / tau, reused while the same `diag_integrals`
+# tensor (same object, unmodified) comes back with the same threshold.
+# Each entry holds a reference to its tensor, so the id cannot be reused.
+_SCREEN_PLANS: dict = {}
+_SCREEN_PLANS_MAX = 16
+
+
+def _screen_plan(diag_integrals: torch.Tensor, threshold: float, M: int, dev, symmetric=False):
+    """(key, n_kept, q_col, q_row, thr) for a square screened product."""
+    import math as _math
+
+    ck = (id(diag_integrals), float(threshold), int(M), str(dev), bool(symmetric))
+    hit = _SCREEN_PLANS.get(ck)
+    if hit is not None and hit[0] is diag_integrals and hit[1] == diag_integrals._version:
+        return hit[2]
+    tau = _math.sqrt(threshold)
+    Q = torch.sqrt(torch.abs(diag_integrals.detach().to(device="cpu", dtype=torch.float32)))
+    row_ptrs, cols, partial, _ = screened_tile_structure(Q, tau, M)
+    M_pad = _round_up(M, _TILE_M)
+    q_h = torch.zeros(M_pad, dtype=torch.float32)
+    q_h[:M] = Q.reshape(-1)[:M]
+    plan = (
+        _kernels.register_structure(row_ptrs, cols, partial, (int(bool(symmetric)),))
+        if cols
+        else None,
+        len(cols),
+        q_h.reshape(M_pad, 1).to(dev),
+        q_h.reshape(1, M_pad).to(dev),
+        torch.full((_TILE_M, 1), tau, dtype=torch.float32).to(dev),
+    )
+    if len(_SCREEN_PLANS) >= _SCREEN_PLANS_MAX:
+        _SCREEN_PLANS.pop(next(iter(_SCREEN_PLANS)))
+    _SCREEN_PLANS[ck] = (diag_integrals, diag_integrals._version, plan)
+    return plan
+
+
+def _nki_screened_tiles(
+    A: torch.Tensor, diag_integrals: torch.Tensor, threshold: float, B, symmetric: bool = False
+):
+    """Screened SpMM through `trnsparse::screened_tiles_keyed` (native path).
+
+    A, B stay dense; only the tile classification of the bounds is a
+    compile-time key (`screened_tile_structure`). Returns None when the
+    structure is too large to unroll, or when nothing survives the screen
+    and A or B needs a gradient (the caller then takes the all-tiles kernel).
+    """
+    M, _ = A.shape
+    _, N = B.shape
+    orig = B.device
+    dev = _kernel_device(B, A)
+    key, n_kept, q_col, q_row, thr = _screen_plan(diag_integrals, threshold, M, dev, symmetric)
+    n_nt = 1 if N <= _TILE_N else _round_up(N, _TILE_N) // _TILE_N
+    if not _static_structure_ok(n_kept * n_nt):
+        return None
+    out_dtype = torch.promote_types(A.dtype, B.dtype)
+    if not n_kept:
+        if A.requires_grad or B.requires_grad:
+            return None
+        return torch.zeros(M, N, dtype=out_dtype, device=orig)
+    kdt = _kernel_dtype(A, B)
+    M_pad = _round_up(M, _TILE_M)
+    N_pad = N if N <= _TILE_N else _round_up(N, _TILE_N)
+    if M_pad != M:
+        a_dev = torch.zeros(M_pad, M_pad, dtype=kdt, device=dev)
+        a_dev[:M, :M] = A.to(device=dev, dtype=kdt)
+    else:
+        a_dev = A.contiguous().to(device=dev, dtype=kdt)
+    if M_pad != M or N_pad != N:
+        b_dev = torch.zeros(M_pad, N_pad, dtype=kdt, device=dev)
+        b_dev[:M, :N] = B.to(device=dev, dtype=kdt)
+    else:
+        b_dev = B.contiguous().to(device=dev, dtype=kdt)
+    out = _get_native_ops()["screened_tiles_keyed"](a_dev, q_col, q_row, thr, b_dev, key)
+    if M_pad != M or N_pad != N:
+        out = out[:M, :N]
+    return out.to(device=orig, dtype=out_dtype)
+
+
 class _ScreenedSpMMFunction(torch.autograd.Function):
     """Autograd wrapper for fused screened SpMM.
 
@@ -1090,6 +1215,7 @@ def nki_screened_spmm(
     diag_integrals: torch.Tensor,
     B: torch.Tensor,
     threshold: float,
+    symmetric: bool = False,
 ) -> torch.Tensor:
     """Screened SpMM entry point — wraps `_ScreenedSpMMFunction.apply` for autograd.
 
@@ -1102,9 +1228,25 @@ def nki_screened_spmm(
         from ..ops import _screened_spmm_pytorch
 
         return _screened_spmm_pytorch(A, diag_integrals, B, threshold)
+    if B.dim() == 1:  # matrix-vector: one right-hand side
+        return nki_screened_spmm(A, diag_integrals, B[:, None], threshold, symmetric)[:, 0]
     if _native_path():
         import math as _math
 
+        if (
+            _SCREEN_SKIP_TILES
+            and A.dim() == 2
+            and A.shape[0] == A.shape[1]
+            and B.dim() == 2
+            and diag_integrals.dim() == 1
+            and diag_integrals.shape[0] == A.shape[0]
+            # The bounds are compared in fp32 on chip; a bf16 / fp16 bound
+            # vector's mask (compared in its own dtype) takes the fused kernel.
+            and diag_integrals.dtype in (torch.float32, torch.float64)
+        ):
+            out = _nki_screened_tiles(A, diag_integrals, threshold, B, symmetric)
+            if out is not None:
+                return out
         A = A.to(B.device)
         Q = torch.sqrt(torch.abs(diag_integrals.to(B.device)))
         return _nki_screened_spmm_impl(A, Q, _math.sqrt(threshold), B)

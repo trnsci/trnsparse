@@ -7,20 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
-
-- **Guard against the NKI trace-cache closure bug ([aws-neuron/aws-neuron-sdk#1454](https://github.com/aws-neuron/aws-neuron-sdk/issues/1454),
-  trnsci/trnsci#35).** `tests/test_trace_cache_safety.py` (CPU) finds every
-  `@nki.jit` kernel and fails if its body, or a helper it calls, reads a
-  closure variable or a module global that is not a constant expression
-  (reviewed exceptions are allow-listed with a reason), and checks each
-  kernel's `__closure__` at runtime against a stub `nki`.
-- Tests: `conftest.py` no longer turns the NKI trace cache off. Neuron tests
-  run with it on, as under `import torch_neuronx`, with a fresh
-  `NKI_TRACE_CACHE_URL` directory per session (no stale editable-install
-  traces). `NKI_ENABLE_TRACE_CACHE=0` still turns it off.
-- README: known platform issue note for #1454.
-
 ### Fixed
 
 - **No NKI kernel is reached with an operand dtype it does not take** (one
@@ -41,7 +27,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`_KERNEL_OPERAND_DTYPES`: the native op table, `_run` on the XLA path and
   the simulator) and raises `TypeError` naming the op and dtypes, so a future
   wrapper without the entry check cannot hand a kernel an unsupported dtype.
-  Affects every release with NKI kernels, through 0.12.1.
+  Affects every release with NKI kernels, through 0.13.0.
+
+## [0.13.0] — 2026-11-02
+
+Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
+
+Headline: **correctness fixes — upgrade recommended.** `COOMatrix.to_dense` dropped duplicate entries (#56); `from_scipy` dropped the imaginary part (#58); attention second derivatives were wrong (#65); `spmv`/`spmm` accepted a broadcasting y/C (#67); `chebyshev_coeffs` was not the Chebyshev polynomial for K ≥ 2 (#73); `bsr_diagonal` padded tall matrices (#74); on device, complex `bsr_spmm` dropped the imaginary part (#78), integer `spmv`/`spmm` returned float32 (#79), and an undersized attention mask was accepted (#82). New: bf16 and head_dim > 128 gather attention (#49), and Schwarz-screened tile skipping that beats dense aten for large screened products (#89).
+
+### Added
+
+- **`screened_spmm` skips screened-out tiles (#61).** On the native
+  TorchNeuron path the host classifies each 128 x 128 tile of `A` from the
+  Schwarz bounds alone (skip / full / partial, exact in fp32) and one keyed
+  kernel loads, transposes and multiplies only the kept tiles; partial
+  tiles get the element mask on chip. `A` stays dense on the device and
+  nothing is gathered. The plan (classification, key, device bounds) is
+  cached while the same bound tensor is reused. New keyword
+  `symmetric=True` (for `A == A.T`, as for the pair-index ERI matrix) skips
+  the Tensor Engine transposes. On Trn2 (LNC=2) at n = 8192, N = 512 it is
+  faster than dense aten `A @ B` up to 80% of tiles kept in fp32 (5.9x at
+  5%) and up to ~65% in bf16; at n = 4096 up to ~75% (fp32) / not in bf16;
+  at n <= 2048 the ~0.25 ms launch floor loses to aten. It beats
+  `(A * mask) @ B` and the previous fused kernel at every density for
+  n >= 4096. Results are in
+  docs/benchmarks.md. `TRNSPARSE_SCREEN_SKIP_TILES=0` restores the
+  all-tiles fused kernel. `trnsparse.nki.dispatch.screened_tile_structure`
+  exposes the classification.
+
+- **Guard against the NKI trace-cache closure bug ([aws-neuron/aws-neuron-sdk#1454](https://github.com/aws-neuron/aws-neuron-sdk/issues/1454),
+  trnsci/trnsci#35).** `tests/test_trace_cache_safety.py` (CPU) finds every
+  `@nki.jit` kernel and fails if its body, or a helper it calls, reads a
+  closure variable or a module global that is not a constant expression
+  (reviewed exceptions are allow-listed with a reason), and checks each
+  kernel's `__closure__` at runtime against a stub `nki`.
+- Tests: `conftest.py` no longer turns the NKI trace cache off. Neuron tests
+  run with it on, as under `import torch_neuronx`, with a fresh
+  `NKI_TRACE_CACHE_URL` directory per session (no stale editable-install
+  traces). `NKI_ENABLE_TRACE_CACHE=0` still turns it off.
+- README: known platform issue note for #1454.
+
+### Fixed
+
+- `screened_spmm` with a 1-D `B` on the NKI backend raised `ValueError`
+  (pre-existing on main; found by the conformance suite on Trn2 during #61).
+
 - **`bsr_spmm` dropped the imaginary part of complex operands on the NKI
   backend** (silent, #78). The static-structure kernel path cast complex
   blocks and `B` to fp32 and the result back to complex, so the imaginary
