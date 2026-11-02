@@ -337,6 +337,17 @@ def test_tiled_attention_rejects_partial_block():
         trnsparse.block_sparse_attention_tiled(Q, K, V, mask)
 
 
+@pytest.mark.parametrize("mask_n, kv_n", [(256, 384), (512, 384), (384, 256)])
+def test_tiled_attention_rejects_mismatched_mask(mask_n, kv_n):
+    # A (256, 256) mask with seq_len 384 was accepted on the native NKI path,
+    # leaving rows 256..383 unmasked garbage (#82); PyTorch raised IndexError.
+    Q = torch.randn(384, 16)
+    K, V = torch.randn(kv_n, 16), torch.randn(384, 16)
+    mask = trnsparse.BSRMatrix.from_dense(torch.ones(mask_n, mask_n), block_size=128)
+    with pytest.raises(ValueError, match="must be"):
+        trnsparse.block_sparse_attention_tiled(Q, K, V, mask)
+
+
 def _small_mask_bsr(n_tiles, b, pattern):
     rp = [0] * (n_tiles + 1)
     for r, _ in pattern:

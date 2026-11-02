@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `NKI_TRACE_CACHE_URL` directory per session (no stale editable-install
   traces). `NKI_ENABLE_TRACE_CACHE=0` still turns it off.
 - README: known platform issue note for #1454.
+
 ### Fixed
 
 - **No NKI kernel is reached with an operand dtype it does not take** (one
@@ -54,6 +55,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   promotes, so int32/int64 products on a `neuron` operand came back float32.
   Affects every release with the device dense CSR path, through 0.12.1. A
   scale of 1 is now skipped. Found by the conformance suite on Trn2
+- **`block_sparse_attention_tiled` accepted a mask smaller than `seq_len` on
+  the NKI path** (silent, #82). With a `(256, 256)` mask and `seq_len = 384`,
+  the native `bsr_attn` op returned output rows 256..383 that no mask block
+  covers (garbage values, no error). The PyTorch path raised an opaque
+  `IndexError`. Every backend now raises `ValueError` unless
+  `mask_bsr.shape == (Q rows, K rows)` and K and V have the same length.
+  Affects 0.10.0 through 0.12.1. Found by the round-3 device harness on Trn2
   (trnsci/trnsci#35).
 - **`bsr_diagonal` returned length m for a tall matrix** (silent; every
   release 0.3.2–0.12.1, every backend). For a rectangular (m, n) BSR matrix
@@ -74,14 +82,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   worst-case residual after K steps was up to ~3x the Chebyshev bound
   (K = 7). The coefficients now follow Saad's three-term recurrence
   (Alg. 12.1) and the residual is T_K((d - lam)/c) / T_K(d/c) (#73).
-### Fixed
 
 - **`from_scipy` discarded the imaginary part of complex matrices** (silent;
   every release 0.1.1–0.12.1). Values were always cast to float32, so a
   complex scipy matrix became its real part (one C++ `UserWarning`, no
   error). Complex input now gives `complex64` values; real input is
   unchanged (float32) (#58).
-### Fixed
 
 - **Second derivatives of `block_sparse_attention_tiled` were wrong**
   (silent; 0.6.0–0.12.1, the releases with attention autograd, on the
@@ -91,7 +97,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   vector products) dropped their dependence on Q and K, with no error.
   Double backward now differentiates a graph-carrying recomputation; first-
   order gradients are unchanged (#65).
-### Fixed
 
 - **`spmv` / `spmm` accepted a `y` / `C` that enlarged the output** (silent;
   every release 0.1.1–0.12.1, all backends). `beta * y` was added with plain
@@ -100,7 +105,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ValueError`; every `y` / `C` that broadcasts to the product's shape works
   as before (#67).
 
-### Fixed
 
 - **bf16 Q / K / V raised on the gather attention kernels** (loud; #49).
   Affects released versions **0.4.4 through 0.12.1** with `backend="nki"`
