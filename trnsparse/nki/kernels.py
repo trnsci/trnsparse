@@ -2797,9 +2797,12 @@ if HAS_NKI:
                     ]
                     for _, rr in rg
                 ]
+                # The body's Y coordinates in one DMA: (d + 2, sum(sizes)).
+                y_all = nl.load(yt[:, nl.ds(j0, sum(sizes))])
                 j = j0
                 for k, jr in enumerate(sizes):
-                    yb = nl.load(yt[:, nl.ds(j, jr)])  # (d + 2, jr): stationary
+                    off = sum(sizes[:k])
+                    yb = y_all[:, off : off + jr]  # (d + 2, jr): stationary
                     # Full-size allocation, sliced: one PSUM shape for every
                     # tile lets the allocator reuse banks across bodies.
                     d_full = nl.ndarray((_TILE_M, NI), dtype=nl.float32, buffer=nl.psum)

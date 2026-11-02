@@ -74,6 +74,9 @@ def main():
     ap.add_argument("--kernel", default="rbf")
     ap.add_argument("--d", type=int, default=3)
     ap.add_argument("--cpu-rows", type=int, default=2048)
+    ap.add_argument(
+        "--aten-max", type=int, default=262144, help="largest n for the aten mode (it is slow)"
+    )
     ap.add_argument("--reps", type=int, default=3)
     ap.add_argument("--json", default=None)
     ap.add_argument("--compare", nargs=2, metavar=("A", "B"))
@@ -102,6 +105,8 @@ def main():
         for R in rhs:
             V = torch.randn(n, R, generator=g)
             for mode in modes:
+                if mode == "aten" and n > args.aten_max:
+                    continue
                 rec = {"n": n, "R": R, "mode": mode, "kernel": args.kernel, "d": args.d}
                 if mode == "nki":
                     trnsparse.set_backend("nki")
