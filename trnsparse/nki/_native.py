@@ -195,7 +195,11 @@ def attn_bwd_static(
 def _fake_attn_stats(q_scaled_blocks, k_gathered_pad):
     M_tiles, K_max = k_gathered_pad.shape[:2]
     shape = (M_tiles, K_max, _P, 1)
-    return q_scaled_blocks.new_empty(shape), q_scaled_blocks.new_empty(shape)
+    # The statistics are fp32 for fp32 and bf16 Q (#49).
+    return (
+        q_scaled_blocks.new_empty(shape, dtype=torch.float32),
+        q_scaled_blocks.new_empty(shape, dtype=torch.float32),
+    )
 
 
 @nki_op("trnsparse::attn_stats", mutates_args={}, fake_fn=_fake_attn_stats)
