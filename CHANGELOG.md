@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **float64 under `auto` now computes in torch at float64 accuracy
+  (previously cast to fp32 on the NKI path)** — the trnsci suite fp64
+  policy (#84). Trainium computes float64 at fp32 precision, so no kernel
+  can give a float64-accurate result. For `spmm`, `bsr_spmm`,
+  `screened_spmm`, `block_sparse_attention_tiled` (forward and backward),
+  `cg_bsr` (through `bsr_spmm`), `cg_bsr_fused` and
+  `power_iteration_bsr_fused`, a float64 value operand (and complex128 in
+  `bsr_spmm`, whose complex path runs as real kernel launches):
+  - under `set_backend("auto")` (the default) takes the PyTorch path that
+    `set_backend("pytorch")` takes, at float64 accuracy, and no kernel runs
+    (the fused solvers take their host path);
+  - under an explicit `set_backend("nki")` is cast to fp32 (complex64) for
+    the kernel as before, now with a one-time `UserWarning` per op saying
+    precision is reduced to fp32;
+  - under `TRNSPARSE_REQUIRE_NKI=1` raises `NotImplementedError` (on either
+    backend; this takes precedence over the explicit-nki cast).
+
+  The result dtype always equals the pytorch backend's for the same inputs,
+  including bf16 / fp16 and mixed-dtype promotion; a kernel result computed
+  in fp32 is cast to that dtype. Callers of 0.2.0 through 0.13.0 who
+  relied on float64 inputs running on the kernels under `auto` now get
+  torch (more precise; on the host or device aten instead of the kernel):
+  pass float32 operands, or select `set_backend("nki")`, to keep the
+  kernel. float64 validation runs under REQUIRE_NKI must pass fp32 operands
+  (or call the autograd Functions directly, as the hardware gradchecks do).
+  Lands in 0.14.0. `screened_spmm` decides on `A` and `B`; a float64 bound
+  vector `diag_integrals` alone does not change the route. See
+  docs/architecture.md, "Precision and dtypes".
+
 ### Fixed
 
 - **No NKI kernel is reached with an operand dtype it does not take** (one
@@ -20,9 +51,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `spmm` / `screened_spmm` reached the kernel unchanged, the static attention
   kernels cast complex Q/K/V to fp32 (imaginary part dropped), the static
   `bsr_spmm` and attention kernels cast integers to fp32 and back, and
-  REQUIRE_NKI failed with whatever error the kernel raised. float64 keeps its
-  documented route (cast to fp32 for the kernel, result back in float64;
-  #84 asks whether to change that); fp32, bf16 and fp16 are unchanged. Every
+  REQUIRE_NKI failed with whatever error the kernel raised. float64 follows
+  the fp64 policy below (#84); fp32, bf16 and fp16 are unchanged. Every
   launch now also checks a per-kernel, per-operand dtype table itself
   (`_KERNEL_OPERAND_DTYPES`: the native op table, `_run` on the XLA path and
   the simulator) and raises `TypeError` naming the op and dtypes, so a future

@@ -888,7 +888,17 @@ class TestNativePathOnCpu:
         dense[:128, 128:] = 0
         A = trnsparse.BSRMatrix.from_dense(dense, block_size=P)
         B = rnd(384, 5, dtype=b_dtype)
-        C = trnsparse.bsr_spmm(A, B)
+        if torch.complex128 in (a_dtype, b_dtype):
+            # The fp64 policy (#84): complex128 raises under REQUIRE_NKI, and
+            # the explicit nki backend casts to complex64 with a warning.
+            with pytest.raises(NotImplementedError, match="complex128"):
+                trnsparse.bsr_spmm(A, B)
+            monkeypatch.setattr(dispatch, "_REQUIRE_NKI", False)
+            monkeypatch.setattr(dispatch, "_fp64_warned", set())
+            with pytest.warns(UserWarning, match="reduced to fp32"):
+                C = trnsparse.bsr_spmm(A, B)
+        else:
+            C = trnsparse.bsr_spmm(A, B)
         want = dense.to(torch.complex128) @ B.to(torch.complex128)
         assert C.dtype == torch.promote_types(a_dtype, b_dtype)
         err = (C.to(torch.complex128) - want).abs().max() / want.abs().max()

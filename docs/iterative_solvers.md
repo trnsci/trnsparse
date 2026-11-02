@@ -173,7 +173,11 @@ replaces fp32; bf16 is at best an inner solver or a preconditioner. See `benchma
 
 The kernel is fp32 (PSUM accumulates in fp32). The host path (no
 `neuron` device, or `set_backend("pytorch")`) runs the same masked
-algorithm in PyTorch in b's dtype, so fp64 stays fp64.
+algorithm in PyTorch in b's dtype, so fp64 stays fp64. A float64 A, b
+or x0 takes that host path under the default `auto` backend too; an
+explicit `set_backend("nki")` runs the fp32 kernel with a one-time
+`UserWarning`, and `TRNSPARSE_REQUIRE_NKI=1` raises `NotImplementedError`
+(see Architecture, "Precision and dtypes").
 
 ### Chronopoulos–Gear recurrence (`recurrence=`, opt-in)
 

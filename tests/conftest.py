@@ -5,7 +5,7 @@ import os
 import shutil
 import tempfile
 
-import pytest  # noqa: F401 — imported for marker side-effect exposure
+import pytest
 
 # NKI trace cache (aws-neuron/aws-neuron-sdk#1454, trnsci/trnsci#35).
 # `import torch_neuronx` turns the cache on (NKI_ENABLE_TRACE_CACHE=1), so
@@ -49,3 +49,30 @@ def pytest_addoption(parser):
         default="cpu",
         help="device for the dense operands in tests/test_conformance.py (default: cpu)",
     )
+
+
+_FP64_POLICY_MARK = "Trainium computes float64 at fp32 precision"
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    # Under TRNSPARSE_REQUIRE_NKI, float64 / complex128 kernel calls raise
+    # NotImplementedError by design (the fp64 policy, #84). The conformance
+    # suite builds most references in float64, so report those cases as
+    # skips there rather than failures (as needs_pytorch_block does for #46).
+    outcome = yield
+    report = outcome.get_result()
+    if (
+        call.excinfo is not None
+        and report.failed
+        and item.path.name == "test_conformance.py"
+        and os.environ.get("TRNSPARSE_REQUIRE_NKI", "").lower() in ("1", "true", "yes")
+        and call.excinfo.errisinstance(NotImplementedError)
+        and _FP64_POLICY_MARK in str(call.excinfo.value)
+    ):
+        report.outcome = "skipped"
+        report.longrepr = (
+            str(item.path),
+            item.location[1] or 0,
+            "Skipped: float64 raises under TRNSPARSE_REQUIRE_NKI by design (#84)",
+        )

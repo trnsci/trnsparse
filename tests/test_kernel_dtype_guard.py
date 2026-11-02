@@ -13,6 +13,12 @@ gather kernels) and the XLA path, with backend "nki" and "auto", with and
 without TRNSPARSE_REQUIRE_NKI. The result dtype must match the pytorch
 backend's for the same inputs.
 
+float64 (and complex128 in `bsr_spmm`, whose complex path is real kernel
+launches) follows the suite fp64 policy (#84): under `auto` it computes in
+torch at float64 accuracy and reaches no kernel; under an explicit `nki`
+it is cast to fp32 for the kernel with one `UserWarning` per op; under
+TRNSPARSE_REQUIRE_NKI it raises `NotImplementedError`.
+
 Stub violations are recorded rather than raised, because the host wrappers
 fall back to PyTorch on a kernel exception when REQUIRE_NKI is off.
 """
@@ -21,6 +27,7 @@ import inspect
 import re
 import sys
 import types
+import warnings
 
 import pytest
 import torch
@@ -300,9 +307,26 @@ def _outcome(fn):
         return None, e
 
 
+# The fp64 policy (#84): the dtypes it covers per API. complex128 only where
+# a complex kernel path exists (bsr_spmm, and cg_bsr through it); elsewhere
+# complex has no kernel at all (NO_KERNEL). The fused solvers decide on
+# float64 only (complex is #85).
+FP64_APIS = {api: {torch.float64} for api in APIS}
+FP64_APIS["bsr_spmm"] = FP64_APIS["cg_bsr"] = {torch.float64, torch.complex128}
+FUSED = {"cg_bsr_fused", "power_fused"}
+
+
+def _fp64_policy(api, dtype, path):
+    """True when the fp64 policy decides this call (it would reach a kernel otherwise)."""
+    if dtype not in FP64_APIS[api]:
+        return False
+    # The fused kernels run on the native path only (the XLA path is the host).
+    return not (api in FUSED and path == "xla")
+
+
 @pytest.mark.parametrize("dtype", DTYPES, ids=str)
 @pytest.mark.parametrize("api", APIS)
-def test_no_unsupported_dtype_reaches_a_kernel(stubs, monkeypatch, api, dtype, require):
+def test_no_unsupported_dtype_reaches_a_kernel(stubs, monkeypatch, api, dtype, require, path):
     if api == "attention_grad" and not dtype.is_floating_point:
         pytest.skip("gradients need a float dtype")
     try:
@@ -314,12 +338,14 @@ def test_no_unsupported_dtype_reaches_a_kernel(stubs, monkeypatch, api, dtype, r
         m.setattr(dispatch, "_backend", "pytorch")
         ref, ref_err = _outcome(fn)
 
-    got, err = _outcome(fn)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)  # the explicit-nki fp64 warning
+        got, err = _outcome(fn)
     assert not stubs.violations, stubs.violations
     routed = api in ROUTED_APIS and dtype in NO_KERNEL
     if api == "bsr_spmm" and dtype.is_complex and hasattr(dispatch, "_nki_bsr_spmm_complex"):
         routed = False  # #80: complex BSR SpMM as real kernel launches
-    if require and routed:
+    if require and (routed or _fp64_policy(api, dtype, path)):
         assert isinstance(err, NotImplementedError), (err, got)
         return
     if ref_err is not None:
@@ -385,3 +411,159 @@ def test_every_reachable_kernel_is_exercised(monkeypatch):
             seen |= {name for name, _ in log.calls}
             assert not log.violations
     assert seen == set(KERNEL_TAKES) - UNREACHED, seen ^ (set(KERNEL_TAKES) - UNREACHED)
+
+
+# ── The fp64 policy (#84) ────────────────────────────────────────────────────
+
+FP64_CASES = [
+    (api, dtype)
+    for api in APIS
+    for dtype in (torch.float64, torch.complex128)
+    if dtype in FP64_APIS[api]
+]
+FP64_IDS = [f"{a}-{d}" for a, d in FP64_CASES]
+
+
+def _fp64_case(api, dtype, path):
+    if not _fp64_policy(api, dtype, path):
+        pytest.skip("the fused kernels do not run on the XLA path")
+    return _case(api, dtype)
+
+
+def _seeded(fn):
+    torch.manual_seed(0)  # power iteration starts from a random vector
+    return fn()
+
+
+def _pytorch_ref(monkeypatch, fn):
+    with monkeypatch.context() as m:
+        m.setattr(dispatch, "_backend", "pytorch")
+        return _outcome(lambda: _seeded(fn))
+
+
+def _policy_warnings(caught):
+    return [
+        w for w in caught if issubclass(w.category, UserWarning) and "reduced" in str(w.message)
+    ]
+
+
+@pytest.mark.parametrize("api,dtype", FP64_CASES, ids=FP64_IDS)
+def test_fp64_auto_computes_in_torch_at_fp64_accuracy(monkeypatch, path, api, dtype):
+    log = _install_stubs(monkeypatch, path, "auto", False)
+    fn = _fp64_case(api, dtype, path)
+    ref, ref_err = _pytorch_ref(monkeypatch, fn)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        got, err = _outcome(lambda: _seeded(fn))
+    assert log.calls == [], log.calls  # no kernel launch
+    assert not _policy_warnings(caught)
+    if ref_err is not None:  # the pytorch backend refuses (mixed dtypes): so does auto
+        assert type(err) is type(ref_err), (err, ref_err)
+        return
+    assert err is None, err
+    assert got.dtype == ref.dtype
+    # The same torch code as the pytorch backend: float64 accuracy.
+    torch.testing.assert_close(got, ref, rtol=1e-12, atol=1e-12)
+
+
+@pytest.mark.parametrize("api,dtype", FP64_CASES, ids=FP64_IDS)
+def test_fp64_explicit_nki_casts_and_warns_once_per_op(monkeypatch, path, api, dtype):
+    log = _install_stubs(monkeypatch, path, "nki", False)
+    monkeypatch.setattr(dispatch, "_fp64_warned", set())
+    fn = _fp64_case(api, dtype, path)
+    ref, ref_err = _pytorch_ref(monkeypatch, fn)
+    if ref_err is not None:
+        pytest.skip(f"the pytorch backend refuses these operands: {ref_err}")
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        outs = [_seeded(fn) for _ in range(3)]
+    assert not log.violations, log.violations
+    assert log.calls, "explicit nki must launch the kernel"
+    for name, dts in log.calls:  # fp32 operands only (no bf16 / fp16 in these calls)
+        assert all(d == torch.float32 for d in dts if d.is_floating_point), (name, dts)
+    ws = _policy_warnings(caught)
+    assert len(ws) == 1, [str(w.message) for w in ws]  # one per op, across calls
+    assert "fp32" in str(ws[0].message)
+    for got in outs:
+        assert got.dtype == ref.dtype and got.shape == ref.shape
+
+
+def test_fp64_warning_is_per_op(monkeypatch):
+    _install_stubs(monkeypatch, "native-static", "nki", False)
+    monkeypatch.setattr(dispatch, "_fp64_warned", set())
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        for api in ("spmm", "bsr_spmm", "screened_spmm", "spmm", "bsr_spmm"):
+            _case(api, torch.float64)()
+    ws = _policy_warnings(caught)
+    assert len(ws) == 3
+    assert sorted(w.message.args[0].split(":")[0] for w in ws) == [
+        "trnsparse bsr_spmm",
+        "trnsparse screened_spmm",
+        "trnsparse spmm",
+    ]
+
+
+@pytest.mark.parametrize("backend_", ["nki", "auto"])
+@pytest.mark.parametrize("api,dtype", FP64_CASES, ids=FP64_IDS)
+def test_fp64_require_nki_raises(monkeypatch, path, backend_, api, dtype):
+    log = _install_stubs(monkeypatch, path, backend_, True)
+    fn = _fp64_case(api, dtype, path)
+    with pytest.raises(NotImplementedError, match="float64|complex128"):
+        fn()
+    assert log.calls == []
+
+
+# Result dtype == the pytorch backend's: same dtypes and mixed promotion.
+MIXED = [
+    (torch.float32, torch.float32),
+    (torch.float64, torch.float64),
+    (torch.bfloat16, torch.bfloat16),
+    (torch.float16, torch.float16),
+    (torch.float32, torch.float64),
+    (torch.float64, torch.float32),
+    (torch.bfloat16, torch.float32),
+    (torch.float16, torch.float32),
+    (torch.bfloat16, torch.float64),
+    (torch.complex64, torch.float64),
+]
+
+
+def _mixed_case(api, da, db):
+    g = torch.Generator().manual_seed(5)
+    if api == "spmm":
+        A = trnsparse.from_dense(_rnd((200, 150), da, g))
+        B = _rnd((150, 7), db, g)
+        return lambda: trnsparse.spmm(A, B)
+    if api == "bsr_spmm":
+        Ad = _rnd((256, 384), da, g)
+        Ad[:128, 128:256] = 0
+        A = trnsparse.BSRMatrix.from_dense(Ad, block_size=P)
+        B = _rnd((384, 5), db, g)
+        return lambda: trnsparse.bsr_spmm(A, B)
+    if api == "screened_spmm":
+        A, B = _rnd((200, 200), da, g), _rnd((200, 6), db, g)
+        diag = _rnd((200,), torch.float32, g)
+        return lambda: trnsparse.screened_spmm(A, diag, B, 0.25)
+    raise AssertionError(api)
+
+
+@pytest.mark.parametrize("da,db", MIXED, ids=lambda d: str(d).replace("torch.", ""))
+@pytest.mark.parametrize("api", ["spmm", "bsr_spmm", "screened_spmm"])
+def test_result_dtype_matches_pytorch_backend(monkeypatch, path, backend, api, da, db):
+    log = _install_stubs(monkeypatch, path, backend, False)
+    try:
+        fn = _mixed_case(api, da, db)
+    except (RuntimeError, TypeError, ValueError) as e:
+        pytest.skip(f"inputs not constructible: {e}")
+    ref, ref_err = _pytorch_ref(monkeypatch, fn)
+    if ref_err is not None:
+        pytest.skip(f"the pytorch backend refuses {da} x {db}: {ref_err}")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        got = fn()
+    assert not log.violations, log.violations
+    assert got.dtype == ref.dtype == torch.promote_types(da, db), (got.dtype, ref.dtype)
+    assert got.shape == ref.shape
+    if torch.float64 in (da, db) and backend == "auto":
+        assert log.calls == []  # float64 anywhere: torch under auto

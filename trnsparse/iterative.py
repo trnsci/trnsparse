@@ -556,6 +556,19 @@ def _use_fused_kernel(op: FusedCGOperator) -> bool:
     return native and op.device.type != "cpu"
 
 
+def _fused_fp64_ok(what: str, *dtypes: torch.dtype) -> bool:
+    """The fp64 policy (#84) for the fused kernels, which are fp32 throughout.
+
+    float64 A, b, x0 or v0: the host path at float64 accuracy under `auto`,
+    the fp32 kernel with a one-time `UserWarning` under explicit `nki`, and
+    `NotImplementedError` under TRNSPARSE_REQUIRE_NKI. Complex values are
+    #85 (host packing, every backend) and are not decided here.
+    """
+    from .nki.dispatch import _fp64_route
+
+    return _fp64_route(what, *(d for d in dtypes if d == torch.float64))
+
+
 def _accel_device(t: torch.Tensor | None):
     """t's device when it is an accelerator (not the CPU), else None."""
     return t.device if t is not None and t.device.type != "cpu" else None
@@ -596,7 +609,11 @@ def cg_bsr_fused(
     from `prepare_cg_bsr` runs where it was prepared (a host operator takes
     the host path whatever b's device).
     Otherwise the same algorithm runs in PyTorch on the host, in b's dtype
-    (fp64 stays fp64). The device kernel is fp32 throughout.
+    (fp64 stays fp64). The device kernel is fp32 throughout, so float64 A,
+    b or x0 take the host path under the `auto` backend (float64 accuracy),
+    run the kernel in fp32 with a one-time `UserWarning` under an explicit
+    `set_backend("nki")`, and raise `NotImplementedError` under
+    `TRNSPARSE_REQUIRE_NKI` (#84).
 
     Args:
         A: SPD BSR matrix with block_size 128, or a `prepare_cg_bsr` operator.
@@ -703,7 +720,9 @@ def cg_bsr_fused(
         out[:n] = v
         return out.reshape(T, _P, R)
 
-    if _use_fused_kernel(op):
+    if _use_fused_kernel(op) and _fused_fp64_ok(
+        "cg_bsr_fused", op.dtype, b.dtype, *(() if x0 is None else (x0.dtype,))
+    ):
         from .nki.dispatch import _get_native_ops
 
         bt, mt, key = op._device_operands(precision)
@@ -816,7 +835,8 @@ def power_iteration_bsr_fused(
     lam = v.Av / v.v, and stops when |lam_k - lam_{k-1}| < tol (as
     `power_iteration_bsr`, whose first change is measured from 0) or after
     `max_iter` steps. The device is fp32: lam settles to about 1e-7 |lam|,
-    so a much smaller `tol` runs to `max_iter`.
+    so a much smaller `tol` runs to `max_iter`. A float64 A or v0 takes the
+    host path under `auto` (as for `cg_bsr_fused`, #84).
 
     Args:
         A: square BSR matrix (block_size 128), or a `prepare_cg_bsr` operator
@@ -864,7 +884,7 @@ def power_iteration_bsr_fused(
 
     vt = torch.zeros(T * _P, dtype=torch.float64)
     vt[:n] = v
-    if _use_fused_kernel(op):
+    if _use_fused_kernel(op) and _fused_fp64_ok("power_iteration_bsr_fused", op.dtype, out_dtype):
         from .nki.dispatch import _get_native_ops
 
         bt, _, key = op._device_operands(precision)

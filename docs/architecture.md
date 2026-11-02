@@ -165,6 +165,39 @@ Restricted to square A (`M == K`) with 1-D `diag_integrals` in v0.4.0
 — the common Fock-build case. Rectangular / asymmetric-bounds
 extension is a follow-up if asked for.
 
+## Precision and dtypes
+
+Every NKI kernel computes in fp32 or bf16 with fp32 PSUM accumulation.
+Trainium computes float64 at fp32 precision, so no kernel can return a
+float64-accurate result. float64 operands (and complex128 in `bsr_spmm`,
+whose complex path runs as real kernel launches) follow one rule across
+the trnsci suite (#84):
+
+| configuration | float64 / complex128 operands |
+|---|---|
+| `set_backend("auto")` (default) | the PyTorch path, at float64 accuracy, the same code as `set_backend("pytorch")` |
+| `set_backend("nki")` | cast to fp32 (complex64) for the kernel; one `UserWarning` per op per process says precision is reduced to fp32 |
+| `TRNSPARSE_REQUIRE_NKI=1` | `NotImplementedError` (takes precedence over the explicit-nki cast) |
+
+This covers `spmm`, `bsr_spmm`, `screened_spmm`,
+`block_sparse_attention_tiled` (forward and backward), `cg_bsr` (through
+`bsr_spmm`) and the fused solvers `cg_bsr_fused` /
+`power_iteration_bsr_fused`, whose host path then runs in float64. A
+call with any float64 value operand counts (for example fp32 CSR values
+with a float64 `B`). `screened_spmm` decides on `A` and `B`; the Schwarz
+bound vector `diag_integrals` only builds the mask.
+
+The result dtype is always what `set_backend("pytorch")` returns for the
+same inputs, including bf16 / fp16 operands and mixed-dtype promotion
+(`torch.promote_types` of the operands); a kernel that computes in fp32
+has its result cast to that dtype. fp32, bf16 and fp16 operands take the
+kernels unchanged. Integer, bool and complex operands (outside
+`bsr_spmm`) have no kernel and take the PyTorch path, or raise
+`NotImplementedError` under `TRNSPARSE_REQUIRE_NKI`.
+
+Before 0.14.0 (0.2.0 through 0.13.0), float64 under `auto` was cast to
+fp32 on the NKI path without a warning.
+
 ## Known limits
 
 - **BSR block size.** The NKI kernels take `block_size=128` only. Other block

@@ -231,8 +231,9 @@ def case_cg(n, R=1, pc=None, matvec="auto", precision="fp32", seed=5):
     op = trnsparse.prepare_cg_bsr(
         trnsparse.BSRMatrix.from_dense(A.float(), block_size=P), preconditioner=pc, device=DEV
     )
+    # fp32 b: the fused kernel is fp32, and float64 raises under REQUIRE_NKI (#84).
     x, _, _, info = trnsparse.cg_bsr_fused(
-        op, b, tol=1e-6, max_iter=500, matvec=matvec, precision=precision, return_info=True
+        op, b.float(), tol=1e-6, max_iter=500, matvec=matvec, precision=precision, return_info=True
     )
     assert info["path"] == "nki" or not REQUIRE_NKI_PATH, info
     ref = torch.linalg.solve(A, b)
@@ -248,7 +249,7 @@ def case_power(n, matvec="column", seed=6):
         trnsparse.BSRMatrix.from_dense(A.float(), block_size=P), device=DEV
     )
     lam, v, _, info = trnsparse.power_iteration_bsr_fused(
-        op, v0=v0, tol=1e-4, max_iter=3000, matvec=matvec, return_info=True
+        op, v0=v0.float(), tol=1e-4, max_iter=3000, matvec=matvec, return_info=True
     )
     assert info["path"] == "nki" or not REQUIRE_NKI_PATH, info
     ev, V = torch.linalg.eigh(A)

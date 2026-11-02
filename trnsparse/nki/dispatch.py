@@ -145,12 +145,17 @@ def _nki_block_ok(op: str, block_size: int) -> bool:
 # came back as garbage, a dropped imaginary part, or the wrong dtype
 # (#78, #79, trnsci/trnsci#35). Two layers:
 #
-# 1. `_kernel_values_ok` / `_no_kernel_for_dtype`, at each public entry: which
-#    value dtypes a kernel path can take. float64 is cast to fp32 for the kernel
-#    and the result back to float64 (the documented behaviour since 0.2.0;
-#    Trainium has no fp64 datapath). Complex, integer and bool values have no
-#    kernel: they take the PyTorch path (what `set_backend("pytorch")` does),
-#    or raise `NotImplementedError` under TRNSPARSE_REQUIRE_NKI.
+# 1. `_kernel_route` (with `_no_kernel_for_dtype` / `_fp64_route`), at each
+#    public entry: which value dtypes a kernel path can take. Complex (outside
+#    `bsr_spmm`), integer and bool values have no kernel: they take the PyTorch
+#    path (what `set_backend("pytorch")` does), or raise `NotImplementedError`
+#    under TRNSPARSE_REQUIRE_NKI. float64 (and complex128 in `bsr_spmm`'s
+#    complex kernel path) follows the suite fp64 policy (#84): Trainium
+#    computes fp64 at fp32 precision, so under `auto` it takes the PyTorch
+#    path at float64 accuracy; under an explicit `set_backend("nki")` it is
+#    cast to fp32 for the kernel with a one-time `UserWarning` per op; under
+#    TRNSPARSE_REQUIRE_NKI it raises `NotImplementedError`. The result dtype
+#    is always the pytorch backend's for the same inputs.
 # 2. `_check_kernel_operands`, enforced by every launch itself (the native op
 #    table from `_get_native_ops`, `_run` on the XLA path, `_simulate` on the
 #    simulator): each tensor operand of each op, by position, must have a dtype
@@ -189,8 +194,15 @@ _KERNEL_OPERAND_DTYPES: dict[str, tuple[frozenset, ...]] = {
     "bsr_attn_bwd": (_ANYF,) * 5 + (_IDX, _IDX) + (_ANYF, _ANYF),
 }
 
-# Value dtypes a kernel path takes at the public entry (float64 via a cast).
+# Value dtypes a kernel path takes at the public entry (float64 only through
+# the explicit-nki fp32 cast, see `_fp64_route`).
 _KERNEL_VALUE_DTYPES = _ANYF
+
+# Dtypes the device computes at fp32 precision only (#84).
+_FP64_DTYPES = frozenset({torch.float64, torch.complex128})
+
+# Ops that already warned about the explicit-nki fp32 cast (one warning per op).
+_fp64_warned: set[str] = set()
 
 
 def _check_kernel_operands(op_name: str, args) -> None:
@@ -222,7 +234,7 @@ def _guard_op(op_name: str, op):
 
 
 def _kernel_values_ok(*tensors: torch.Tensor) -> bool:
-    """True when every value operand can go to a kernel (float64 through a cast)."""
+    """True when every value operand has a kernel dtype (float64 through a cast)."""
     return all(t.dtype in _KERNEL_VALUE_DTYPES for t in tensors)
 
 
@@ -235,17 +247,56 @@ def _no_kernel_for_dtype(what: str, *tensors: torch.Tensor) -> None:
         dts = sorted({str(t.dtype) for t in tensors})
         raise NotImplementedError(
             f"trnsparse {what}: the NKI kernels take float32/bfloat16/float16 "
-            f"(float64 through an fp32 cast) values, got {dts}. "
-            "Unset TRNSPARSE_REQUIRE_NKI to compute in torch."
+            f"values, got {dts}. Unset TRNSPARSE_REQUIRE_NKI to compute in torch."
         )
 
 
-def _kernel_route(what: str, *tensors: torch.Tensor) -> bool:
-    """True: a kernel path. False: the PyTorch path (raises under REQUIRE_NKI)."""
-    if _kernel_values_ok(*tensors):
+def _fp64_route(what: str, *dtypes: torch.dtype) -> bool:
+    """The fp64 policy (#84) for value dtypes headed to a kernel.
+
+    True: a kernel path (no float64 / complex128, or an explicit
+    `set_backend("nki")`, where the caller casts to fp32 / complex64 and
+    this warns once per op). False: the PyTorch path at float64 accuracy
+    (backend `auto`). Under TRNSPARSE_REQUIRE_NKI, float64 / complex128
+    raise `NotImplementedError` (the kernels cannot give fp64 accuracy).
+    """
+    wide = sorted({str(d) for d in dtypes if d in _FP64_DTYPES})
+    if not wide:
         return True
-    _no_kernel_for_dtype(what, *tensors)
-    return False
+    if _REQUIRE_NKI:
+        raise NotImplementedError(
+            f"trnsparse {what}: no NKI kernel computes {', '.join(wide)} at full "
+            "precision (Trainium computes float64 at fp32 precision). Unset "
+            "TRNSPARSE_REQUIRE_NKI to compute in torch at float64 accuracy, or pass "
+            "float32 operands."
+        )
+    if _backend != "nki":
+        return False
+    key = what.removesuffix(" backward")
+    if key not in _fp64_warned:
+        _fp64_warned.add(key)
+        warnings.warn(
+            f"trnsparse {key}: {', '.join(wide)} operands on the explicit NKI backend "
+            "are cast to float32 / complex64 for the kernel, so precision is reduced "
+            "to fp32 (the result keeps the pytorch-backend dtype). Use "
+            'set_backend("auto") for float64 accuracy in torch.',
+            UserWarning,
+            stacklevel=3,
+        )
+    return True
+
+
+def _kernel_route(what: str, *tensors: torch.Tensor) -> bool:
+    """True: a kernel path. False: the PyTorch path.
+
+    Complex / integer / bool values: the PyTorch path (raises under
+    REQUIRE_NKI). float64: `_fp64_route` (torch under `auto`, an fp32 cast
+    with a one-time warning under explicit `nki`, raise under REQUIRE_NKI).
+    """
+    if not _kernel_values_ok(*tensors):
+        _no_kernel_for_dtype(what, *tensors)
+        return False
+    return _fp64_route(what, *(t.dtype for t in tensors))
 
 
 def _simulate(kernel, op_name: str, *tensors: torch.Tensor):
@@ -460,7 +511,8 @@ class _MaskPattern:
 def _kernel_input(t: torch.Tensor) -> torch.Tensor:
     """Cast a kernel operand to a dtype the NeuronCore datapath supports.
 
-    Trainium has no fp64 datapath; the native device silently hands fp64
+    float64 reaches a kernel wrapper only on the explicit `nki` backend
+    (`_fp64_route`, #84; `auto` takes torch). Trainium has no fp64 datapath; the native device silently hands fp64
     operands to the kernel as fp32, and the kernel output (whose dtype
     follows its input) then comes back as fp32. Downcast explicitly so the
     kernel always sees fp32, and have callers cast the result back to the
@@ -870,6 +922,11 @@ def nki_bsr_spmm(A, B: torch.Tensor) -> torch.Tensor:
 
         return _bsr_spmm_pytorch(A, B)
     if A.blocks.is_complex() or B.is_complex():
+        # complex128 / float64 parts: the fp64 policy (#84) before the real launches.
+        if not _fp64_route("bsr_spmm", A.blocks.dtype, B.dtype):
+            from ..ops import _bsr_spmm_pytorch
+
+            return _bsr_spmm_pytorch(A, B)
         return _nki_bsr_spmm_complex(A, B)  # real kernel launches (#78)
     if not _kernel_route("bsr_spmm", A.blocks, B):
         from ..ops import _bsr_spmm_pytorch
