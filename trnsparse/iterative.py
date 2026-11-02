@@ -93,7 +93,11 @@ def cg_bsr(
 
     Returns:
         `(x, iters, rel_residual)` — solution, iteration count, final
-        relative residual.
+        relative residual. `iters` is the number of CG steps taken: it is
+        below `max_iter` both on convergence (`rel_residual < tol`) and on
+        breakdown (`|p . A p|` vanishes, e.g. after exact convergence with
+        `tol=0`), so check `rel_residual` to tell them apart. With
+        `max_iter=0` the result is `(x0, 0, ||b - A x0|| / ||b||)`.
 
     Autograd: when `b` or `A.blocks` requires grad, `x` is differentiated
     as the exact solve `A^{-1} b` (implicit differentiation, as
@@ -150,12 +154,14 @@ def _cg_bsr_loop(
     z = precond(r) if precond is not None else r.clone()
     p = z.clone()
     rz = torch.dot(r, z).item()
+    r_norm = torch.linalg.norm(r).item()
 
     for k in range(max_iter):
         Ap = matvec(p)
         pAp = torch.dot(p, Ap).item()
         if abs(pAp) < 1e-30:
-            break
+            # Breakdown: no step can be taken, x is the iterate after k steps.
+            return x, k, r_norm / b_norm
 
         alpha = rz / pAp
         x = x + alpha * p
