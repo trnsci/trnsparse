@@ -27,7 +27,12 @@ Dense operands go to `--conformance-device`; sparse structure (CSR / BSR
 indices) stays on the host, which is the documented placement. float64 /
 complex128 follow the suite fp64 policy (#84): under `--backend auto` they
 compute in torch at float64 accuracy and are held to the float64
-tolerances, as with the pytorch backend; only under `--backend nki` (an
+tolerances, as with the pytorch backend. With `--conformance-device
+neuron` that is host torch: device-resident float64 operands are copied to
+the host for the op and the result comes back to the device (device aten
+computes float64 at fp32 precision), so the fp64 tolerances apply there
+too. `TRNSPARSE_FP64_ON_DEVICE=1` keeps device aten instead; such a run is
+held to fp32 tolerances for float64 (`tol_for`); only under `--backend nki` (an
 explicit fp32 cast with a one-time warning) are they held to fp32
 tolerances. The fp64 gradchecks run on every backend and are skipped on a
 device (host-only placement). Under `TRNSPARSE_REQUIRE_NKI=1` float64 /
@@ -62,6 +67,7 @@ TOL = {
 }
 FP32_TOL = 2e-4
 REQUIRE_NKI = os.environ.get("TRNSPARSE_REQUIRE_NKI", "").lower() in ("1", "true", "yes")
+FP64_ON_DEVICE = os.environ.get("TRNSPARSE_FP64_ON_DEVICE", "").lower() in ("1", "true", "yes")
 
 _STATE: dict = {"backend": "pytorch", "device": torch.device("cpu")}
 
@@ -116,7 +122,11 @@ def ref_dtype(dt: torch.dtype) -> torch.dtype:
 
 def tol_for(dt: torch.dtype) -> float:
     t = TOL.get(dt, 0.0)
-    if explicit_nki() and dt in (torch.float64, torch.complex128):
+    if dt in (torch.float64, torch.complex128) and (
+        explicit_nki() or (FP64_ON_DEVICE and on_device())
+    ):
+        # Explicit nki casts to fp32; FP64_ON_DEVICE keeps device aten (fp32
+        # precision). Under auto, device-resident float64 runs on the host.
         return FP32_TOL
     if nki_backend() and dt in (torch.float32, torch.complex64):
         return max(t, 1e-4)

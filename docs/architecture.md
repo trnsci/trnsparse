@@ -175,7 +175,7 @@ the trnsci suite (#84):
 
 | configuration | float64 / complex128 operands |
 |---|---|
-| `set_backend("auto")` (default) | the PyTorch path, at float64 accuracy, the same code as `set_backend("pytorch")` |
+| `set_backend("auto")` (default) | the PyTorch path, at float64 accuracy, the same code as `set_backend("pytorch")`; on the host, also for operands that live on the `neuron` device (see below) |
 | `set_backend("nki")` | cast to fp32 (complex64) for the kernel; one `UserWarning` per op per process says precision is reduced to fp32 |
 | `TRNSPARSE_REQUIRE_NKI=1` | `NotImplementedError` (takes precedence over the explicit-nki cast) |
 
@@ -197,6 +197,34 @@ kernels unchanged. Integer, bool and complex operands (outside
 
 Before 0.14.0 (0.2.0 through 0.13.0), float64 under `auto` was cast to
 fp32 on the NKI path without a warning.
+
+### float64 on the `neuron` device
+
+On the `neuron` device the PyTorch path would be device aten, and device
+aten computes float64 at fp32 precision too (measured on Trn2). So under
+`auto`, when any float64 or complex128 operand of a public op lives on a
+`neuron` device (a dense tensor, or the values / blocks of a CSR, COO or
+BSR matrix), the op runs on the host instead: the device-resident operands
+are copied to the CPU (indices included), host torch computes at float64,
+and the result is copied back to the dense operand's device in float64
+(complex128). The copies are differentiable, so autograd flows through
+them. The first such call of each op emits one `UserWarning`: "float64 on
+the neuron device is computed on the host for float64 accuracy (device
+arithmetic is fp32); pass float32 to stay on device".
+
+This covers `spmv`, `spmm`, `spmv_symmetric`, `bsr_spmm`, `screened_spmm`,
+`block_sparse_attention_tiled` (forward and backward), `cg_bsr`,
+`chebyshev_bsr`, `richardson_bsr`, `power_iteration_bsr` and the
+preconditioner returned by `jacobi_preconditioner_bsr`; a solver moves its
+operands once, not once per iteration. The fused solvers `cg_bsr_fused` /
+`power_iteration_bsr_fused` already run float64 on their host path.
+
+To keep float64 on the device anyway (faster, fp32 precision), set
+`TRNSPARSE_FP64_ON_DEVICE=1`: device-resident float64 then runs in device
+aten, without copies or the warning. The explicit `set_backend("nki")`
+cast, `TRNSPARSE_REQUIRE_NKI=1`, the pytorch backend and host-resident
+float64 are not affected. float32, bf16 and fp16 operands on the device
+stay on the device.
 
 ## Known limits
 

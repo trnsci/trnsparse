@@ -16,6 +16,7 @@ from collections.abc import Callable
 import torch
 
 from .formats import BSRMatrix
+from .nki.dispatch import _fp64_host_guard
 from .ops import bsr_spmm
 
 
@@ -64,6 +65,7 @@ def _bsr_matvec(A: BSRMatrix) -> Callable[[torch.Tensor], torch.Tensor]:
     return matvec
 
 
+@_fp64_host_guard("cg_bsr")
 def cg_bsr(
     A: BSRMatrix,
     b: torch.Tensor,
@@ -153,6 +155,7 @@ def jacobi_preconditioner_bsr(
         raise ValueError("Jacobi preconditioner: diagonal has near-zero entries")
     inv_d = 1.0 / d
 
+    @_fp64_host_guard("jacobi_preconditioner_bsr")
     def precond(r: torch.Tensor) -> torch.Tensor:
         # No-op when r is on A.blocks' device (the usual case).
         return r * inv_d.to(r.device)
@@ -227,6 +230,7 @@ def chebyshev_coeffs(
     return alpha.float(), beta.float()
 
 
+@_fp64_host_guard("chebyshev_bsr")
 def chebyshev_bsr(
     A: BSRMatrix,
     b: torch.Tensor,
@@ -283,6 +287,7 @@ def chebyshev_bsr(
     return x, K, rel
 
 
+@_fp64_host_guard("richardson_bsr")
 def richardson_bsr(
     A: BSRMatrix,
     b: torch.Tensor,
@@ -325,6 +330,7 @@ def richardson_bsr(
     return x, K, rel
 
 
+@_fp64_host_guard("power_iteration_bsr")
 def power_iteration_bsr(
     A: BSRMatrix,
     v0: torch.Tensor | None = None,

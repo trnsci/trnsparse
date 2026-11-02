@@ -23,6 +23,8 @@ device of the dense operand.
 
 from __future__ import annotations
 
+import dataclasses
+import functools
 import importlib.util
 import os
 import warnings
@@ -49,6 +51,16 @@ if HAS_NKI:
 # When set, kernel-path failures re-raise instead of falling back to
 # PyTorch. Used by the hardware validation suite.
 _REQUIRE_NKI = os.environ.get("TRNSPARSE_REQUIRE_NKI", "").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
+# float64 / complex128 on the `neuron` device under `auto` (#84): device aten
+# computes them at fp32 precision (measured on Trn2), so the op runs in host
+# torch instead and the result comes back to the device (`_fp64_host_guard`).
+# TRNSPARSE_FP64_ON_DEVICE=1 keeps device aten (fp32 precision, no copies).
+_FP64_ON_DEVICE = os.environ.get("TRNSPARSE_FP64_ON_DEVICE", "").lower() in (
     "1",
     "true",
     "yes",
@@ -297,6 +309,144 @@ def _kernel_route(what: str, *tensors: torch.Tensor) -> bool:
         _no_kernel_for_dtype(what, *tensors)
         return False
     return _fp64_route(what, *(t.dtype for t in tensors))
+
+
+# ── Device-resident float64 under `auto`: host torch (#84) ───────────────────
+#
+# `auto` promises float64 accuracy for float64 (and complex128) operands. On
+# the host that is host torch; on the `neuron` device the torch fallback
+# would be device aten, which computes float64 at fp32 precision. So every
+# public op is wrapped in `_fp64_host_guard`: under `auto` (not
+# TRNSPARSE_REQUIRE_NKI, which keeps raising, and not
+# TRNSPARSE_FP64_ON_DEVICE), a float64 / complex128 tensor operand on a
+# `neuron` device (directly, or as a CSR / COO / BSR container's values)
+# sends the whole call to the host: neuron-resident operands are copied to
+# the CPU (indices included), the op runs there (host torch at float64),
+# and tensor results go back to the device of the dense operand, keeping
+# their dtype. The copies are `.to()` calls, so autograd flows through.
+# One `UserWarning` per op.
+
+_fp64_host_warned: set[str] = set()
+
+
+def _on_neuron_device(t: torch.Tensor) -> bool:
+    """True when `t` lives on a `neuron` device (patched in the CPU tests)."""
+    return t.device.type == "neuron"
+
+
+_SPARSE_CONTAINERS: tuple[type, ...] | None = None
+
+
+def _sparse_containers() -> tuple[type, ...]:
+    global _SPARSE_CONTAINERS
+    if _SPARSE_CONTAINERS is None:
+        from ..formats import BSRMatrix, COOMatrix, CSRMatrix
+
+        _SPARSE_CONTAINERS = (CSRMatrix, COOMatrix, BSRMatrix)
+    return _SPARSE_CONTAINERS
+
+
+def _operand_tensors(x):
+    """The tensors in one operand (a tensor, sparse container, tuple or list)."""
+    if isinstance(x, torch.Tensor):
+        yield x
+    elif isinstance(x, _sparse_containers()):
+        for f in dataclasses.fields(x):
+            v = getattr(x, f.name)
+            if isinstance(v, torch.Tensor):
+                yield v
+    elif isinstance(x, tuple | list):
+        for y in x:
+            yield from _operand_tensors(y)
+
+
+def _host_copy(t: torch.Tensor) -> torch.Tensor:
+    """`t` copied to the CPU (differentiable)."""
+    return t.to("cpu")
+
+
+def _move_neuron_to_host(x):
+    """`x` with every neuron-resident tensor (also inside containers) on the CPU."""
+    if isinstance(x, torch.Tensor):
+        return _host_copy(x) if _on_neuron_device(x) else x
+    if isinstance(x, _sparse_containers()):
+        moved = {
+            f.name: _move_neuron_to_host(getattr(x, f.name))
+            for f in dataclasses.fields(x)
+            if isinstance(getattr(x, f.name), torch.Tensor)
+        }
+        return dataclasses.replace(x, **moved)
+    if isinstance(x, tuple | list):
+        return type(x)(_move_neuron_to_host(y) for y in x)
+    return x
+
+
+def _move_to(x, device: torch.device):
+    """Result `x` (tensors, containers, tuples, lists) with its tensors on `device`."""
+    if isinstance(x, torch.Tensor):
+        return x.to(device)
+    if isinstance(x, _sparse_containers()):
+        moved = {
+            f.name: getattr(x, f.name).to(device)
+            for f in dataclasses.fields(x)
+            if isinstance(getattr(x, f.name), torch.Tensor)
+        }
+        return dataclasses.replace(x, **moved)
+    if isinstance(x, tuple | list):
+        return type(x)(_move_to(y, device) for y in x)
+    return x
+
+
+def _fp64_host_guard(op: str):
+    """Decorator for a public op: device-resident float64 runs in host torch.
+
+    See the section comment above. The result goes back to the device of the
+    first neuron-resident dense (non-container) tensor operand: trnsparse
+    results land on the dense operand's device. When only a sparse container
+    was on the device, the dense operand is on the host and so is the result.
+    """
+
+    def deco(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            if _backend != "auto" or _REQUIRE_NKI or _FP64_ON_DEVICE:
+                return fn(*args, **kwargs)
+            operands = (*args, *kwargs.values())
+            if not any(
+                t.dtype in _FP64_DTYPES and _on_neuron_device(t)
+                for x in operands
+                for t in _operand_tensors(x)
+            ):
+                return fn(*args, **kwargs)
+            home = next(
+                (
+                    t.device
+                    for x in operands
+                    if not isinstance(x, _sparse_containers())
+                    for t in _operand_tensors(x)
+                    if _on_neuron_device(t)
+                ),
+                None,
+            )
+            if op not in _fp64_host_warned:
+                _fp64_host_warned.add(op)
+                warnings.warn(
+                    f"trnsparse {op}: float64 on the neuron device is computed on the "
+                    "host for float64 accuracy (device arithmetic is fp32); pass "
+                    "float32 to stay on device, or set TRNSPARSE_FP64_ON_DEVICE=1 to "
+                    "keep device aten at fp32 precision.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+            out = fn(
+                *(_move_neuron_to_host(a) for a in args),
+                **{k: _move_neuron_to_host(v) for k, v in kwargs.items()},
+            )
+            return out if home is None else _move_to(out, home)
+
+        return wrapper
+
+    return deco
 
 
 def _simulate(kernel, op_name: str, *tensors: torch.Tensor):

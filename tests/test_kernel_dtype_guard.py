@@ -567,3 +567,300 @@ def test_result_dtype_matches_pytorch_backend(monkeypatch, path, backend, api, d
     assert got.shape == ref.shape
     if torch.float64 in (da, db) and backend == "auto":
         assert log.calls == []  # float64 anywhere: torch under auto
+
+
+# ── Device-resident float64 under `auto`: host torch (#84) ───────────────────
+#
+# Device aten computes float64 at fp32 precision (measured on Trn2), so under
+# `auto` a float64 / complex128 operand on the `neuron` device sends the op to
+# the host (`dispatch._fp64_host_guard`). Here the "neuron" device is CPU
+# tensors marked `_fake_neuron`: `_on_neuron_device` checks the mark,
+# `_host_copy` (the device -> host copy) records itself and returns an
+# unmarked clone, and `_move_to` (the result's way back) records its target
+# and marks what it returns.
+
+import dataclasses  # noqa: E402
+
+HOST_WARNING = (
+    "float64 on the neuron device is computed on the host for float64 accuracy "
+    "(device arithmetic is fp32); pass float32 to stay on device"
+)
+
+
+def _neuron(t):
+    t = t.detach().clone()
+    t._fake_neuron = True
+    return t
+
+
+def _neuron_mat(A):
+    return dataclasses.replace(
+        A,
+        **{
+            f.name: _neuron(getattr(A, f.name))
+            for f in dataclasses.fields(A)
+            if isinstance(getattr(A, f.name), torch.Tensor)
+        },
+    )
+
+
+def _is_neuron(t):
+    return getattr(t, "_fake_neuron", False)
+
+
+class _Transfers:
+    def __init__(self):
+        self.to_host = []  # dtypes copied to the host
+        self.back = []  # devices results were moved to
+
+
+def _fake_neuron(monkeypatch, backend="auto", require=False, on_device=False):
+    log = _install_stubs(monkeypatch, "native-gather", backend, require)
+    monkeypatch.setattr(dispatch, "_fp64_host_warned", set())
+    monkeypatch.setattr(dispatch, "_fp64_warned", set())
+    monkeypatch.setattr(dispatch, "_FP64_ON_DEVICE", on_device)
+    monkeypatch.setattr(dispatch, "_on_neuron_device", _is_neuron)
+    tr = _Transfers()
+
+    def host_copy(t):
+        assert _is_neuron(t)
+        tr.to_host.append(t.dtype)
+        return t.clone()  # unmarked: a host tensor (and differentiable)
+
+    real_move_to = dispatch._move_to
+
+    def move_to(x, device):
+        tr.back.append(device)
+        out = real_move_to(x, device)
+        if isinstance(out, torch.Tensor):
+            out._fake_neuron = True
+        return out
+
+    monkeypatch.setattr(dispatch, "_host_copy", host_copy)
+    monkeypatch.setattr(dispatch, "_move_to", move_to)
+    return log, tr
+
+
+def _sym_csr(n, dtype, g):
+    M = _rnd((n, n), dtype, g)
+    M[:, ::3] = 0
+    return trnsparse.from_dense(M + M.T.conj() if dtype.is_complex else M + M.T)
+
+
+def _spd_bsr_dtype(dtype):
+    return trnsparse.BSRMatrix.from_dense(_spd_bsr().to_dense().to(dtype), block_size=P)
+
+
+def _device_case(api, dtype):
+    """(fn, args): `fn(*args)` is the public call; args hold host operands."""
+    g = torch.Generator().manual_seed(11)
+    if api == "spmv":
+        A = trnsparse.from_dense(_rnd((200, 150), dtype, g))
+        return (lambda A, x: trnsparse.spmv(A, x)), (A, _rnd((150,), dtype, g))
+    if api == "spmm":
+        A = trnsparse.from_dense(_rnd((200, 150), dtype, g))
+        return (lambda A, B: trnsparse.spmm(A, B)), (A, _rnd((150, 7), dtype, g))
+    if api == "spmv_symmetric":
+        A = _sym_csr(150, dtype, g)
+        return (lambda A, x: trnsparse.spmv_symmetric(A, x)), (A, _rnd((150,), dtype, g))
+    if api == "bsr_spmm":
+        Ad = _rnd((256, 384), dtype, g)
+        Ad[:128, 128:256] = 0
+        A = trnsparse.BSRMatrix.from_dense(Ad, block_size=P)
+        return (lambda A, B: trnsparse.bsr_spmm(A, B)), (A, _rnd((384, 5), dtype, g))
+    if api == "screened_spmm":
+        args = (_rnd((200, 200), dtype, g), _rnd((200,), dtype, g), _rnd((200, 6), dtype, g))
+        return (lambda A, d, B: trnsparse.screened_spmm(A, d, B, 0.25)), args
+    if api in ("attention", "attention_grad"):
+        mask = trnsparse.BSRMatrix.from_dense(
+            torch.tensor([[1.0, 0.0], [1.0, 1.0]]).repeat_interleave(P, 0).repeat_interleave(P, 1),
+            block_size=P,
+        )
+        qkv = tuple(_rnd((256, 64), dtype, g) for _ in range(3))
+        if api == "attention":
+            return (lambda Q, K, V: trnsparse.block_sparse_attention_tiled(Q, K, V, mask)), qkv
+
+        def fwd_bwd(Q, K, V):
+            q, k, v = (t.requires_grad_(True) for t in (Q, K, V))
+            out = trnsparse.block_sparse_attention_tiled(q, k, v, mask)
+            out.sum().backward()
+            return q.grad
+
+        return fwd_bwd, qkv
+    b = _rnd((256,), dtype, g)
+    if api == "cg_bsr":
+        return (lambda A, b: trnsparse.cg_bsr(A, b, max_iter=5)[0]), (_spd_bsr_dtype(dtype), b)
+    if api == "chebyshev_bsr":
+        fn = lambda A, b: trnsparse.chebyshev_bsr(A, b, 1.0, 3.0, K=4)[0]  # noqa: E731
+        return fn, (_spd_bsr_dtype(dtype), b)
+    if api == "richardson_bsr":
+        fn = lambda A, b: trnsparse.richardson_bsr(A, b, 0.4, K=4)[0]  # noqa: E731
+        return fn, (_spd_bsr_dtype(dtype), b)
+    if api == "power_iteration_bsr":
+        fn = lambda A, v0: trnsparse.power_iteration_bsr(A, v0, max_iter=4)[1]  # noqa: E731
+        return fn, (_spd_bsr_dtype(dtype), b)
+    if api == "jacobi_preconditioner_bsr":
+        A = _spd_bsr_dtype(dtype)
+        return (lambda r: trnsparse.jacobi_preconditioner_bsr(A)(r)), (b,)
+    raise AssertionError(api)
+
+
+DEVICE_APIS = [
+    "spmv",
+    "spmm",
+    "spmv_symmetric",
+    "bsr_spmm",
+    "screened_spmm",
+    "attention",
+    "attention_grad",
+    "cg_bsr",
+    "chebyshev_bsr",
+    "richardson_bsr",
+    "power_iteration_bsr",
+    "jacobi_preconditioner_bsr",
+]
+DEVICE_CASES = [(a, torch.float64) for a in DEVICE_APIS] + [
+    (a, torch.complex128) for a in ("spmv", "spmm", "bsr_spmm", "cg_bsr")
+]
+DEVICE_IDS = [f"{a}-{d}" for a, d in DEVICE_CASES]
+
+
+def _on_device(args):
+    return tuple(
+        _neuron(a) if isinstance(a, torch.Tensor) else _neuron_mat(a) if a is not None else a
+        for a in args
+    )
+
+
+def _host_warnings(caught):
+    return [w for w in caught if HOST_WARNING in str(w.message)]
+
+
+def _call(fn, args):
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        out = fn(*args)
+    return out, _host_warnings(caught)
+
+
+def _host_ref(monkeypatch, fn, args):
+    with monkeypatch.context() as m:
+        m.setattr(dispatch, "_backend", "pytorch")
+        return fn(*args)
+
+
+@pytest.mark.parametrize("api,dtype", DEVICE_CASES, ids=DEVICE_IDS)
+def test_fp64_on_device_auto_computes_on_host(monkeypatch, api, dtype):
+    log, tr = _fake_neuron(monkeypatch)
+    fn, args = _device_case(api, dtype)
+    ref = _host_ref(monkeypatch, fn, args)
+    outs = []
+    for _ in range(3):
+        out, ws = _call(fn, _on_device(args))
+        outs.append((out, ws))
+    assert log.calls == [], log.calls  # no kernel launch
+    assert dtype in tr.to_host  # device operands were copied to the host
+    assert tr.back and all(d == torch.device("cpu") for d in tr.back)
+    # The warning fires once for the op, on the first call only.
+    assert len(outs[0][1]) == 1 and all(not ws for _, ws in outs[1:])
+    msg = str(outs[0][1][0].message)
+    assert "TRNSPARSE_FP64_ON_DEVICE" in msg
+    for out, _ in outs:
+        if api != "attention_grad":  # q.grad accumulates on its device leaf
+            assert _is_neuron(out), "result must come back to the device"
+        assert out.dtype == dtype
+        assert out.shape == ref.shape
+        torch.testing.assert_close(out, ref, rtol=1e-12, atol=1e-12)
+
+
+def test_fp64_on_device_warning_is_per_op(monkeypatch):
+    _fake_neuron(monkeypatch)
+    caught_ops = []
+    for api in ("spmm", "bsr_spmm", "spmm", "screened_spmm", "bsr_spmm"):
+        fn, args = _device_case(api, torch.float64)
+        _, ws = _call(fn, _on_device(args))
+        caught_ops += [str(w.message).split(":")[0] for w in ws]
+    assert caught_ops == ["trnsparse spmm", "trnsparse bsr_spmm", "trnsparse screened_spmm"]
+
+
+def test_fp64_on_device_result_follows_the_dense_operand(monkeypatch):
+    # Only the sparse container on the device: the dense operand (and so the
+    # result, as trnsparse places it) is on the host.
+    _, tr = _fake_neuron(monkeypatch)
+    fn, (A, B) = _device_case("bsr_spmm", torch.float64)
+    out, ws = _call(fn, (_neuron_mat(A), B))
+    assert len(ws) == 1 and torch.float64 in tr.to_host
+    assert not _is_neuron(out) and tr.back == []
+    torch.testing.assert_close(out, _host_ref(monkeypatch, fn, (A, B)), rtol=1e-12, atol=1e-12)
+
+
+@pytest.mark.parametrize("api,dtype", DEVICE_CASES, ids=DEVICE_IDS)
+def test_fp64_on_device_override_keeps_device_aten(monkeypatch, api, dtype):
+    log, tr = _fake_neuron(monkeypatch, on_device=True)
+    fn, args = _device_case(api, dtype)
+    ref = _host_ref(monkeypatch, fn, args)
+    out, ws = _call(fn, _on_device(args))
+    assert ws == [] and tr.to_host == [] and tr.back == []  # no host round trip
+    assert log.calls == []  # still torch (device aten), not a kernel
+    assert out.dtype == dtype and out.shape == ref.shape
+
+
+@pytest.mark.parametrize("value,expect", [("1", True), ("true", True), ("", False), ("0", False)])
+def test_fp64_on_device_env_flag(value, expect):
+    import os
+    import subprocess
+
+    env = {**os.environ, "TRNSPARSE_FP64_ON_DEVICE": value}
+    code = "from trnsparse.nki import dispatch; print(dispatch._FP64_ON_DEVICE)"
+    out = subprocess.run(
+        [sys.executable, "-c", code], env=env, capture_output=True, text=True, check=True
+    )
+    assert out.stdout.strip() == str(expect)
+
+
+@pytest.mark.parametrize("api,dtype", [("spmm", torch.float64), ("bsr_spmm", torch.complex128)])
+def test_fp64_on_device_require_nki_still_raises(monkeypatch, api, dtype):
+    log, tr = _fake_neuron(monkeypatch, require=True)
+    fn, args = _device_case(api, dtype)
+    with pytest.raises(NotImplementedError, match="float64|complex128"):
+        fn(*_on_device(args))
+    assert tr.to_host == [] and log.calls == []
+
+
+def test_fp64_on_device_explicit_nki_unchanged(monkeypatch):
+    log, tr = _fake_neuron(monkeypatch, backend="nki")
+    fn, args = _device_case("spmm", torch.float64)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        out = fn(*_on_device(args))
+    assert tr.to_host == [] and not _host_warnings(caught)
+    assert _policy_warnings(caught)  # the fp32-cast warning, as before
+    assert log.calls and out.dtype == torch.float64
+
+
+def test_fp64_on_device_pytorch_backend_unchanged(monkeypatch):
+    _, tr = _fake_neuron(monkeypatch, backend="pytorch")
+    fn, args = _device_case("bsr_spmm", torch.float64)
+    _, ws = _call(fn, _on_device(args))
+    assert ws == [] and tr.to_host == []
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_fp32_on_device_stays_on_device(monkeypatch, dtype):
+    _, tr = _fake_neuron(monkeypatch)
+    fn, args = _device_case("bsr_spmm", dtype)
+    _, ws = _call(fn, _on_device(args))
+    assert ws == [] and tr.to_host == []
+
+
+def test_fp64_on_host_unchanged(monkeypatch):
+    # The real predicate: CPU tensors are host tensors.
+    _install_stubs(monkeypatch, "native-gather", "auto", False)
+    monkeypatch.setattr(dispatch, "_fp64_host_warned", set())
+    calls = []
+    monkeypatch.setattr(dispatch, "_host_copy", lambda t: calls.append(t) or t)
+    for api in DEVICE_APIS:
+        fn, args = _device_case(api, torch.float64)
+        _, ws = _call(fn, args)
+        assert ws == [], api
+    assert calls == []

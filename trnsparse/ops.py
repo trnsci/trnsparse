@@ -28,6 +28,7 @@ import warnings
 import torch
 
 from .formats import BSRMatrix, COOMatrix, CSRMatrix, _csr_to_dense_host
+from .nki.dispatch import _fp64_host_guard
 
 
 def _as_torch_csr(A: CSRMatrix) -> torch.Tensor:
@@ -63,6 +64,7 @@ def _scaled(s: float, t: torch.Tensor) -> torch.Tensor:
     return t if s == 1 else s * t
 
 
+@_fp64_host_guard("spmv")
 def spmv(
     A: CSRMatrix,
     x: torch.Tensor,
@@ -109,6 +111,7 @@ def _check_epilogue_shape(op: str, name: str, t: torch.Tensor, result: torch.Ten
         )
 
 
+@_fp64_host_guard("spmm")
 def spmm(
     A: CSRMatrix,
     B: torch.Tensor,
@@ -146,6 +149,7 @@ def spmm(
     return result
 
 
+@_fp64_host_guard("spmv_symmetric")
 def spmv_symmetric(
     A: CSRMatrix, x: torch.Tensor, alpha: float = 1.0, uplo: str = "upper"
 ) -> torch.Tensor:
@@ -325,6 +329,7 @@ def _bsr_spmm_pytorch(A: BSRMatrix, B: torch.Tensor) -> torch.Tensor:
     return out[:m]
 
 
+@_fp64_host_guard("bsr_spmm")
 def bsr_spmm(A: BSRMatrix, B: torch.Tensor) -> torch.Tensor:
     """Block-sparse × dense matmul: C = A @ B.
 
@@ -352,6 +357,7 @@ def bsr_spmm(A: BSRMatrix, B: torch.Tensor) -> torch.Tensor:
     return _bsr_spmm_pytorch(A, B)
 
 
+@_fp64_host_guard("screened_spmm")
 def screened_spmm(
     A: torch.Tensor,
     diag_integrals: torch.Tensor,
@@ -770,6 +776,7 @@ class _AttnTiledFunction(torch.autograd.Function):
         return dQ, dK, dV, None, None, None, None, None
 
 
+@_fp64_host_guard("block_sparse_attention_tiled")
 def block_sparse_attention_tiled(
     Q: torch.Tensor,
     K: torch.Tensor,

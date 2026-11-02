@@ -38,6 +38,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   vector `diag_integrals` alone does not change the route. See
   docs/architecture.md, "Precision and dtypes".
 
+  **float64 on the `neuron` device runs on the host under `auto`.** Device
+  aten computes float64 at fp32 precision as well (measured on Trn2), so
+  the torch path alone does not give float64 accuracy for device-resident
+  data. When a float64 / complex128 operand of `spmv`, `spmm`,
+  `spmv_symmetric`, `bsr_spmm`, `screened_spmm`,
+  `block_sparse_attention_tiled` (forward and backward), `cg_bsr`,
+  `chebyshev_bsr`, `richardson_bsr`, `power_iteration_bsr` or the
+  `jacobi_preconditioner_bsr` preconditioner lives on a `neuron` device
+  (dense, or a CSR / COO / BSR matrix's values), the operands are copied to
+  the host, host torch computes at float64, and the result returns to the
+  dense operand's device in float64, with one `UserWarning` per op ("float64
+  on the neuron device is computed on the host for float64 accuracy (device
+  arithmetic is fp32); pass float32 to stay on device").
+  `TRNSPARSE_FP64_ON_DEVICE=1` keeps device aten (fp32 precision, no
+  copies). Host-resident float64, explicit `nki`, REQUIRE_NKI and the
+  pytorch backend are unchanged; the fused solvers already ran float64 on
+  the host.
+
 ### Fixed
 
 - **No NKI kernel is reached with an operand dtype it does not take** (one
