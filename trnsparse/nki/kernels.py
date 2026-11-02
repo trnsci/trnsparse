@@ -245,15 +245,16 @@ if HAS_NKI:
         Returns:
             tile_max:         (M_tiles, K_max, 128) — per-block row-wise max
             tile_sumexp:      (M_tiles, K_max, 128) — per-block stable exp-sum
+
+        Q and K share a dtype (fp32 or bf16). The scores and the statistics are
+        fp32 either way, as in the static kernels (#49).
         """
         M_tiles, K_max, _, _ = k_gathered_pad.shape
         _, _, head_dim = q_scaled_blocks.shape
 
-        tile_max = nl.ndarray(
-            (M_tiles, K_max, _TILE_M, 1), dtype=q_scaled_blocks.dtype, buffer=nl.shared_hbm
-        )
+        tile_max = nl.ndarray((M_tiles, K_max, _TILE_M, 1), dtype=nl.float32, buffer=nl.shared_hbm)
         tile_sumexp = nl.ndarray(
-            (M_tiles, K_max, _TILE_M, 1), dtype=q_scaled_blocks.dtype, buffer=nl.shared_hbm
+            (M_tiles, K_max, _TILE_M, 1), dtype=nl.float32, buffer=nl.shared_hbm
         )
 
         for m in nl.affine_range(M_tiles):
@@ -305,6 +306,11 @@ if HAS_NKI:
         For head_dim > 128: K-tiling — Q/K loaded in TILE_K=128 chunks per ki.
         The weights @ V accumulation (K=128 block dim) is unchanged for all head_dims.
 
+        Precision (#49): Q, K and V share a dtype (fp32 or bf16); row_max and
+        row_denom are fp32. Scores, softmax weights and PSUM are fp32; the
+        weights are rounded to V's dtype for the weights @ V matmul (both
+        nc_matmul operands must be fp32, or neither), as in the static kernel.
+
         Shapes:
             q_scaled_blocks:  (M_tiles, 128, head_dim)
             k_gathered_pad:   (M_tiles, K_max, 128, head_dim)
@@ -315,6 +321,7 @@ if HAS_NKI:
             out:              (M_tiles * 128, head_dim)
         """
         M_tiles, K_max, _, head_dim = k_gathered_pad.shape
+        vdt = v_gathered_pad.dtype
 
         out = nl.ndarray(
             (M_tiles * _TILE_M, head_dim), dtype=q_scaled_blocks.dtype, buffer=nl.shared_hbm
@@ -357,8 +364,9 @@ if HAS_NKI:
 
                 # NKI 0.3.0: nl.transpose gives PSUM which nc_matmul rejects as stationary.
                 # Round-trip weights through HBM so load_transpose2d produces SBUF.
-                _wh = nl.ndarray((_TILE_M, _TILE_M), dtype=weights.dtype, buffer=nl.shared_hbm)
-                nl.store(_wh, value=weights)
+                # Rounded to V's dtype: nc_matmul takes fp32 operands only in pairs.
+                _wh = nl.ndarray((_TILE_M, _TILE_M), dtype=vdt, buffer=nl.shared_hbm)
+                nl.store(_wh, value=_cast(weights, vdt, nl.float32))
                 weights_t = nl.load_transpose2d(_wh)  # (128,128) SBUF — stationary for nc_matmul
                 nisa.nc_matmul(out_psum, weights_t, v_tile, accumulate=True)
 
@@ -400,8 +408,13 @@ if HAS_NKI:
             row_denom:        (M_tiles, 128)
         Returns:
             dQ:               (M_tiles * 128, head_dim)
+
+        Precision (#49): Q, K, V and dO share a dtype (fp32 or bf16); the
+        statistics and D are fp32. P, dP and dS are fp32; dS is rounded to
+        K's dtype for the dS @ K matmul, as in the static kernel.
         """
         M_tiles, K_max, _, head_dim = k_gathered_pad.shape
+        kdt = k_gathered_pad.dtype
 
         dQ = nl.ndarray(
             (M_tiles * _TILE_M, head_dim), dtype=q_scaled_blocks.dtype, buffer=nl.shared_hbm
@@ -469,8 +482,8 @@ if HAS_NKI:
                 dS = nl.multiply(P, nl.subtract(dP, d_m))
 
                 # Round-trip dS through HBM so load_transpose2d gives SBUF stationary.
-                _dsh = nl.ndarray((_TILE_M, _TILE_M), dtype=dS.dtype, buffer=nl.shared_hbm)
-                nl.store(_dsh, value=dS)
+                _dsh = nl.ndarray((_TILE_M, _TILE_M), dtype=kdt, buffer=nl.shared_hbm)
+                nl.store(_dsh, value=_cast(dS, kdt, nl.float32))
                 dS_t = nl.load_transpose2d(_dsh)  # SBUF (transposed) — stationary
                 nisa.nc_matmul(dq_psum, dS_t, k_sbuf, accumulate=True)
 
@@ -512,8 +525,14 @@ if HAS_NKI:
         Returns:
             dK: (N_col * 128, head_dim)
             dV: (N_col * 128, head_dim)
+
+        Precision (#49): K, V, Q and dO share a dtype (fp32 or bf16); the
+        statistics and D are fp32. P and dS are fp32 and are rounded to the
+        operand dtype as the stationary operands of dS^T @ Q and P^T @ dO,
+        as in the static kernel.
         """
         N_col, K_max_col, _, head_dim = q_gathered_col.shape
+        qdt = q_gathered_col.dtype
 
         dK = nl.ndarray((N_col * _TILE_M, head_dim), dtype=k_blocks.dtype, buffer=nl.shared_hbm)
         dV = nl.ndarray((N_col * _TILE_M, head_dim), dtype=k_blocks.dtype, buffer=nl.shared_hbm)
@@ -584,10 +603,10 @@ if HAS_NKI:
                 dS = nl.multiply(P, nl.subtract(dP, d_mi))
 
                 # nc_matmul(dS, q_sbuf) = dS.T @ Q_m (scale baked into q_gathered_col)
-                nisa.nc_matmul(dk_psum, dS, q_sbuf, accumulate=True)
+                nisa.nc_matmul(dk_psum, _cast(dS, qdt, nl.float32), q_sbuf, accumulate=True)
 
                 # nc_matmul(P, do_sbuf) = P.T @ dO_m
-                nisa.nc_matmul(dv_psum, P, do_sbuf, accumulate=True)
+                nisa.nc_matmul(dv_psum, _cast(P, qdt, nl.float32), do_sbuf, accumulate=True)
 
             _dkp = nl.ndarray((_TILE_M, head_dim), dtype=nl.float32)
             _dkn = nl.ndarray((_TILE_M, head_dim), dtype=nl.float32)

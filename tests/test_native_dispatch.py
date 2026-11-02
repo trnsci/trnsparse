@@ -841,6 +841,62 @@ class TestNativePathOnCpu:
         torch.testing.assert_close(A.blocks.grad, blocks_ref.grad, atol=1e-3, rtol=1e-4)
         torch.testing.assert_close(B.grad, B_ref.grad, atol=1e-3, rtol=1e-4)
 
+    @pytest.mark.parametrize(
+        "a_dtype, b_dtype",
+        [
+            (torch.complex64, torch.complex64),
+            (torch.complex128, torch.complex128),
+            (torch.complex64, torch.float32),
+            (torch.float32, torch.complex64),
+        ],
+    )
+    @pytest.mark.parametrize("static", [True, False])
+    def test_bsr_spmm_complex_keeps_imaginary_part(
+        self, cpu_native, monkeypatch, a_dtype, b_dtype, static
+    ):
+        """Through 0.12.1 the static kernel path cast complex operands to fp32 (#78)."""
+        monkeypatch.setattr(dispatch, "_STATIC_STRUCTURE", static)
+        g = torch.Generator().manual_seed(12)
+
+        def rnd(*shape, dtype):
+            if dtype.is_complex:
+                return torch.complex(
+                    torch.randn(*shape, generator=g, dtype=torch.float64),
+                    torch.randn(*shape, generator=g, dtype=torch.float64),
+                ).to(dtype)
+            return torch.randn(*shape, generator=g, dtype=torch.float64).to(dtype)
+
+        dense = rnd(256, 384, dtype=a_dtype)
+        dense[:128, 128:] = 0
+        A = trnsparse.BSRMatrix.from_dense(dense, block_size=P)
+        B = rnd(384, 5, dtype=b_dtype)
+        C = trnsparse.bsr_spmm(A, B)
+        want = dense.to(torch.complex128) @ B.to(torch.complex128)
+        assert C.dtype == torch.promote_types(a_dtype, b_dtype)
+        err = (C.to(torch.complex128) - want).abs().max() / want.abs().max()
+        assert err < 1e-5, err
+
+    def test_bsr_spmm_complex_grad(self, cpu_native):
+        g = torch.Generator().manual_seed(13)
+        dense = torch.complex(
+            torch.randn(128, 256, generator=g), torch.randn(128, 256, generator=g)
+        )
+        A = trnsparse.BSRMatrix.from_dense(dense, block_size=P)
+        A.blocks.requires_grad_(True)
+        B = torch.complex(torch.randn(256, 3, generator=g), torch.randn(256, 3, generator=g))
+        B.requires_grad_(True)
+        trnsparse.bsr_spmm(A, B).abs().square().sum().backward()
+        blocks_ref = A.blocks.detach().clone().requires_grad_(True)
+        B_ref = B.detach().clone().requires_grad_(True)
+        ref = trnsparse.BSRMatrix(
+            blocks_ref, A.block_col_indices, A.block_row_ptrs, A.shape, A.block_size
+        )
+        from trnsparse.ops import _bsr_spmm_pytorch
+
+        _bsr_spmm_pytorch(ref, B_ref).abs().square().sum().backward()
+        torch.testing.assert_close(A.blocks.grad, blocks_ref.grad, atol=1e-3, rtol=1e-4)
+        torch.testing.assert_close(B.grad, B_ref.grad, atol=1e-3, rtol=1e-4)
+
     def test_bsr_spmm_static_is_default_and_gather_path_still_works(self, cpu_native, monkeypatch):
         g = torch.Generator().manual_seed(11)
         dense = torch.randn(256, 384, generator=g)
