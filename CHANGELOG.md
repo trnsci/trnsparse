@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`from_scipy` downcast float64 and integer matrices to float32** (silent,
+  #69). Every real scipy matrix was stored as float32 (float64 rounded to
+  ~3e-8 relative error; int64 exact only up to 2^24) and complex128 as
+  complex64, which contradicted the "zero-copy" description in
+  docs/migration_scipy.md. The values now keep the scipy dtype, and for CSR
+  input share memory with `sp_matrix.data`. Affects 0.1.1 through 0.13.0.
+  **Behaviour change:** float64 scipy input now gives a float64 matrix, so
+  mixing it with float32 vectors (`spmv(from_scipy(M64), x32)`) raises the
+  usual torch dtype-mismatch error; cast one side (`M.astype(np.float32)`).
+  docs/migration_scipy.md no longer refers to a nonexistent `.to_scipy()`.
+
 ## [0.13.0] — 2026-11-02
 
 Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
