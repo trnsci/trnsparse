@@ -145,3 +145,33 @@ class TestSparsityStats:
         assert "n_shells" in stats
         assert "significant_pairs" in stats
         assert "pair_sparsity" in stats
+
+
+class TestScreenedTileStructure:
+    """Host tile classification for the tile-skipping screened SpMM (#61)."""
+
+    @pytest.mark.parametrize("n", [128, 300, 1000])
+    @pytest.mark.parametrize("seed", [0, 1])
+    def test_classification_is_exact(self, n, seed):
+        from trnsparse.nki.dispatch import screened_tile_structure
+
+        g = torch.Generator().manual_seed(seed)
+        Q = torch.exp(-6 * torch.rand(n, generator=g))
+        tau = float(torch.median(torch.outer(Q, Q)))
+        row_ptrs, cols, partial, frac = screened_tile_structure(Q, tau, n)
+        mask = torch.outer(Q, Q) > tau
+        nt = (n + 127) // 128
+        kept = {}
+        for m in range(nt):
+            for i in range(row_ptrs[m], row_ptrs[m + 1]):
+                kept[(m, cols[i])] = partial[i]
+        for m in range(nt):
+            for k in range(nt):
+                t = mask[m * 128 : (m + 1) * 128, k * 128 : (k + 1) * 128]
+                if (m, k) not in kept:
+                    assert not t.any()  # skipped: every element screened out
+                elif kept[(m, k)]:
+                    assert t.any() and not t.all()  # partial: mixed
+                else:
+                    assert t.all()  # full: nothing screened
+        assert frac == len(cols) / nt**2

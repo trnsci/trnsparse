@@ -97,6 +97,20 @@ def _cases():
         (0, 2, 2, 3),
         (0, 2, 2),
     )
+    # Screened SpMM with tile skipping (#61): an empty block row, a full
+    # tile and partial tiles, N <= 512 and N > 512.
+    from trnsparse.nki import kernels as _kn
+
+    skey = _kn.register_structure((0, 2, 2, 3), (0, 2, 1), (1, 0, 1))
+    for width in (128, 1024):
+        cases[("_screened_tiles_keyed_kernel", f"n{width}")] = lambda width=width: (
+            _f32(3 * _P, 3 * _P),
+            np.abs(_f32(3 * _P, 1)),
+            np.abs(_f32(1, 3 * _P)),
+            np.full((_P, 1), 0.5, dtype=np.float32),
+            _f32(3 * _P, width),
+            skey,
+        )
     for hd in (64, 128):
         cases[("_attn_fwd_static_kernel", f"hd{hd}")] = lambda hd=hd: (
             _f32(hd, 3 * _P),
@@ -283,6 +297,23 @@ def _static_lnc2_cases():
         for w in (128, 512):
             cases[("_bsr_spmm_t_keyed_kernel", f"groups-n{w}-{dtype}")] = (
                 lambda mk=mk, gkey=gkey, w=w, nb=len(gc): (mk(_P, nb * _P), mk(8 * _P, w), gkey)
+            )
+        # Screened tile skipping (#61): 10 block rows, two row groups, an
+        # empty row, full and partial tiles (bounds and tau are arguments).
+        s_rows = [[] if m == 4 else sorted({m, (m + 1) % 10, 0}) for m in range(10)]
+        sp = tuple([0] + list(np.cumsum([len(r) for r in s_rows])))
+        sc = tuple(c for r in s_rows for c in r)
+        skey = register_structure(sp, sc, tuple(i % 2 for i in range(len(sc))))
+        for w in (128, 1024):
+            cases[("_screened_tiles_keyed_kernel", f"groups-n{w}-{dtype}")] = (
+                lambda mk=mk, skey=skey, w=w: (
+                    mk(10 * _P, 10 * _P),
+                    np.abs(_f32(10 * _P, 1)),
+                    np.abs(_f32(1, 10 * _P)),
+                    np.full((_P, 1), 0.5, dtype=np.float32),
+                    mk(10 * _P, w),
+                    skey,
+                )
             )
         akey = register_structure((0, 2, 2, 5), (0, 1, 0, 1, 2))
         cases[("_attn_fwd_keyed_kernel", f"hd64-{dtype}")] = lambda mk=mk, akey=akey: (
