@@ -22,6 +22,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - README: known platform issue note for #1454.
 ### Fixed
 
+- **`block_sparse_attention_tiled` accepted a mask smaller than `seq_len` on
+  the NKI path** (silent, #82). With a `(256, 256)` mask and `seq_len = 384`,
+  the native `bsr_attn` op returned output rows 256..383 that no mask block
+  covers (garbage values, no error). The PyTorch path raised an opaque
+  `IndexError`. Every backend now raises `ValueError` unless
+  `mask_bsr.shape == (Q rows, K rows)` and K and V have the same length.
+  Affects 0.10.0 through 0.12.1. Found by the round-3 device harness on Trn2
+  (trnsci/trnsci#35).
 - **`bsr_diagonal` returned length m for a tall matrix** (silent; every
   release 0.3.2–0.12.1, every backend). For a rectangular (m, n) BSR matrix
   with m > n the result was zero-padded to length m; it now has length
