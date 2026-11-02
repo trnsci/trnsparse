@@ -533,6 +533,66 @@ class TestCgBsrFused:
         assert max(loads) <= 13 < 33  # i % 4 puts 30 + 3 blocks on group 0
 
 
+class TestFusedSolverDtypes:
+    """Complex / integer / bool inputs raise TypeError on every backend (#85).
+
+    Through 0.13.0 the fused solvers packed everything into real float tiles:
+    complex inputs lost their imaginary part and integer / bool results were
+    truncated to b's dtype.
+    """
+
+    BAD = [torch.complex64, torch.complex128, torch.int64, torch.int32, torch.bool]
+
+    @pytest.fixture(params=["auto", "pytorch", "nki"])
+    def backend(self, request):
+        prev = trnsparse.get_backend()
+        try:
+            trnsparse.set_backend(request.param)
+        except RuntimeError as e:  # nki not installed
+            pytest.skip(str(e))
+        yield request.param
+        trnsparse.set_backend(prev)
+
+    @staticmethod
+    def _A(dtype=torch.float64):
+        return trnsparse.BSRMatrix.from_dense(_block_spd(1).to(dtype), block_size=128)
+
+    @pytest.mark.parametrize("dtype", BAD, ids=str)
+    def test_cg_b(self, backend, dtype):
+        with pytest.raises(TypeError, match="b must be a real floating-point"):
+            trnsparse.cg_bsr_fused(self._A(), torch.ones(128, dtype=dtype))
+
+    @pytest.mark.parametrize("dtype", BAD, ids=str)
+    def test_cg_x0(self, backend, dtype):
+        b = torch.ones(128, dtype=torch.float64)
+        with pytest.raises(TypeError, match="x0 must be a real floating-point"):
+            trnsparse.cg_bsr_fused(self._A(), b, x0=torch.zeros(128, dtype=dtype))
+
+    @pytest.mark.parametrize("dtype", [torch.complex128, torch.int64], ids=str)
+    def test_cg_A(self, backend, dtype):
+        b = torch.ones(128, dtype=torch.float64)
+        with pytest.raises(TypeError, match="A.blocks must be a real floating-point"):
+            trnsparse.cg_bsr_fused(self._A(dtype), b)
+        with pytest.raises(TypeError, match="A.blocks must be a real floating-point"):
+            trnsparse.prepare_cg_bsr(self._A(dtype))
+
+    @pytest.mark.parametrize("dtype", BAD, ids=str)
+    def test_power_v0(self, backend, dtype):
+        with pytest.raises(TypeError, match="v0 must be a real floating-point"):
+            trnsparse.power_iteration_bsr_fused(self._A(), v0=torch.ones(128, dtype=dtype))
+
+    @pytest.mark.parametrize("dtype", [torch.complex128, torch.int64], ids=str)
+    def test_power_A(self, backend, dtype):
+        with pytest.raises(TypeError, match="A.blocks must be a real floating-point"):
+            trnsparse.power_iteration_bsr_fused(self._A(dtype))
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float64], ids=str)
+    def test_real_float_still_runs(self, dtype):
+        A = self._A(dtype)
+        x, _, _ = trnsparse.cg_bsr_fused(A, torch.ones(128, dtype=dtype), tol=1e-6)
+        assert x.dtype == dtype
+
+
 class TestPowerIterationFused:
     def test_matches_power_iteration_bsr(self):
         A = _block_spd(3, seed=20)
