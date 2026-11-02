@@ -97,7 +97,7 @@ class TestFromScipy:
         sp = pytest.importorskip("scipy.sparse")
         M = sp.random(15, 11, density=0.4, random_state=0, format="csr")
         M = (M + 1j * sp.random(15, 11, density=0.4, random_state=1, format="csr")).tocsr()
-        A = trnsparse.from_scipy(M)
+        A = trnsparse.from_scipy(M.astype(np.complex64))
         assert A.dtype == torch.complex64
         np.testing.assert_allclose(A.to_dense().numpy(), M.toarray(), rtol=1e-6, atol=1e-6)
         x = np.random.default_rng(2).standard_normal(11).astype(np.complex64)
@@ -105,9 +105,35 @@ class TestFromScipy:
             trnsparse.spmv(A, torch.from_numpy(x)).numpy(), M @ x, rtol=1e-5, atol=1e-5
         )
 
-    def test_real_stays_float32(self):
+    def test_float32_stays_float32(self):
         sp = pytest.importorskip("scipy.sparse")
-        M = sp.random(6, 6, density=0.5, random_state=3, format="csr")
+        M = sp.random(6, 6, density=0.5, random_state=3, format="csr", dtype=np.float32)
         A = trnsparse.from_scipy(M)
         assert A.dtype == torch.float32
         np.testing.assert_allclose(A.to_dense().numpy(), M.toarray(), rtol=1e-6)
+
+    @pytest.mark.parametrize("npdt", [np.float64, np.int64, np.int32, np.complex128])
+    def test_preserves_dtype_exactly(self, npdt):
+        # Through 0.13.0 every real input was stored as float32 (rounding
+        # float64, and int64 above 2**24), and complex as complex64 (#69).
+        sp = pytest.importorskip("scipy.sparse")
+        M = sp.random(9, 7, density=0.5, random_state=4, format="csr") * 1e9
+        if np.issubdtype(npdt, np.complexfloating):
+            M = M + 1j * M
+        M = (M + sp.eye(9, 7) * (1 / 3)).astype(npdt).tocsr()
+        A = trnsparse.from_scipy(M)
+        assert A.dtype == torch.from_numpy(M.data).dtype
+        np.testing.assert_array_equal(A.to_dense().numpy(), M.toarray())
+
+    def test_csr_float64_is_zero_copy(self):
+        sp = pytest.importorskip("scipy.sparse")
+        M = sp.random(8, 8, density=0.4, random_state=5, format="csr")
+        A = trnsparse.from_scipy(M)
+        assert np.shares_memory(A.values.numpy(), M.data)
+
+    def test_other_formats_copy(self):
+        sp = pytest.importorskip("scipy.sparse")
+        M = sp.random(8, 8, density=0.4, random_state=6, format="coo")
+        A = trnsparse.from_scipy(M)
+        assert A.dtype == torch.float64
+        np.testing.assert_array_equal(A.to_dense().numpy(), M.toarray())
