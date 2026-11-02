@@ -841,6 +841,13 @@ class TestNativePathOnCpu:
         torch.testing.assert_close(A.blocks.grad, blocks_ref.grad, atol=1e-3, rtol=1e-4)
         torch.testing.assert_close(B.grad, B_ref.grad, atol=1e-3, rtol=1e-4)
 
+    def test_attention_rejects_mask_smaller_than_seq_len(self, cpu_native):
+        """The native `bsr_attn` path accepted a (256, 256) mask for seq_len 384 (#82)."""
+        Q = K = V = torch.randn(384, 16)
+        mask = trnsparse.BSRMatrix.from_dense(torch.ones(256, 256), block_size=P)
+        with pytest.raises(ValueError, match="must be"):
+            trnsparse.block_sparse_attention_tiled(Q, K, V, mask)
+
     def test_bsr_spmm_static_is_default_and_gather_path_still_works(self, cpu_native, monkeypatch):
         g = torch.Generator().manual_seed(11)
         dense = torch.randn(256, 384, generator=g)

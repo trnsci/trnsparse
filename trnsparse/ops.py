@@ -822,6 +822,14 @@ def block_sparse_attention_tiled(
             f"block_sparse_attention_tiled needs seq_len ({seq_len}) to be a "
             f"multiple of mask_bsr.block_size ({b})"
         )
+    if tuple(mask_bsr.shape) != (seq_len, K.shape[0]) or K.shape[0] != V.shape[0]:
+        # The native NKI path accepted a smaller mask and returned garbage in
+        # the rows it does not cover; PyTorch raised an opaque IndexError (#82).
+        raise ValueError(
+            f"block_sparse_attention_tiled: mask_bsr.shape {tuple(mask_bsr.shape)} must be "
+            f"(Q rows, K rows) = ({seq_len}, {K.shape[0]}), and K and V must have the "
+            f"same number of rows (got {K.shape[0]} and {V.shape[0]})"
+        )
 
     if scale is None:
         scale = head_dim**-0.5
