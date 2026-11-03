@@ -844,13 +844,45 @@ def test_fp64_on_device_env_flag(value, expect):
     assert out.stdout.strip() == str(expect)
 
 
-@pytest.mark.parametrize("api,dtype", [("spmm", torch.float64), ("bsr_spmm", torch.complex128)])
-def test_fp64_on_device_require_nki_still_raises(monkeypatch, api, dtype):
-    log, tr = _fake_neuron(monkeypatch, require=True)
+@pytest.mark.parametrize("override", [False, True], ids=["default", "fp64_on_device"])
+@pytest.mark.parametrize("backend", ["auto", "nki"])
+@pytest.mark.parametrize("api,dtype", DEVICE_CASES, ids=DEVICE_IDS)
+def test_fp64_on_device_require_nki_raises(monkeypatch, api, dtype, backend, override):
+    """TRNSPARSE_REQUIRE_NKI=1: a float64 / complex128 operand on the neuron
+    device raises NotImplementedError at every public op, on routes with a
+    kernel and without one (CSR spmv / spmv_symmetric / spmm used to run
+    device aten at fp32 precision with no error), before any host copy or
+    kernel call, and over TRNSPARSE_FP64_ON_DEVICE=1."""
+    log, tr = _fake_neuron(monkeypatch, backend=backend, require=True, on_device=override)
     fn, args = _device_case(api, dtype)
-    with pytest.raises(NotImplementedError, match="float64|complex128"):
-        fn(*_on_device(args))
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with pytest.raises(NotImplementedError, match="float64|complex128"):
+            fn(*_on_device(args))
     assert tr.to_host == [] and log.calls == []
+    assert not _host_warnings(caught)
+
+
+@pytest.mark.parametrize("api", ["spmv", "spmv_symmetric"])
+def test_require_nki_host_fp64_and_device_fp32_unchanged(monkeypatch, api):
+    """The device refusal adds nothing for host float64: on a route with no
+    kernel (CSR spmv) it still runs in host torch; device fp32 still runs.
+    (Host float64 on a kernel route keeps its existing refusal.)"""
+    _, tr = _fake_neuron(monkeypatch, require=True)
+    fn, args = _device_case(api, torch.float64)
+    out, ws = _call(fn, args)
+    assert out.dtype == torch.float64 and tr.to_host == [] and not ws
+    fn, args = _device_case(api, torch.float32)
+    out, _ = _call(fn, _on_device(args))
+    assert out.dtype == torch.float32 and tr.to_host == []
+
+
+def test_require_nki_pytorch_backend_unchanged(monkeypatch):
+    """The pytorch backend is not an NKI backend: REQUIRE_NKI does not refuse."""
+    _, tr = _fake_neuron(monkeypatch, backend="pytorch", require=True)
+    fn, args = _device_case("spmv", torch.float64)
+    out, _ = _call(fn, _on_device(args))
+    assert out.dtype == torch.float64 and tr.to_host == []
 
 
 def test_fp64_on_device_explicit_nki_unchanged(monkeypatch):

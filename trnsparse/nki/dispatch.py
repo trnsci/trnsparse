@@ -322,7 +322,8 @@ def _kernel_route(what: str, *tensors: torch.Tensor) -> bool:
 # the host that is host torch; on the `neuron` device the torch fallback
 # would be device aten, which computes float64 at fp32 precision. So every
 # public op is wrapped in `_fp64_host_guard`: under `auto` (not
-# TRNSPARSE_REQUIRE_NKI, which keeps raising, and not
+# TRNSPARSE_REQUIRE_NKI, which raises for such operands first, on every
+# route, `_refuse_device_fp64`; and not
 # TRNSPARSE_FP64_ON_DEVICE), a float64 / complex128 tensor operand on a
 # `neuron` device (directly, or as a CSR / COO / BSR container's values)
 # sends the whole call to the host: neuron-resident operands are copied to
@@ -417,11 +418,44 @@ def _warn_fp64_host(op: str, stacklevel: int = 3) -> None:
     )
 
 
+def _refuse_device_fp64(op: str, operands) -> None:
+    """Under TRNSPARSE_REQUIRE_NKI (backends `auto` and `nki`), a float64 /
+    complex128 operand on the `neuron` device raises `NotImplementedError`:
+    no kernel gives float64 accuracy there, and the routes without a kernel
+    would compute it in device aten at fp32 precision. Raised before any host
+    copy, kernel or device aten, and over TRNSPARSE_FP64_ON_DEVICE=1."""
+    if not _REQUIRE_NKI or _backend == "pytorch":
+        return
+    wide = sorted(
+        {
+            str(t.dtype)
+            for x in operands
+            for t in _operand_tensors(x)
+            if t.dtype in _FP64_DTYPES and _on_neuron_device(t)
+        }
+    )
+    if wide:
+        raise NotImplementedError(
+            f"trnsparse {op}: no NKI kernel computes {', '.join(wide)} on the neuron "
+            "device at float64 accuracy (device arithmetic is fp32). Unset "
+            "TRNSPARSE_REQUIRE_NKI to compute on the host at float64 accuracy, or "
+            "pass float32."
+        )
+
+
 def _fp64_device_on_host(op: str) -> bool:
     """True, with the one-time warning, when float64 bound for the neuron
     device computes on the host instead: backend `auto`, no
     TRNSPARSE_REQUIRE_NKI, no TRNSPARSE_FP64_ON_DEVICE. For a route that
-    `_fp64_host_guard` cannot see (`KernelOperator` keeps its operands)."""
+    `_fp64_host_guard` cannot see (`KernelOperator` keeps its operands).
+    Under TRNSPARSE_REQUIRE_NKI (backends `auto` / `nki`) NotImplementedError."""
+    if _REQUIRE_NKI and _backend != "pytorch":
+        raise NotImplementedError(
+            f"trnsparse {op}: no NKI kernel computes torch.float64 on the neuron "
+            "device at float64 accuracy (device arithmetic is fp32). Unset "
+            "TRNSPARSE_REQUIRE_NKI to compute on the host at float64 accuracy, or "
+            "pass float32."
+        )
     if _backend != "auto" or _REQUIRE_NKI or _FP64_ON_DEVICE:
         return False
     _warn_fp64_host(op, stacklevel=4)
@@ -440,9 +474,10 @@ def _fp64_host_guard(op: str):
     def deco(fn):
         @functools.wraps(fn)
         def wrapper(*args, **kwargs):
+            operands = (*args, *kwargs.values())
+            _refuse_device_fp64(op, operands)
             if _backend != "auto" or _REQUIRE_NKI or _FP64_ON_DEVICE:
                 return fn(*args, **kwargs)
-            operands = (*args, *kwargs.values())
             if not any(
                 t.dtype in _FP64_DTYPES and _on_neuron_device(t)
                 for x in operands

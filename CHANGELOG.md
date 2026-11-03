@@ -151,9 +151,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on the neuron device is computed on the host for float64 accuracy (device
   arithmetic is fp32); pass float32 to stay on device").
   `TRNSPARSE_FP64_ON_DEVICE=1` keeps device aten (fp32 precision, no
-  copies). Host-resident float64, explicit `nki`, REQUIRE_NKI and the
-  pytorch backend are unchanged; the fused solvers already ran float64 on
-  the host.
+  copies). Host-resident float64, explicit `nki` and the pytorch backend
+  are unchanged; the fused solvers already ran float64 on the host.
+  **`TRNSPARSE_REQUIRE_NKI=1` raises for float64 / complex128 on the neuron
+  device** at every public op (backends `auto` and `nki`, also with
+  `TRNSPARSE_FP64_ON_DEVICE=1`), before any host copy or kernel. Before, the
+  routes with no kernel (CSR `spmv`, `spmv_symmetric`, `spmm`, the Jacobi
+  preconditioner) ran device aten at fp32 precision with no error under
+  REQUIRE_NKI and `auto` (Trn2 conformance: `test_spmv[float64-*]` rel err
+  1e-8..2e-7 against the 1e-10 tolerance).
 
   `kernel_matmul` / `KernelOperator` (#93, new in this release) follow the
   same rules through `dispatch._fp64_route`: under REQUIRE_NKI float64 now

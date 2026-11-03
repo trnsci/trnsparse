@@ -222,9 +222,15 @@ operands once, not once per iteration. The fused solvers `cg_bsr_fused` /
 To keep float64 on the device anyway (faster, fp32 precision), set
 `TRNSPARSE_FP64_ON_DEVICE=1`: device-resident float64 then runs in device
 aten, without copies or the warning. The explicit `set_backend("nki")`
-cast, `TRNSPARSE_REQUIRE_NKI=1`, the pytorch backend and host-resident
-float64 are not affected. float32, bf16 and fp16 operands on the device
-stay on the device.
+cast, the pytorch backend and host-resident float64 are not affected.
+float32, bf16 and fp16 operands on the device stay on the device.
+
+Under `TRNSPARSE_REQUIRE_NKI=1` (backends `auto` and `nki`), a float64 /
+complex128 operand on the `neuron` device raises `NotImplementedError` at
+every public op, before any host copy or kernel, also with
+`TRNSPARSE_FP64_ON_DEVICE=1`: no kernel computes float64 at float64
+accuracy, and the routes without a kernel (CSR `spmv` / `spmv_symmetric` /
+`spmm`) would otherwise run device aten at fp32 precision with no error.
 
 ## Known limits
 
