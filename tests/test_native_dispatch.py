@@ -63,6 +63,9 @@ AUTOGRAD_OPS = {
     "screened_tiles_keyed",
 }
 COMPOSITE_OPS = {"bsr_attn", "bsr_attn_bwd"}
+# Fused kernel-matrix product (#93): tensors plus static `kind` / `group` ints.
+KMV_OPS = {"kmv_self", "kmv_cross"}
+STATIC_OPS |= KMV_OPS
 P = 128
 
 
@@ -572,6 +575,8 @@ class TestLazyRegistration:
             assert ret in ("Tensor", "(Tensor, Tensor)", "(Tensor, Tensor, Tensor)"), (name, schema)
             if name.split("::")[1] in KEYED_OPS:
                 assert re.search(r"(Sym)?[Ii]nt key[,)]", schema), (name, schema)
+            elif name.split("::")[1] in KMV_OPS:
+                assert re.search(r"(Sym)?[Ii]nt kind, (Sym)?[Ii]nt group\)", schema), (name, schema)
             elif name.split("::")[1] in STATIC_OPS:
                 # list[int] infers as SymInt[] (int[] on older torch).
                 assert re.search(r"(Sym)?[Ii]nt\[\] row_ptrs, (Sym)?[Ii]nt\[\] cols", schema), (

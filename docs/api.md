@@ -46,6 +46,40 @@
 `jacobi_preconditioner_bsr`, `bsr_diagonal`. See
 [Iterative solvers](iterative_solvers.md).
 
+## Kernel-matrix products (`kernel_matmul`, #93)
+
+`K(X, Y) @ V` without forming `K`, for stationary kernels of the distance:
+`"rbf"`, `"matern12"`, `"matern32"`, `"matern52"` (`trnsparse.KERNELS`).
+The operator of matrix-free Gaussian-process regression and kernel ridge
+regression.
+
+- `kernel_matmul(X, Y, V, kernel="rbf", lengthscale=1.0, outputscale=1.0, noise=0.0)`
+  — `Y=None` gives `(K(X, X) + noise I) @ V`. `lengthscale` is a float or a
+  `(d,)` tensor (per-dimension lengthscales). `V` is `(m,)` or `(m, R)`.
+- `KernelOperator(X, kernel, lengthscale, outputscale, noise, device=None)` —
+  prepares `X` once (centred, rescaled, fp32 on the device) for repeated
+  applications: `op(V)`, `op.cross(Y, W)` = `K(Y, X) @ W`, `op.diag()`,
+  `op.rows(idx)` (rows of `K` for pivoted-Cholesky preconditioners).
+- `kernel_matmul_reference(...)` — dense float64 `torch.cdist` reference.
+
+NKI path: one launch per application. Per 128 x 512 tile the squared
+distances are one TensorEngine matmul on augmented coordinates
+`[x, |x|^2, 1] . [-2y, 1, |y|^2]` into PSUM, the kernel function runs on
+ScalarE reading PSUM (`exp(a D + log s)` for RBF), and the product with `V`
+accumulates on the TensorEngine. Lengthscale, outputscale and noise are a
+tensor argument, so new hyperparameters do not recompile. Output rows are
+split over both physical cores (LNC=2); results are bit-identical at LNC=1
+and LNC=2 by construction (same Y-tile order). `d <= 126`.
+
+Precision: fp32, with inputs centred on the host. The distance expansion
+cancels for near-coincident points (relative error about
+`u (|x|^2 + |y|^2) / |x - y|^2`); the smooth kernels see that at first order,
+Matern-1/2 (a cusp at 0) as `sqrt(u |x|^2) / l`. float64 follows the suite
+policy: `auto` computes in torch float64, explicit `nki` casts with a
+warning, `TRNSPARSE_REQUIRE_NKI` raises. Env: `TRNSPARSE_KMV_GROUP` (Y tiles
+per loop body, default 4), `TRNSPARSE_NKI_EAGER_HANDLE=0` (custom op instead
+of the cached `wrap_nki` handle).
+
 ## Screening
 
 - `schwarz_bounds(shell_pair_integrals)` — Cauchy-Schwarz bounds $Q_{pq} = \sqrt{(pq|pq)}$
