@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0] — 2026-11-04
+
+Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
+
+Headline: `kernel_matmul` / `KernelOperator`, a fused kernel-matrix product for matrix-free GP and kernel methods (#93, #102, #103), cached eager NKI handles, and the trnsci float64 policy with a dtype guard at the kernel boundary; `cg_bsr` and `power_iteration_bsr` gradients and `from_scipy` dtypes fixed.
+
 ### Performance
 
 - **Eager NKI kernel calls skip the per-call handle rebuild and the custom-op
