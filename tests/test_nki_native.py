@@ -289,8 +289,10 @@ class TestEagerHandle:
             )
         return torch.equal(a, b) if isinstance(a, torch.Tensor) else a == b
 
-    def test_spmm_dense_handle_matches_op_and_is_cached(self, D):
+    def test_spmm_dense_handle_matches_op_and_is_cached(self, D, monkeypatch):
         from trnsparse.nki import kernels
+
+        monkeypatch.setattr(D, "_EAGER_HANDLE_ENABLED", True)
 
         g = torch.Generator().manual_seed(0)
         a, b = (t.to(DEV) for t in (torch.randn(256, 256, generator=g), torch.randn(256, 128)))
