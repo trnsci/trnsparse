@@ -31,6 +31,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`cg_bsr` raised `UnboundLocalError` with `max_iter=0` or on a first-step
+  breakdown, and reported `iters=max_iter` on any breakdown** (#71, #86).
+  `r_norm` was only assigned inside the loop, so `max_iter=0`, `A p = 0`
+  (e.g. a zero matrix) or `p . A p = 0` at k=0 (an exact `x0` with `tol=0`)
+  raised. A later breakdown (`|p . A p| < 1e-30`, e.g. after exact
+  convergence with `tol=0`) returned `iters = max_iter` (500 or 1000 for a
+  1-2 step solve). `cg_bsr` now returns the number of steps actually taken
+  and the residual of the returned `x`; `max_iter=0` gives
+  `(x0, 0, ||b - A x0|| / ||b||)`. Solutions are unchanged. Affects 0.3.2
+  through 0.13.0.
+- **`power_iteration_bsr` gave silently wrong gradients** (#96), as
+  `cg_bsr` did (#70). The norms were taken with `.item()`, so autograd
+  differentiated the iterations with frozen normalisation instead of the
+  eigenvector, and `v0` received a spurious gradient. The eigenvector now
+  differentiates as the exact unit eigenvector of `A` (implicit
+  differentiation of `A v = lam v`, `||v|| = 1`): backward solves a dense
+  bordered `(N+1) x (N+1)` system, so it costs O(N^3), and gives
+  `grad_A = -w v^T` on the stored blocks. `v0` gets no gradient, the
+  eigenvalue stays a Python float, and backward raises `NotImplementedError`
+  for complex `A`. Forward values are unchanged. Affects 0.3.2 through 0.13.0.
 - **`from_scipy` downcast float64 and integer matrices to float32** (silent,
   #69). Every real scipy matrix was stored as float32 (float64 rounded to
   ~3e-8 relative error; int64 exact only up to 2^24) and complex128 as

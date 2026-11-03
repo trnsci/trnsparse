@@ -86,6 +86,52 @@ class TestCgBsr:
         assert iters == 0
         assert rel == 0.0
 
+    def test_breakdown_on_first_step(self):
+        """p . A p = 0 at k=0 (A = 0): no step, x = x0, iters 0, rel 1 (#86)."""
+        A = trnsparse.BSRMatrix.from_dense(torch.zeros(128, 128), block_size=128)
+        b = torch.ones(128)
+        x, iters, rel = trnsparse.cg_bsr(A, b)
+        torch.testing.assert_close(x, torch.zeros(128))
+        assert iters == 0
+        assert rel == pytest.approx(1.0)
+
+    def test_exact_x0_with_zero_tol(self):
+        """x0 already solves A x = b and tol=0: breakdown at k=0 returns x0 (#71)."""
+        A = trnsparse.BSRMatrix.from_dense(2.0 * torch.eye(16, dtype=torch.float64), block_size=8)
+        b = torch.ones(16, dtype=torch.float64)
+        x0 = torch.full((16,), 0.5, dtype=torch.float64)
+        x, iters, rel = trnsparse.cg_bsr(A, b, x0=x0, tol=0.0, max_iter=50)
+        torch.testing.assert_close(x, x0)
+        assert iters == 0
+        assert rel == 0.0
+
+    def test_max_iter_zero(self):
+        """max_iter=0 returns (x0, 0, ||b - A x0|| / ||b||) (#71)."""
+        # Local generator: the global RNG state is left alone for other tests.
+        gen = torch.Generator().manual_seed(5)
+        Mr = torch.randn(64, 64, dtype=torch.float64, generator=gen)
+        Ad = Mr @ Mr.T + 64 * torch.eye(64, dtype=torch.float64)
+        A = trnsparse.BSRMatrix.from_dense(Ad, block_size=8)
+        b = torch.randn(64, dtype=torch.float64, generator=gen)
+        x0 = torch.randn(64, dtype=torch.float64, generator=gen)
+        x, iters, rel = trnsparse.cg_bsr(A, b, x0=x0, max_iter=0)
+        torch.testing.assert_close(x, x0)
+        assert iters == 0
+        ref = (torch.linalg.norm(b - Ad @ x0) / torch.linalg.norm(b)).item()
+        assert rel == pytest.approx(ref, rel=1e-12)
+
+    def test_breakdown_reports_steps_taken(self):
+        """A = I with tol=0: one step solves exactly, then p = 0 breaks down.
+
+        The reported count is the steps taken (1), not max_iter (#71).
+        """
+        A = trnsparse.BSRMatrix.from_dense(torch.eye(16, dtype=torch.float64), block_size=8)
+        b = torch.arange(1.0, 17.0, dtype=torch.float64)
+        x, iters, rel = trnsparse.cg_bsr(A, b, tol=0.0, max_iter=500)
+        torch.testing.assert_close(x, b)
+        assert iters == 1
+        assert rel == 0.0
+
 
 class TestCgBsrAutograd:
     """cg_bsr differentiates as the exact solve A^{-1} b (#70)."""
@@ -180,6 +226,91 @@ class TestPowerIterationBsr:
         # Power iteration on a random SPD matrix has a spectral gap;
         # 1e-3 relative tolerance is generous.
         assert abs(lam_ours - lam_ref) / lam_ref < 1e-3, f"ours={lam_ours}, ref={lam_ref}"
+
+
+class TestPowerIterationBsrAutograd:
+    """power_iteration_bsr differentiates as the exact unit eigenvector (#96)."""
+
+    N, BS = 24, 8
+
+    @staticmethod
+    def _gen(seed):
+        return torch.Generator().manual_seed(seed)
+
+    def _sym(self):
+        # Symmetric, dominant eigenvalue 20 with gap ratio 0.5: converges to
+        # machine precision well inside max_iter.
+        gen = self._gen(7)
+        Q = torch.linalg.qr(torch.randn(self.N, self.N, dtype=torch.float64, generator=gen))[0]
+        d = torch.linspace(1.0, 10.0, self.N, dtype=torch.float64)
+        d[-1] = 20.0
+        return Q @ torch.diag(d) @ Q.T
+
+    def _run(self, Ad, seed=1, v0_grad=False):
+        A = trnsparse.BSRMatrix.from_dense(Ad, block_size=self.BS)
+        blk = A.blocks.clone().requires_grad_()
+        A2 = trnsparse.BSRMatrix(blk, A.block_col_indices, A.block_row_ptrs, A.shape, self.BS)
+        v0 = torch.ones(self.N, dtype=torch.float64)
+        if v0_grad:
+            v0.requires_grad_()
+        lam, v, iters = trnsparse.power_iteration_bsr(A2, v0=v0, max_iter=2000, tol=0.0)
+        g = torch.randn(self.N, dtype=torch.float64, generator=self._gen(seed))
+        (v * g).sum().backward()
+        dense_grad = trnsparse.BSRMatrix(
+            blk.grad, A.block_col_indices, A.block_row_ptrs, A.shape, self.BS
+        ).to_dense()
+        return lam, v.detach(), g, dense_grad, v0
+
+    def test_grad_matches_eigh(self):
+        Ad = self._sym()
+        lam, v, g, G, _ = self._run(Ad)
+        Al = Ad.clone().requires_grad_()
+        _, V = torch.linalg.eigh(Al)
+        sign = torch.sign(torch.dot(V[:, -1].detach(), v))
+        ((sign * V[:, -1]) * g).sum().backward()
+        assert lam == pytest.approx(20.0, rel=1e-12)
+        # eigh differentiates w.r.t. symmetric perturbations: compare the
+        # symmetric part of the (unconstrained) gradient.
+        torch.testing.assert_close(0.5 * (G + G.T), Al.grad, rtol=1e-8, atol=1e-10)
+
+    def test_grad_nonsymmetric_vs_finite_difference(self):
+        Ad = self._sym() + 0.3 * torch.randn(
+            self.N, self.N, dtype=torch.float64, generator=self._gen(8)
+        )
+        _, v, g, G, _ = self._run(Ad)
+
+        def dominant(B):  # independent reference: dense eig, unit norm, sign-aligned
+            ev, V = torch.linalg.eig(B)
+            u = V[:, ev.abs().argmax()].real
+            u = u / torch.linalg.norm(u)
+            return u * torch.sign(torch.dot(u, v))
+
+        E = torch.randn(self.N, self.N, dtype=torch.float64, generator=self._gen(9))
+        h = 1e-6
+        fd = torch.dot(dominant(Ad + h * E) - dominant(Ad - h * E), g) / (2 * h)
+        assert (G * E).sum().item() == pytest.approx(fd.item(), rel=1e-6, abs=1e-9)
+
+    def test_no_grad_to_v0_and_values_unchanged(self):
+        Ad = self._sym()
+        A = trnsparse.BSRMatrix.from_dense(Ad, block_size=self.BS)
+        v0 = torch.ones(self.N, dtype=torch.float64)
+        ref = trnsparse.power_iteration_bsr(A, v0=v0, max_iter=50, tol=1e-9)
+        out = trnsparse.power_iteration_bsr(
+            A, v0=v0.clone().requires_grad_(), max_iter=50, tol=1e-9
+        )
+        assert out[1].requires_grad
+        assert (ref[0], ref[2]) == (out[0], out[2]) and torch.equal(ref[1], out[1].detach())
+        _, _, _, _, v0l = self._run(Ad, v0_grad=True)
+        assert v0l.grad is None
+
+    def test_complex_backward_raises(self):
+        Ad = torch.diag(torch.arange(1.0, 9.0, dtype=torch.float64)).to(torch.complex128)
+        A = trnsparse.BSRMatrix.from_dense(Ad, block_size=8)
+        blk = A.blocks.clone().requires_grad_()
+        A2 = trnsparse.BSRMatrix(blk, A.block_col_indices, A.block_row_ptrs, A.shape, 8)
+        _, v, _ = trnsparse.power_iteration_bsr(A2, v0=torch.ones(8, dtype=torch.complex128))
+        with pytest.raises(NotImplementedError, match="complex"):
+            v.real.sum().backward()
 
 
 class TestBsrDiagonal:

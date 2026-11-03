@@ -888,9 +888,6 @@ def test_cg_bsr_x0_and_zero_b():
     assert it == 0
 
 
-@pytest.mark.xfail(
-    strict=True, raises=UnboundLocalError, reason="trnsci/trnsparse#71: cg_bsr(max_iter=0) raises"
-)
 def test_cg_bsr_max_iter_zero():
     A, Ad = spd_bsr(64, 8)
     rhs = rand_vec((64,), torch.float64, 123)
@@ -900,9 +897,6 @@ def test_cg_bsr_max_iter_zero():
     assert rel == pytest.approx(1.0)
 
 
-@pytest.mark.xfail(
-    strict=True, reason="trnsci/trnsparse#71: on breakdown cg_bsr reports iters=max_iter"
-)
 def test_cg_bsr_breakdown_iteration_count():
     # tol=0 cannot be met; CG on n=8 converges exactly in <= 8 steps, then breaks down.
     A, Ad = spd_bsr(8, 4, band=2)
