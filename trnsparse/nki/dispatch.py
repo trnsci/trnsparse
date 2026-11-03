@@ -1793,12 +1793,17 @@ _EAGER_HANDLE = os.environ.get("TRNSPARSE_NKI_EAGER_HANDLE", "1").strip().lower(
     "no",
     "off",
 )
-_eager_handles: dict[int, tuple] = {}
+_eager_handles: dict[tuple, tuple] = {}
 
 
-def _eager_handle(kernel):
-    """Cached `torch_neuronx.wrap_nki(kernel)`, or None when unavailable."""
-    entry = _eager_handles.get(id(kernel))
+def _eager_handle(kernel, shapes=()):
+    """Cached `torch_neuronx.wrap_nki(kernel)` per (kernel, operand shapes), or None.
+
+    One handle per launch shape: a row-blocked product (#100) launches the
+    same block shape many times and reuses one handle for all of them.
+    """
+    key = (id(kernel), tuple(shapes))
+    entry = _eager_handles.get(key)
     if entry is not None:
         return entry[1]
     try:
@@ -1808,7 +1813,7 @@ def _eager_handle(kernel):
     except ImportError:
         wrap = None
     handle = wrap(kernel) if wrap is not None and hasattr(kernel, "func") else None
-    _eager_handles[id(kernel)] = (kernel, handle)
+    _eager_handles[key] = (kernel, handle)
     return handle
 
 
@@ -1821,6 +1826,37 @@ def _eager_ok(tensors) -> bool:
     )
 
 
+def _kmv_block_work() -> int:
+    """Per-launch budget in kernel entries, rows x m (`kernels._KMV_BLOCK_WORK`).
+
+    TRNSPARSE_KMV_BLOCK_WORK overrides it (tests force tiny blocks with it).
+    """
+    env = os.environ.get("TRNSPARSE_KMV_BLOCK_WORK", "").strip()
+    return max(1, int(float(env))) if env else _kernels._KMV_BLOCK_WORK
+
+
+def _kmv_launch(x, y, v, vn, params, kind: int, group: int, sim: bool) -> torch.Tensor:
+    """One kernel launch on operands already placed (device, or host for the simulator)."""
+    from . import kernels as _k
+
+    if y is None:
+        kernel, name, tensors = _k._kmv_self_kernel, "kmv_self", (x, v, params)
+    elif vn is None:
+        kernel, name, tensors = _k._kmv_cross_kernel, "kmv_cross", (x, y, v, params)
+    else:
+        kernel, name, tensors = _k._kmv_selfblk_kernel, "kmv_selfblk", (x, y, v, vn, params)
+    if sim:
+        out = nki.simulate(kernel)(*(_sim_np(t) for t in tensors), int(kind), int(group))
+        return _sim_torch(out, v.device)
+    if _get_dispatch_path() == "native":
+        shapes = tuple(tuple(t.shape) for t in tensors)
+        handle = _eager_handle(kernel, shapes) if _eager_ok(tensors) else None
+        if handle is not None:
+            return handle(*tensors, int(kind), int(group))
+        return _get_native_ops()[name](*tensors, int(kind), int(group))
+    return kernel(*tensors, int(kind), int(group))
+
+
 def nki_kernel_matmul(
     x: torch.Tensor,
     y: torch.Tensor | None,
@@ -1829,29 +1865,53 @@ def nki_kernel_matmul(
     kind: int,
     group: int,
 ) -> torch.Tensor:
-    """One launch of the fused kernel-matrix product (see `kernels._kmv_body`).
+    """The fused kernel-matrix product (see `kernels._kmv_body`), row-blocked.
 
     x (n, d), y (m, d) or None (Y = X, noise added), v (m, R) and params
     (128, 4) are fp32 and contiguous, prepared by `trnsparse.kernel_matmul`.
     The result is fp32 on v's device. Raises on any kernel-path failure;
     the caller decides whether to fall back.
-    """
-    from . import kernels as _k
 
-    self_op = y is None
-    kernel = _k._kmv_self_kernel if self_op else _k._kmv_cross_kernel
-    tensors = (x, v, params) if self_op else (x, y, v, params)
-    if _use_simulator():
-        out = nki.simulate(kernel)(*(_sim_np(t) for t in tensors), int(kind), int(group))
-        return _sim_torch(out, v.device)
-    xs, orig = _to_device(*tensors)
-    if _get_dispatch_path() == "native":
-        handle = _eager_handle(kernel) if _eager_ok(xs) else None
-        if handle is not None:
-            out = handle(*xs, int(kind), int(group))
-        else:
-            op = _get_native_ops()["kmv_self" if self_op else "kmv_cross"]
-            out = op(*xs, int(kind), int(group))
+    A product of more than `_kmv_block_work()` kernel entries (n * m)
+    runs as several launches over row blocks of x (`kernels.kmv_block_rows`),
+    so no launch reaches the runtime's 30 s execution timeout (#100). Below
+    the budget it is one launch, exactly as before. Rows of the product are
+    independent and each row runs the same instructions in a block as in one
+    launch, so the blocked result is bit-identical. The last, ragged block
+    is zero-padded to the block shape (padding rows are computed and
+    dropped): every launch has one shape, one compile and one cached handle.
+    """
+    n, d = x.shape
+    m = n if y is None else y.shape[0]
+    R = v.shape[1]
+    rows = _kernels.kmv_block_rows(n, m, _kmv_block_work())
+    sim = _use_simulator()
+    tensors = (x, v, params) if y is None else (x, y, v, params)
+    # Placed once: every block launch gets the same device Y, V and params,
+    # and its X (and noise) rows as views of the placed X (and V).
+    if sim:
+        placed, orig = list(tensors), v.device
     else:
-        out = kernel(*xs, int(kind), int(group))
+        placed, orig = _to_device(*tensors)
+    if y is None:
+        xs, vs, ps = placed
+        ys = None
+    else:
+        xs, ys, vs, ps = placed
+    if rows >= n:
+        return _kmv_launch(xs, ys, vs, None, ps, kind, group, sim).to(orig)
+
+    self_op = ys is None
+    yy = xs if self_op else ys
+    out = torch.empty(n, R, dtype=torch.float32, device=vs.device)
+    for i0 in range(0, n, rows):
+        nb = min(rows, n - i0)
+        xb = xs[i0 : i0 + nb]
+        vb = vs[i0 : i0 + nb] if self_op else None
+        if nb < rows:
+            xb = torch.cat([xb, xb.new_zeros(rows - nb, d)])
+            if self_op:
+                vb = torch.cat([vb, vb.new_zeros(rows - nb, R)])
+        ob = _kmv_launch(xb, yy, vs, vb, ps, kind, group, sim)
+        out[i0 : i0 + nb] = ob[:nb].to(out.device)
     return out.to(orig)

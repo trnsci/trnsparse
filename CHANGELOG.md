@@ -31,6 +31,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`kernel_matmul` no longer hits the Neuron runtime's 30 s execution
+  timeout at n >= 1e6** (#100). One launch at n = 2^20, R = 33 takes about
+  40 s at LNC=2 and 80 s at LNC=1 on Trn2 and failed with `NRT status 5`.
+  Products above 6e10 kernel entries (`n * m`; the rate is flat in R, so
+  the budget is not weighted by d + R) now run as host-side row blocks of
+  X: the fewest launches the budget allows, split into equal blocks of a
+  multiple of 1024 rows (19 launches of 55296 rows at n = m = 2^20, about
+  2.2 s each at LNC=2 and 4.5 s at LNC=1), R kept whole. Large blocks keep
+  the fixed per-launch cost (~75 ms, staging Y) near 1% of the run; Y, V
+  and params are placed on the device once for all blocks. The ragged last
+  block is zero-padded (less than 1024 rows per block), so every launch has
+  one shape, one compile and one cached `wrap_nki` handle (now keyed per
+  kernel and shape). Blocks of the square operator use a new
+  `_kmv_selfblk_kernel` (custom op `trnsparse::kmv_selfblk`) that adds
+  `noise * V` for the block's rows in the same fused epilogue, so blocked
+  results are bit-identical to one launch. Below the budget nothing
+  changes. `TRNSPARSE_KMV_BLOCK_WORK` overrides the budget.
+
 - **`cg_bsr` raised `UnboundLocalError` with `max_iter=0` or on a first-step
   breakdown, and reported `iters=max_iter` on any breakdown** (#71, #86).
   `r_norm` was only assigned inside the loop, so `max_iter=0`, `A p = 0`

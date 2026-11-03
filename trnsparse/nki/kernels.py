@@ -2663,6 +2663,45 @@ def kmv_split(n: int, NI: int, n_prog: int, pid: int):
     return lo, hi, a, b - a
 
 
+# Kernel entries (rows x m) per launch (#100). The Neuron runtime kills a
+# launch after 30 s (NRT status 5). On Trn2 the kernel runs at about
+# 2.7e10 entries/s per logical core at LNC=2 (n = 524288, R = 33 in 10.1 s),
+# about half that at LNC=1, and the rate is flat in R from 1 to 128 (the
+# per-entry ScalarE work dominates, not the d + R of the two matmuls). So
+# the budget counts entries only: 6e10 is ~2.2 s at LNC=2 and ~4.5 s at
+# LNC=1. Each launch also pays a fixed setup (staging Y's augmented
+# coordinates, about 75 ms measured at m = 2^20), so blocks are kept as
+# large as the timeout allows: n = m = 2^20 runs in 19 launches.
+_KMV_BLOCK_WORK = 6 * 10**10
+# Row-block granularity: two physical cores x NI = 512 rows, so at LNC=2 a
+# block splits into whole output blocks per core (`kmv_split`). Blocks
+# smaller than that (tiny budgets, tests) round to 128-row tiles instead.
+_KMV_BLOCK_QUANTUM = 2 * _KMV_ACC_BANKS * _TILE_M
+
+
+def kmv_block_rows(n: int, m: int, work: int = _KMV_BLOCK_WORK) -> int:
+    """Output rows per kernel launch: n (one launch) when n * m <= work entries.
+
+    Otherwise as few launches as the budget allows, of equal size: the
+    largest multiple of `_KMV_BLOCK_QUANTUM` rows (of 128 when that is below
+    the quantum, never fewer than 128) with rows * m <= work fixes the
+    number of blocks, and the block is the smallest multiple of the same
+    quantum that covers n in that many blocks, so the zero-padded tail
+    wastes little (n = 524288: 5 blocks of 105472 rows, 0.6% padding,
+    instead of 5 of 113664, 8%). Rows of the product are independent, so a
+    row block of the output is the kernel applied to that row block of X.
+    """
+    m = max(1, m)
+    if n * m <= work:
+        return n
+    rows = work // m
+    q = _KMV_BLOCK_QUANTUM if rows >= _KMV_BLOCK_QUANTUM else _TILE_M
+    rows = max(_TILE_M, rows // q * q)
+    nblk = -(-n // rows)
+    per = -(-n // nblk)  # rows per block, balanced
+    return min(n, -(-per // q) * q)
+
+
 if HAS_NKI:
 
     def _kmv_aug_t(src, scr, r_lo, r_hi, ydir):
@@ -2730,13 +2769,15 @@ if HAS_NKI:
         nisa.scalar_tensor_tensor(k, q, nl.add, 1.0, nl.multiply, e)
         return k
 
-    def _kmv_body(x, y, v, params, kind, group, self_op):
-        """out = K(X, Y) @ V (+ noise * V if self_op), K never materialised.
+    def _kmv_body(x, y, v, params, kind, group, self_op, vn=None):
+        """out = K(X, Y) @ V (+ noise * V if self_op, + noise * vn if vn given), K never materialised.
 
         Shapes (fp32):
             x:      (n, d)  X, centred (and scaled) by the host, d <= 126
             y:      (m, d)  Y (ignored when self_op: Y = X)
             v:      (m, R)
+            vn:     (n, R)  rows of V for the noise term of a row block of the
+                    square operator (x = rows of y, #100); None otherwise
             params: (128, 4) per-partition replicated [a, log s, noise, 0]
             kind:   0 rbf, 1 matern12, 2 matern32, 3 matern52 (static)
             group:  Y tiles per rolled-loop body (static; capped by PSUM)
@@ -2751,6 +2792,10 @@ if HAS_NKI:
         m = n if self_op else y.shape[0]
         R = v.shape[1]
         da = d + 2
+        # The noise term reads V's rows of the output rows: v itself for the
+        # whole square operator, vn for one row block of it.
+        noisy = self_op or vn is not None
+        v_noise = v if self_op else vn
         n_prog, pid = _program_split()
         NI, r_groups = kmv_plan(n, R, n_prog)
         b_lo, b_hi, t0, tn = kmv_split(n, NI, n_prog, pid)
@@ -2845,9 +2890,9 @@ if HAS_NKI:
 
             for ri, (r0, rr) in enumerate(rg):
                 for ci, (c, cr) in enumerate(chunks):
-                    if self_op:
+                    if noisy:
                         o = nl.ndarray((cr, rr), dtype=nl.float32, buffer=nl.sbuf)
-                        vi = nl.load(v[nl.ds(i0 + c, cr), r0 : r0 + rr])
+                        vi = nl.load(v_noise[nl.ds(i0 + c, cr), r0 : r0 + rr])
                         nisa.scalar_tensor_tensor(
                             o, vi, nl.multiply, prm[0:cr, 2:3], nl.add, acc[ri][ci]
                         )
@@ -2872,3 +2917,13 @@ if HAS_NKI:
     def _kmv_cross_kernel(x, y, v, params, kind, group):
         """K(X, Y) @ V. See `_kmv_body`."""
         return _kmv_body(x, y, v, params, int(kind), int(group), False)
+
+    @nki.jit
+    def _kmv_selfblk_kernel(x, y, v, vn, params, kind, group):
+        """Row block of (K(Y, Y) + noise I) @ V: x = rows of y, vn = the same rows of v (#100).
+
+        The same instructions per output row as `_kmv_self_kernel` (the
+        augmented coordinates and the noise term are row-local), so a
+        row-blocked square product is bit-identical to the one-launch one.
+        """
+        return _kmv_body(x, y, v, params, int(kind), int(group), False, vn)

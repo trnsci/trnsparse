@@ -532,6 +532,24 @@ def kmv_cross(
     return _k._kmv_cross_kernel(x, y, v, params, int(kind), int(group))
 
 
+@nki_op(
+    "trnsparse::kmv_selfblk",
+    mutates_args={},
+    fake_fn=lambda x, y, v, vn, params, kind, group: v.new_empty((x.shape[0], v.shape[1])),
+)
+def kmv_selfblk(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    v: torch.Tensor,
+    vn: torch.Tensor,
+    params: torch.Tensor,
+    kind: int,
+    group: int,
+) -> torch.Tensor:
+    # One row block of the square operator (#100): x = rows of y, vn = those rows of v.
+    return _k._kmv_selfblk_kernel(x, y, v, vn, params, int(kind), int(group))
+
+
 # Composite attention ops (forward/backward over Q, K, V with host mask
 # structure). Registered once per process; see `_native_attn.py`.
 from . import _native_attn  # noqa: E402
@@ -559,4 +577,5 @@ OPS = {
     "bsr_attn_bwd": _native_attn.bsr_attn_bwd,
     "kmv_self": kmv_self,
     "kmv_cross": kmv_cross,
+    "kmv_selfblk": kmv_selfblk,
 }
