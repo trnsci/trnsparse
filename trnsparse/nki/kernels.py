@@ -2663,34 +2663,43 @@ def kmv_split(n: int, NI: int, n_prog: int, pid: int):
     return lo, hi, a, b - a
 
 
-# Work per launch, in n * m * (d + R) units (#100). The Neuron runtime kills
-# a launch after 30 s (NRT status 5). On Trn2 the kernel runs at about
-# 2.7e10 kernel entries/s per logical core at d = 3, R = 33 (n = 524288 in
-# 10.1 s at LNC=2), i.e. about 1e12 work units/s, so 1e11 units is ~0.1 s
-# there. Each kernel entry also costs ScalarE work that does not scale with
-# d + R, so at the smallest d + R = 2 a block of 1e11 units is 5e10 entries:
-# ~1.9 s at LNC=2, ~3.7 s at LNC=1. Either way a launch stays under ~5 s.
-_KMV_BLOCK_WORK = 10**11
+# Kernel entries (rows x m) per launch (#100). The Neuron runtime kills a
+# launch after 30 s (NRT status 5). On Trn2 the kernel runs at about
+# 2.7e10 entries/s per logical core at LNC=2 (n = 524288, R = 33 in 10.1 s),
+# about half that at LNC=1, and the rate is flat in R from 1 to 128 (the
+# per-entry ScalarE work dominates, not the d + R of the two matmuls). So
+# the budget counts entries only: 6e10 is ~2.2 s at LNC=2 and ~4.5 s at
+# LNC=1. Each launch also pays a fixed setup (staging Y's augmented
+# coordinates, about 75 ms measured at m = 2^20), so blocks are kept as
+# large as the timeout allows: n = m = 2^20 runs in 19 launches.
+_KMV_BLOCK_WORK = 6 * 10**10
 # Row-block granularity: two physical cores x NI = 512 rows, so at LNC=2 a
 # block splits into whole output blocks per core (`kmv_split`). Blocks
 # smaller than that (tiny budgets, tests) round to 128-row tiles instead.
 _KMV_BLOCK_QUANTUM = 2 * _KMV_ACC_BANKS * _TILE_M
 
 
-def kmv_block_rows(n: int, m: int, d: int, R: int, work: int = _KMV_BLOCK_WORK) -> int:
-    """Output rows per kernel launch: n (one launch) when n * m * (d + R) <= work.
+def kmv_block_rows(n: int, m: int, work: int = _KMV_BLOCK_WORK) -> int:
+    """Output rows per kernel launch: n (one launch) when n * m <= work entries.
 
-    Otherwise the largest multiple of `_KMV_BLOCK_QUANTUM` rows (of 128 when
-    that is below the quantum, and never fewer than 128) with
-    rows * m * (d + R) <= work. Rows of the product are independent, so a
+    Otherwise as few launches as the budget allows, of equal size: the
+    largest multiple of `_KMV_BLOCK_QUANTUM` rows (of 128 when that is below
+    the quantum, never fewer than 128) with rows * m <= work fixes the
+    number of blocks, and the block is the smallest multiple of the same
+    quantum that covers n in that many blocks, so the zero-padded tail
+    wastes little (n = 524288: 5 blocks of 105472 rows, 0.6% padding,
+    instead of 5 of 113664, 8%). Rows of the product are independent, so a
     row block of the output is the kernel applied to that row block of X.
     """
-    per_row = max(1, m * (d + R))
-    if n * per_row <= work:
+    m = max(1, m)
+    if n * m <= work:
         return n
-    rows = work // per_row
+    rows = work // m
     q = _KMV_BLOCK_QUANTUM if rows >= _KMV_BLOCK_QUANTUM else _TILE_M
-    return min(n, max(_TILE_M, rows // q * q))
+    rows = max(_TILE_M, rows // q * q)
+    nblk = -(-n // rows)
+    per = -(-n // nblk)  # rows per block, balanced
+    return min(n, -(-per // q) * q)
 
 
 if HAS_NKI:

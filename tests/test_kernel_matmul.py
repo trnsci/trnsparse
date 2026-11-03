@@ -253,23 +253,42 @@ def test_kmv_split_covers_rows_with_equal_trip_counts(n, R, n_prog):
 def test_kmv_block_rows_rule():
     W = K._KMV_BLOCK_WORK
     # Under the budget: one launch, blocking is a no-op.
-    assert K.kmv_block_rows(1000, 1000, 3, 33, W) == 1000
+    assert K.kmv_block_rows(1000, 1000, W) == 1000
     # n = 1M, d = 3, R = 33 (the Trn2 timeout of #100): 2048-row blocks, 512 launches.
-    rows = K.kmv_block_rows(1 << 20, 1 << 20, 3, 33, W)
-    assert rows == 2048 and rows % K._KMV_BLOCK_QUANTUM == 0
-    assert rows * (1 << 20) * 36 <= W < (rows + K._KMV_BLOCK_QUANTUM) * (1 << 20) * 36
-    for n, m, d, R in [
-        (1 << 20, 1 << 20, 1, 1),
-        (1 << 20, 1 << 20, 126, 1500),
-        (10**6, 10**7, 3, 1),
+    # The budget counts kernel entries only (the rate is flat in R, #100).
+    assert W == 6 * 10**10
+    # n = m = 2^20 (the Trn2 timeout of #100): 19 launches of 55296 rows.
+    n = 1 << 20
+    rows = K.kmv_block_rows(n, n, W)
+    assert rows == 55296 and rows % K._KMV_BLOCK_QUANTUM == 0 and rows * n <= W
+    assert -(-n // rows) == 19 == -(-n // (W // n // 1024 * 1024))  # fewest launches
+    # n = m = 524288: 5 launches of 105472 rows (one was 10.1 s at LNC=2).
+    assert K.kmv_block_rows(524_288, 524_288, W) == 105_472
+    # Just under / over the budget: two blocks of 100352.
+    assert K.kmv_block_rows(200_000, 300_000, W) == 200_000
+    assert K.kmv_block_rows(200_001, 300_000, W) == 100_352
+    for n, m in [
+        (1 << 20, 1 << 20),
+        (10**6, 10**7),
+        (10**7, 10**6),
+        (10**4, 10**9),
+        (3 << 20, 77_777),
     ]:
-        rows = K.kmv_block_rows(n, m, d, R, W)
+        rows = K.kmv_block_rows(n, m, W)
         assert rows % 128 == 0 and 128 <= rows < n
-        assert rows * m * (d + R) <= W or rows == 128
+        assert rows * m <= W or rows == 128
+        nblk = -(-n // rows)
+        cap = max(
+            128, W // m // (1024 if W // m >= 1024 else 128) * (1024 if W // m >= 1024 else 128)
+        )
+        assert nblk == -(-n // cap)  # as few launches as the budget allows
+        assert (
+            nblk * rows - n < (1024 if rows >= 1024 else 128) * nblk
+        )  # padding < one quantum per block
     # Tiny budgets round to 128-row tiles, never below one tile.
-    assert K.kmv_block_rows(1000, 50, 3, 2, 50 * 5 * 300) == 256
-    assert K.kmv_block_rows(1000, 50, 3, 2, 1) == 128
-    assert K.kmv_block_rows(100, 50, 3, 2, 1) == 100
+    assert K.kmv_block_rows(1000, 50, 50 * 300) == 256
+    assert K.kmv_block_rows(1000, 50, 1) == 128
+    assert K.kmv_block_rows(100, 50, 1) == 100
 
 
 def _fake_launch(calls):
@@ -281,7 +300,14 @@ def _fake_launch(calls):
     """
 
     def launch(x, y, v, vn, params, kind, group, sim):
-        calls.append((tuple(x.shape), None if y is None else tuple(y.shape), vn is not None))
+        calls.append(
+            (
+                tuple(x.shape),
+                None if y is None else tuple(y.shape),
+                vn is not None,
+                (None if y is None else y.data_ptr(), v.data_ptr(), params.data_ptr()),
+            )
+        )
         Y = x if y is None else y
         a, noise = float(params[0, 0]), float(params[0, 2])
         Y64, V64 = Y.double(), v.double()
@@ -322,7 +348,7 @@ def test_row_blocked_launch_matches_one_launch(monkeypatch, self_op, n):
     monkeypatch.setenv("TRNSPARSE_KMV_BLOCK_WORK", "1")  # force 128-row blocks
     blocked = D.nki_kernel_matmul(x, y, v, params, 0, 4)
     assert torch.equal(one, blocked)
-    rows = K.kmv_block_rows(n, m, 3, 5, 1)
+    rows = K.kmv_block_rows(n, m, 1)
     assert len(calls) == -(-n // rows)
     if n > rows:
         # Every launch has the block shape (ragged tail padded), Y whole, and
@@ -330,6 +356,9 @@ def test_row_blocked_launch_matches_one_launch(monkeypatch, self_op, n):
         assert {c[0] for c in calls} == {(rows, 3)}
         assert {c[1] for c in calls} == {(m, 3)}
         assert all(c[2] is self_op for c in calls)
+        # Y, V and params are placed once: every launch gets the same storage.
+        Y_in = x if self_op else y
+        assert {c[3] for c in calls} == {(Y_in.data_ptr(), v.data_ptr(), params.data_ptr())}
 
 
 def test_kernel_operator_row_blocked_under_nki_backend(monkeypatch):
@@ -346,7 +375,7 @@ def test_kernel_operator_row_blocked_under_nki_backend(monkeypatch):
     assert op.route == "nki"
     monkeypatch.delenv("TRNSPARSE_KMV_BLOCK_WORK", raising=False)
     a = op(V)
-    monkeypatch.setenv("TRNSPARSE_KMV_BLOCK_WORK", str(256 * 700 * 7))
+    monkeypatch.setenv("TRNSPARSE_KMV_BLOCK_WORK", str(256 * 700))
     b = op(V)
-    assert len(calls) == 1 + 3  # 256-row blocks: 256, 256, 188 (padded)
+    assert len(calls) == 1 + 3  # three 256-row blocks: 256, 256, 188 (padded)
     assert torch.equal(a, b)

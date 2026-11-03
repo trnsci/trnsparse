@@ -1827,7 +1827,7 @@ def _eager_ok(tensors) -> bool:
 
 
 def _kmv_block_work() -> int:
-    """Per-launch work budget in n * m * (d + R) units (`kernels._KMV_BLOCK_WORK`).
+    """Per-launch budget in kernel entries, rows x m (`kernels._KMV_BLOCK_WORK`).
 
     TRNSPARSE_KMV_BLOCK_WORK overrides it (tests force tiny blocks with it).
     """
@@ -1872,7 +1872,7 @@ def nki_kernel_matmul(
     The result is fp32 on v's device. Raises on any kernel-path failure;
     the caller decides whether to fall back.
 
-    A product of more than `_kmv_block_work()` units of n * m * (d + R) work
+    A product of more than `_kmv_block_work()` kernel entries (n * m)
     runs as several launches over row blocks of x (`kernels.kmv_block_rows`),
     so no launch reaches the runtime's 30 s execution timeout (#100). Below
     the budget it is one launch, exactly as before. Rows of the product are
@@ -1884,9 +1884,11 @@ def nki_kernel_matmul(
     n, d = x.shape
     m = n if y is None else y.shape[0]
     R = v.shape[1]
-    rows = _kernels.kmv_block_rows(n, m, d, R, _kmv_block_work())
+    rows = _kernels.kmv_block_rows(n, m, _kmv_block_work())
     sim = _use_simulator()
     tensors = (x, v, params) if y is None else (x, y, v, params)
+    # Placed once: every block launch gets the same device Y, V and params,
+    # and its X (and noise) rows as views of the placed X (and V).
     if sim:
         placed, orig = list(tensors), v.device
     else:

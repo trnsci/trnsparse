@@ -215,8 +215,8 @@ def test_dispatch_row_blocked_under_simulator(monkeypatch, self_op):
     yt = None if self_op else torch.from_numpy(y)
     monkeypatch.delenv("TRNSPARSE_KMV_BLOCK_WORK", raising=False)
     one = dispatch.nki_kernel_matmul(xt, yt, vt, pt, 0, 4)
-    monkeypatch.setenv("TRNSPARSE_KMV_BLOCK_WORK", str(256 * m * 8))  # 256-row blocks
-    assert K.kmv_block_rows(n, m, 3, 5, dispatch._kmv_block_work()) == 256
+    monkeypatch.setenv("TRNSPARSE_KMV_BLOCK_WORK", str(256 * m))  # 256-row blocks
+    assert K.kmv_block_rows(n, m, dispatch._kmv_block_work()) == 256
     blocked = dispatch.nki_kernel_matmul(xt, yt, vt, pt, 0, 4)
     _assert_blocked_matches(one.numpy(), blocked.numpy())
     direct = _run(x, y, v, params, 0, 1, self_op)
@@ -263,9 +263,9 @@ def _compile_cases():
                 4,
             ),
         )
-    # Row blocks of the square operator (#100): 2048 rows of n = 1M at R = 33,
+    # Row blocks of the square operator (#100): 55296 rows of n = 2^20 at R = 33,
     # and a small ragged-free block.
-    for nb, m, R in [(2048, 1 << 20, 33), (256, 1000, 7)]:
+    for nb, m, R in [(55296, 1 << 20, 33), (256, 1000, 7)]:
         cases[f"selfblk-nb{nb}-m{m}-R{R}"] = (
             "_kmv_selfblk_kernel",
             lambda nb=nb, m=m, R=R: (

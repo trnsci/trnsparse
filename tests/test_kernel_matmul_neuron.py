@@ -134,8 +134,8 @@ def test_row_blocked_is_bitwise_one_launch(monkeypatch, kernel, self_op):
 
     monkeypatch.delenv("TRNSPARSE_KMV_BLOCK_WORK", raising=False)
     one = apply()
-    monkeypatch.setenv("TRNSPARSE_KMV_BLOCK_WORK", str(1024 * m * (3 + R)))
-    assert _d._kernels.kmv_block_rows(n, m, 3, R, _d._kmv_block_work()) == 1024
+    monkeypatch.setenv("TRNSPARSE_KMV_BLOCK_WORK", str(1024 * m))
+    assert _d._kernels.kmv_block_rows(n, m, _d._kmv_block_work()) == 1024
     n_handles = len(_d._eager_handles)
     blocked = apply()
     assert torch.equal(one, blocked)
@@ -150,7 +150,7 @@ def test_row_blocked_is_bitwise_one_launch(monkeypatch, kernel, self_op):
     os.environ.get("TRNSPARSE_KMV_BIG") != "1", reason="set TRNSPARSE_KMV_BIG=1 (minutes)"
 )
 def test_one_million_rows_under_the_runtime_timeout():
-    """n = 2^20, R = 33: was one 40-80 s launch (NRT status 5 at 30 s); now 2048-row blocks."""
+    """n = 2^20, R = 33: was one 40-80 s launch (NRT status 5 at 30 s); now 19 launches."""
     import time
 
     n = 1 << 20

@@ -63,12 +63,14 @@ regression.
 - `kernel_matmul_reference(...)` — dense float64 `torch.cdist` reference.
 
 NKI path: one launch per application, or one per row block of `X` when the
-product exceeds 1e11 units of `n * m * (d + R)` work (#100): the Neuron
-runtime stops a launch after 30 s, and a single launch at n = 2^20 takes
-40-80 s on Trn2. Blocks are the largest multiple of 1024 rows within the
-budget (2048 rows at n = m = 2^20, R = 33, d = 3), the last one zero-padded
-to the same shape, so every block reuses one compile and one cached handle.
-Rows are independent, so the blocked result is bit-identical to a single
+product exceeds 6e10 kernel entries `n * m` (#100): the Neuron runtime
+stops a launch after 30 s, and a single launch at n = 2^20 takes 40-80 s on
+Trn2. The rate is flat in R, so the budget counts entries only: about 2.2 s
+per launch at LNC=2, 4.5 s at LNC=1. The product runs in the fewest
+launches the budget allows, as equal blocks of a multiple of 1024 rows (19
+blocks of 55296 rows at n = m = 2^20), the last one zero-padded to the same
+shape, so every block reuses one compile and one cached handle. Rows are
+independent, so the blocked result is bit-identical to a single
 launch. Per 128 x 512 tile the squared
 distances are one TensorEngine matmul on augmented coordinates
 `[x, |x|^2, 1] . [-2y, 1, |y|^2]` into PSUM, the kernel function runs on
@@ -84,8 +86,8 @@ cancels for near-coincident points (relative error about
 Matern-1/2 (a cusp at 0) as `sqrt(u |x|^2) / l`. float64 follows the suite
 policy: `auto` computes in torch float64, explicit `nki` casts with a
 warning, `TRNSPARSE_REQUIRE_NKI` raises. Env: `TRNSPARSE_KMV_GROUP` (Y tiles
-per loop body, default 4), `TRNSPARSE_KMV_BLOCK_WORK` (per-launch work
-budget, default `1e11`), `TRNSPARSE_NKI_EAGER_HANDLE=0` (custom op instead
+per loop body, default 4), `TRNSPARSE_KMV_BLOCK_WORK` (kernel entries
+per launch, default `6e10`), `TRNSPARSE_NKI_EAGER_HANDLE=0` (custom op instead
 of the cached `wrap_nki` handle).
 
 ## Screening
