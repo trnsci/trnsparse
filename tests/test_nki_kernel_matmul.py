@@ -174,14 +174,16 @@ def _assert_blocked_matches(one, blocked):
     In one launch that chunk is a matmul of n % 128 columns; in a padded
     block it is part of a full 128-column one. The simulator runs each as a
     numpy matmul, whose summation order changes with the width (a 1-row
-    product is a GEMV), so those rows may differ in the last bit there. The
+    product is a GEMV), so those rows may differ in the last bits there. The
     TensorEngine computes every output column the same way at any width,
     which the neuron-marked test checks bit for bit on the device.
     """
     n = one.shape[0]
     head = n - n % _TILE
     assert np.array_equal(one[:head], blocked[:head])
-    np.testing.assert_allclose(blocked[head:], one[head:], rtol=1e-6, atol=1e-6)
+    # fp32 rounding of a different summation order: within the kernel's
+    # own accuracy bound against float64 (5e-6 of the largest entry).
+    assert np.abs(blocked[head:] - one[head:]).max(initial=0.0) <= 5e-6 * np.abs(one).max()
 
 
 _TILE = 128
