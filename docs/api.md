@@ -103,7 +103,8 @@ cancels for near-coincident points (relative error about
 Matern-1/2 (a cusp at 0) as `sqrt(u |x|^2) / l`. float64 follows the suite
 policy: `auto` computes in torch float64, explicit `nki` casts with a
 warning, `TRNSPARSE_REQUIRE_NKI` raises. Env: `TRNSPARSE_KMV_GROUP` (Y tiles
-per loop body, default 4), `TRNSPARSE_KMV_BLOCK_WORK` (kernel entries
+per loop body, 1 to 32; default `kmv_group(m)`: about `sqrt(m / 128)`, from 4
+to 16, which also minimises the fp32 summation error), `TRNSPARSE_KMV_BLOCK_WORK` (kernel entries
 per launch, default `6e10`), `TRNSPARSE_NKI_EAGER_HANDLE=0` (custom op instead
 of the cached `wrap_nki` handle).
 

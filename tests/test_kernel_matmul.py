@@ -229,7 +229,10 @@ def test_params_are_tensor_arguments(monkeypatch):
 def test_kmv_split_covers_rows_with_equal_trip_counts(n, R, n_prog):
     NI, groups = K.kmv_plan(n, R, n_prog)
     assert NI in (128, 256, 512) and NI % 128 == 0
-    assert [c for g in groups for c in g] == [(r0, min(512, R - r0)) for r0 in range(0, R, 512)]
+    assert [c for g in groups for c in g] == [(r0, min(128, R - r0)) for r0 in range(0, R, 128)]
+    # One PSUM bank per accumulator, at least two banks left for distance tiles.
+    assert all(1 <= len(g) <= K._KMV_PSUM_BANKS - 2 for g in groups)
+    assert len(groups) == (1 if R <= 768 else -(-R // 768))
     owner = [None] * n
     trips = set()
     for pid in range(n_prog):
@@ -245,6 +248,47 @@ def test_kmv_split_covers_rows_with_equal_trip_counts(n, R, n_prog):
             owner[r] = pid if owner[r] is None else owner[r]
     assert len(trips) == 1  # same rolled-loop trip count on every core
     assert all(o is not None for o in owner)
+
+
+# ── Y tiles per loop body (#103) ──
+
+
+def test_kmv_group_rule(monkeypatch):
+    from trnsparse.kernel_matmul import _kmv_group
+
+    # Small m: the fixed 4-tile body of earlier releases (same summation, same bits).
+    for m in (1, 128, 1000, 3199):
+        assert K.kmv_group(m) == 4
+    # About sqrt(m / 128) Y tiles in between, capped at 16.
+    assert K.kmv_group(3200) == 5
+    assert K.kmv_group(8192) == 8
+    assert [K.kmv_group(m) for m in (32768, 131072, 1 << 20)] == [16, 16, 16]
+    assert all(K.kmv_group(m) <= K.kmv_group(m + 128) for m in range(0, 40000, 128))
+    monkeypatch.delenv("TRNSPARSE_KMV_GROUP", raising=False)
+    assert _kmv_group(131072) == 16
+    monkeypatch.setenv("TRNSPARSE_KMV_GROUP", "7")
+    assert _kmv_group(131072) == 7
+    monkeypatch.setenv("TRNSPARSE_KMV_GROUP", "100")
+    assert _kmv_group(10) == K._KMV_MAX_GROUP
+
+
+def test_group_follows_m_not_the_row_block(monkeypatch):
+    """Square, row-blocked and cross products of one Y share a body size (same bits)."""
+    from trnsparse.nki import dispatch
+
+    monkeypatch.delenv("TRNSPARSE_KMV_GROUP", raising=False)
+    monkeypatch.setattr(dispatch, "_use_nki", lambda: True)
+    groups = []
+    monkeypatch.setattr(
+        dispatch,
+        "nki_kernel_matmul",
+        lambda x, y, v, p, kind, group: groups.append(group) or torch.zeros(x.shape[0], v.shape[1]),
+    )
+    X = torch.rand(9000, 3)
+    op = KernelOperator(X, "rbf", 0.5)
+    op(torch.rand(9000, 2))
+    op.cross(torch.rand(10, 3), torch.rand(9000, 2))
+    assert groups == [K.kmv_group(9000)] * 2 == [8, 8]
 
 
 # ── Row-blocked launches (#100): no launch reaches the 30 s runtime timeout ──

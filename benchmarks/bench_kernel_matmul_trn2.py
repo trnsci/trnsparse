@@ -19,6 +19,10 @@ Usage:
         [--sizes 131072,262144,524288,1048576] [--rhs 1,16,64,128] \
         [--modes nki,aten,cpu2,cpuall] [--kernel rbf] [--json out.json]
     python benchmarks/bench_kernel_matmul_trn2.py --compare A.pt B.pt   # bitwise LNC check
+
+`--dump DIR` saves every nki result, so two checkouts (or LNC settings) can
+be compared with `--compare`. The package version and the
+`TRNSPARSE_KMV_GROUP` in effect are printed with the header.
 """
 
 from __future__ import annotations
@@ -80,6 +84,9 @@ def main():
     ap.add_argument("--reps", type=int, default=3)
     ap.add_argument("--json", default=None)
     ap.add_argument("--compare", nargs=2, metavar=("A", "B"))
+    ap.add_argument(
+        "--dump", default=None, help="save each nki result to DIR/kmv_n{n}_R{R}.pt (for --compare)"
+    )
     args = ap.parse_args()
 
     if args.compare:
@@ -97,6 +104,8 @@ def main():
     rows = []
     print(
         f"kernel={args.kernel} d={args.d} lnc={os.environ.get('NEURON_LOGICAL_NC_CONFIG', 'default')}"
+        f" trnsparse={trnsparse.__file__}"
+        f" group={os.environ.get('TRNSPARSE_KMV_GROUP', 'auto')}"
     )
     print(f"{'n':>9} {'R':>4} {'mode':>7} {'time_s':>10} {'entries/s':>11} {'relerr':>9}")
     for n in sizes:
@@ -117,7 +126,11 @@ def main():
                     _sync(DEV)
                     rec["first_call_s"] = time.perf_counter() - t_cold
                     t = _time(lambda op=op, Vd=Vd: op(Vd), DEV, 1, args.reps)
-                    rec["relerr"] = _check(op(Vd), X, V, args.kernel, ell, noise)
+                    res = op(Vd).cpu()
+                    rec["relerr"] = _check(res, X, V, args.kernel, ell, noise)
+                    if args.dump:
+                        os.makedirs(args.dump, exist_ok=True)
+                        torch.save(res, os.path.join(args.dump, f"kmv_n{n}_R{R}.pt"))
                     entries = n * n
                 elif mode == "aten":
                     trnsparse.set_backend("pytorch")
