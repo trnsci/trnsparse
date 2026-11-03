@@ -522,6 +522,9 @@ class TestLaunchRouting:
         assert names == KERNEL_OPS
 
 
+_EAGER_CALL_OK = dispatch._eager_call_ok  # before any test patches it
+
+
 class _FakeKernel:
     """Stands in for an `@nki.jit` kernel (has `.func`)."""
 
@@ -609,6 +612,45 @@ class TestEagerHandle:
         out = dispatch._launch(None, "k", a, b)
         assert len(seen) == 1
         assert torch.equal(out, a + b)
+
+    def _kmv(self, monkeypatch):
+        """Fake kmv kernels (absent without nki) and a recording custom op."""
+        fakes = {n: _FakeKernel() for n in ("kmv_self", "kmv_cross")}
+        for n, k in fakes.items():
+            monkeypatch.setattr(kernels, f"_{n}_kernel", k, raising=False)
+        dispatch._native_ops["kmv_self"] = lambda *t: ("op", t, {})
+        return fakes
+
+    def test_kmv_launch_shares_the_cache_keyed_by_shape(self, eager, monkeypatch):
+        """kernel_matmul launches use the same cache as `_native_call`: one
+        handle per (kernel, operand shapes), reused for repeated launches
+        (every row block and core of a product has one shape, #100 / #102)."""
+        built, _ = eager
+        fakes = self._kmv(monkeypatch)
+        p = torch.ones(128, 4)
+        small = (torch.ones(4, 3), torch.ones(4, 2))
+        big = (torch.ones(8, 3), torch.ones(8, 2))
+        for x, v in (small, small, big, small):
+            out = dispatch._kmv_launch(x, None, v, None, p, 0, 1, sim=False)
+            assert out[0] == "handle" and out[1][-2:] == (0, 1)
+        assert built == [fakes["kmv_self"]] * 2
+
+        def key(x, v):
+            return (id(fakes["kmv_self"]), (tuple(x.shape), tuple(v.shape), tuple(p.shape)))
+
+        assert set(dispatch._eager_handles) == {key(*small), key(*big)}
+        dispatch._native_call("k", [torch.ones(1)])  # same cache, shape-free key
+        assert len(dispatch._eager_handles) == 3
+
+    def test_kmv_launch_respects_flag(self, eager, monkeypatch):
+        built, _ = eager
+        self._kmv(monkeypatch)
+        monkeypatch.setattr(dispatch, "_eager_call_ok", _EAGER_CALL_OK)  # the real gate
+        monkeypatch.setattr(dispatch, "_NEURON_DEVICE", "cpu")
+        monkeypatch.setattr(dispatch, "_EAGER_HANDLE_ENABLED", False)
+        x, v, p = torch.ones(4, 3), torch.ones(4, 2), torch.ones(128, 4)
+        assert dispatch._kmv_launch(x, None, v, None, p, 0, 1, sim=False)[0] == "op"
+        assert built == [] and dispatch._eager_handles == {}
 
     def test_missing_nki_api_resolves_to_unavailable(self, monkeypatch):
         monkeypatch.setattr(dispatch, "_eager_handles", {})
@@ -740,7 +782,13 @@ class TestEagerKernelTable:
         names = {k.value: v for k, v in zip(ops.keys, ops.values, strict=True)}
         bodies = self._single_kernel_bodies(tree)
         single = {k for k, v in names.items() if isinstance(v, ast.Name) and v.id in bodies}
-        assert set(self._table(tree)) == single
+        # Single-kernel ops deliberately left out of KERNELS (see the comment
+        # above KERNELS in _native.py): the kmv_* launches take their handle
+        # from `_kmv_launch` (same cache, keyed by shape); screened_tiles_keyed
+        # keeps the custom op for now.
+        not_listed = {"kmv_self", "kmv_cross", "kmv_selfblk", "screened_tiles_keyed"}
+        assert not_listed <= single
+        assert set(self._table(tree)) == single - not_listed
         assert set(names) - single == {"bsr_attn", "bsr_attn_bwd"}
 
 

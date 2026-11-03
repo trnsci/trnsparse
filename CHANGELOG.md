@@ -23,8 +23,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (e2e 0.201 to 0.124 ms), a keyed `bsr_spmm` from 0.255 to 0.157 ms e2e, and
   `cg_bsr_fused` n=256 from 1.36 to 1.19 ms. Results are bit-identical.
   `torch.compile`, requires-grad, int64 and tensor-subclass inputs, and the
-  composite `bsr_attn` / `bsr_attn_bwd` ops keep the custom op.
-  `TRNSPARSE_NKI_EAGER_HANDLE=0` turns this off;
+  composite `bsr_attn` / `bsr_attn_bwd` ops keep the custom op, as does
+  the screened-tile op (`screened_tiles_keyed`, #61) for now. This is the
+  same handle cache that `kernel_matmul` launches use (keyed there by
+  operand shapes, one handle shared by every row block and core), so
+  `TRNSPARSE_NKI_EAGER_HANDLE=0` turns both off;
   `scripts/bench_eager_handle.py` measures it.
 
 ### Added

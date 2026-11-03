@@ -320,18 +320,27 @@ def _to_device(*tensors: torch.Tensor):
 # require grad, and int64 inputs (the custom op applies the TorchNeuron int64
 # policy), the custom op is used as before.
 # `TRNSPARSE_NKI_EAGER_HANDLE=0` turns the fast path off.
+#
+# This is the one handle cache in the module: `_native_call` (one handle per
+# kernel, `shapes=()`) and the `kernel_matmul` launches (`_kmv_launch`, one
+# handle per kernel and launch shape, shared by every row block and every
+# logical core, #100 / #102) both use `_eager_handle` and `_eager_call_ok`,
+# so the env toggle covers both.
 
 _EAGER_HANDLE_ENABLED: bool = os.environ.get(
     "TRNSPARSE_NKI_EAGER_HANDLE", "1"
 ).strip().lower() not in ("0", "false", "no", "off")
-# id(kernel) -> (kernel, handle); holding the kernel keeps its id unique.
-_eager_handles: dict[int, tuple[object, object]] = {}
+# (id(kernel), shapes) -> (kernel, handle); holding the kernel keeps its id unique.
+_eager_handles: dict[tuple, tuple[object, object]] = {}
 _wrap_nki: object = None  # torch_neuronx.wrap_nki, resolved on first use; False if absent
 
 
-def _eager_handle(kernel):
-    """Torch call handle for `kernel`, built once; None if unavailable."""
-    entry = _eager_handles.get(id(kernel))
+def _eager_handle(kernel, shapes=()):
+    """Torch call handle for `kernel`, built once per (kernel, `shapes`); None if
+    unavailable. `_native_call` passes no shapes (one handle per kernel);
+    `_kmv_launch` passes the operand shapes (one handle per launch shape)."""
+    key = (id(kernel), tuple(shapes))
+    entry = _eager_handles.get(key)
     if entry is not None:
         return entry[1]
     global _wrap_nki
@@ -345,7 +354,7 @@ def _eager_handle(kernel):
     if _wrap_nki is False or not hasattr(kernel, "func"):
         return None  # no torch_neuronx.wrap_nki, or not an @nki.jit kernel
     handle = _wrap_nki(kernel)
-    _eager_handles[id(kernel)] = (kernel, handle)
+    _eager_handles[key] = (kernel, handle)
     return handle
 
 
@@ -1890,45 +1899,9 @@ def nki_bsr_attn_bwd(
 # once per kernel (the trnblas#92 pattern, aws-neuron-sdk#1456): the custom-op
 # layer and nki `Kernel.__call__` rebuild a handle on every call, about
 # 0.08 ms. A CG iteration is one launch, so that floor is per iteration.
+# The cache and gate are the module's (`_eager_handle` / `_eager_call_ok`,
+# above), keyed here by (kernel, operand shapes).
 # TRNSPARSE_NKI_EAGER_HANDLE=0 uses the `trnsparse::kmv_*` custom ops instead.
-
-_EAGER_HANDLE = os.environ.get("TRNSPARSE_NKI_EAGER_HANDLE", "1").strip().lower() not in (
-    "0",
-    "false",
-    "no",
-    "off",
-)
-_eager_handles: dict[tuple, tuple] = {}
-
-
-def _eager_handle(kernel, shapes=()):
-    """Cached `torch_neuronx.wrap_nki(kernel)` per (kernel, operand shapes), or None.
-
-    One handle per launch shape: a row-blocked product (#100) launches the
-    same block shape many times and reuses one handle for all of them.
-    """
-    key = (id(kernel), tuple(shapes))
-    entry = _eager_handles.get(key)
-    if entry is not None:
-        return entry[1]
-    try:
-        import torch_neuronx
-
-        wrap = getattr(torch_neuronx, "wrap_nki", None)
-    except ImportError:
-        wrap = None
-    handle = wrap(kernel) if wrap is not None and hasattr(kernel, "func") else None
-    _eager_handles[key] = (kernel, handle)
-    return handle
-
-
-def _eager_ok(tensors) -> bool:
-    if not _EAGER_HANDLE or torch.compiler.is_compiling():  # torch >= 2.3 (native path: 2.14)
-        return False
-    return all(
-        type(t) is torch.Tensor and t.device.type == _NEURON_DEVICE and not t.requires_grad
-        for t in tensors
-    )
 
 
 def _kmv_block_work() -> int:
@@ -1955,7 +1928,7 @@ def _kmv_launch(x, y, v, vn, params, kind: int, group: int, sim: bool) -> torch.
         return _sim_torch(out, v.device)
     if _get_dispatch_path() == "native":
         shapes = tuple(tuple(t.shape) for t in tensors)
-        handle = _eager_handle(kernel, shapes) if _eager_ok(tensors) else None
+        handle = _eager_handle(kernel, shapes) if _eager_call_ok(tensors) else None
         if handle is not None:
             return handle(*tensors, int(kind), int(group))
         return _get_native_ops()[name](*tensors, int(kind), int(group))

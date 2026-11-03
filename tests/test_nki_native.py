@@ -299,7 +299,7 @@ class TestEagerHandle:
             out = D._native_call("spmm_dense", [a, b])
             assert out.device.type == DEV
             assert torch.equal(out.cpu(), op)
-        assert list(D._eager_handles) == [id(kernels._spmm_dense_kernel)]
+        assert list(D._eager_handles) == [(id(kernels._spmm_dense_kernel), ())]
 
     def test_keyed_bsr_spmm_int_key(self, D, monkeypatch):
         from trnsparse.nki import kernels
@@ -309,7 +309,7 @@ class TestEagerHandle:
         B = torch.randn(4 * P, 256, generator=torch.Generator().manual_seed(1)).to(DEV)
         out, ref = self._on_off(D, monkeypatch, lambda: trnsparse.bsr_spmm(A, B))
         assert torch.equal(out, ref)
-        assert set(D._eager_handles) & {
+        assert {k for k, _ in D._eager_handles} & {
             id(kernels._bsr_spmm_keyed_kernel),
             id(kernels._bsr_spmm_static_kernel),
         }
@@ -357,7 +357,7 @@ class TestEagerHandle:
         assert self._equal(out, ref)
         from trnsparse.nki import kernels
 
-        assert id(kernels._cg_bsr_keyed_kernel) in D._eager_handles
+        assert (id(kernels._cg_bsr_keyed_kernel), ()) in D._eager_handles
         torch.testing.assert_close(out[0], torch.linalg.solve(S, b.cpu()), atol=1e-3, rtol=1e-3)
 
     def test_flag_off_uses_op(self, D, monkeypatch):

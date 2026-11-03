@@ -561,6 +561,11 @@ from . import _native_attn  # noqa: E402
 # `dispatch._native_call`, which resolves the kernel at call time and applies
 # the same conversions. `bsr_attn` / `bsr_attn_bwd` run whole drivers and are
 # not listed (their kernel launches inside take the handle on their own).
+# Also not listed, though single kernel calls: `kmv_self` / `kmv_cross` /
+# `kmv_selfblk`, whose launches (`dispatch._kmv_launch`) take a handle from the
+# same cache keyed by operand shapes, and `screened_tiles_keyed` (#61), which
+# `dispatch` still calls through the custom op (its handle path has not been
+# validated on the device yet).
 KERNELS = {
     "spmm_dense": (_k, "_spmm_dense_kernel"),
     "bsr_spmm": (_k, "_bsr_spmm_kernel"),
