@@ -28,6 +28,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `benchmarks/bench_kernel_matmul_trn2.py` measures kernel entries/s
   against aten on the device and the host CPU at 2 threads and all vCPUs.
   `tile_mask` is reserved and raises for now.
+- **`kernel_matmul`: row blocks spread across all visible logical
+  NeuronCores** (#102). On trn2.3xlarge at LNC=2 (`neuron:0..3`, with
+  `NEURON_RT_VISIBLE_CORES=0-3`) a row-blocked product issues its blocks
+  round-robin over the cores. The block count rounds up to a multiple of
+  the core count (`kmv_block_rows(..., parts=k)`; 20 blocks of 53248 rows
+  on 4 cores at n = m = 2^20), so each core gets the same number. Y, V and
+  params are staged through the host once and placed on each core before
+  any kernel is queued. Launches are issued asynchronously from the calling
+  thread (NKI tracing stays on one thread, aws-neuron-sdk#1453) and
+  gathered in row order on the operands' device, bit-identical to one
+  core. `TRNSPARSE_KMV_CORES`: `auto` (default: every visible core when
+  `n * m` exceeds the 6e10-entry block budget, else one), `all`, or an
+  int. `TRNSPARSE_KMV_THREADS=1` is a fallback that issues each core's
+  blocks from a worker thread, after the first block per core has been
+  launched on the calling thread. Target: n = 2^20 from about 42 s to about
+  11 s per apply on 4 cores. CPU stand-in tests cover block-to-core
+  assignment, per-core placement and the gather (bitwise against single
+  core). A neuron test compares multi-core with single-core bitwise and
+  skips below 2 visible cores.
 
 ### Fixed
 

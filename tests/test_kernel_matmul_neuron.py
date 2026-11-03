@@ -7,6 +7,12 @@ and custom-op launch paths agreeing bit for bit, and run-to-run bitwise
 determinism. With TRNSPARSE_KMV_DUMP=<dir> the determinism case also saves
 its output, so runs at NEURON_LOGICAL_NC_CONFIG=1 and =2 can be compared
 bitwise (see `benchmarks/bench_kernel_matmul_trn2.py --compare`).
+
+The multi-core case (#102) needs several visible logical cores and skips
+otherwise:
+
+    NEURON_RT_VISIBLE_CORES=0-3 TRNSPARSE_REQUIRE_NKI=1 \\
+        pytest tests/test_kernel_matmul_neuron.py -v -m neuron -k multicore
 """
 
 from __future__ import annotations
@@ -164,8 +170,80 @@ def test_one_million_rows_under_the_runtime_timeout():
     out = op(Vd)
     torch.neuron.synchronize()
     dt = time.perf_counter() - t0
-    print(f"\nn={n} R=33 rbf: {dt:.2f} s, {n * n / dt:.3e} entries/s")
+    W = _d._kmv_block_work()
+    cores = _d._kmv_core_count(n, n, _d._visible_cores(), _d._kmv_cores_setting(), W)
+    rows = _d._kernels.kmv_block_rows(n, n, W, parts=cores)
+    print(
+        f"\nn={n} R=33 rbf: {dt:.2f} s, {n * n / dt:.3e} entries/s, "
+        f"{cores} core(s), {-(-n // rows)} blocks of {rows}"
+    )
+    dump = os.environ.get("TRNSPARSE_KMV_DUMP")
+    if dump:  # compare runs at different TRNSPARSE_KMV_CORES bitwise (#102)
+        os.makedirs(dump, exist_ok=True)
+        torch.save(out.cpu(), os.path.join(dump, f"kmv_n{n}_cores{cores}.pt"))
     idx = torch.linspace(0, n - 1, 64).long()
     ref = trnsparse.kernel_matmul_reference(X[idx], X, V, "rbf", 0.05, 1.0)
     ref += 1e-4 * V[idx].double()
     assert _rel(out.cpu()[idx], ref) < 2e-5
+
+
+@pytest.mark.parametrize("threads", ["0", "1"], ids=["async", "threads"])
+@pytest.mark.parametrize("kernel", ["rbf", "matern52"])
+@pytest.mark.parametrize("self_op", [True, False], ids=["square", "cross"])
+def test_multicore_is_bitwise_single_core(monkeypatch, kernel, self_op, threads):
+    """Row blocks over every visible logical core (#102) == one core, bit for bit.
+
+    n = 5000 in forced small blocks: 1024-row blocks on one core, and the
+    block count rounded up to a multiple of the core count across cores.
+    Needs NEURON_RT_VISIBLE_CORES covering 2+ logical cores.
+    """
+    visible = _d._visible_cores()
+    if visible < 2:
+        pytest.skip("needs >= 2 visible logical NeuronCores (NEURON_RT_VISIBLE_CORES=0-3)")
+    g = torch.Generator().manual_seed(102)
+    n, R = 5000, 33
+    m = n if self_op else 3000
+    X = torch.rand(n, 3, generator=g)
+    Y = None if self_op else torch.rand(m, 3, generator=g)
+    V = torch.randn(m, R, generator=g)
+    op = trnsparse.KernelOperator(
+        X if self_op else Y, kernel, 0.1, 1.0, noise=1e-4 if self_op else 0.0, device=DEV
+    )
+    Vd = V.to(DEV)
+
+    def apply():
+        out = op(Vd) if self_op else op.cross(X, Vd)
+        assert out.device == Vd.device
+        return out.cpu()
+
+    used = []
+    real = _d._kmv_multicore
+
+    def spy(tensors, self_op_, n_, R_, rows, devices, *a):
+        used.append((rows, list(devices)))
+        return real(tensors, self_op_, n_, R_, rows, devices, *a)
+
+    monkeypatch.setattr(_d, "_kmv_multicore", spy)
+    monkeypatch.setenv("TRNSPARSE_KMV_THREADS", threads)
+    monkeypatch.delenv("TRNSPARSE_KMV_BLOCK_WORK", raising=False)
+    monkeypatch.setenv("TRNSPARSE_KMV_CORES", "1")
+    one = apply()
+    monkeypatch.setenv("TRNSPARSE_KMV_BLOCK_WORK", str(1024 * m))
+    single = apply()
+    assert not used
+    monkeypatch.setenv("TRNSPARSE_KMV_CORES", "all")
+    n_handles = len(_d._eager_handles)
+    multi = apply()
+    again = apply()
+    assert len(used) == 2
+    rows, devices = used[0]
+    assert len(devices) == min(visible, -(-n // rows)) >= 2
+    assert len({d.index for d in devices}) == len(devices)
+    assert len(_d._eager_handles) - n_handles <= 1  # one handle for every core
+    assert torch.equal(single, one)
+    assert torch.equal(multi, single)
+    assert torch.equal(again, multi)
+    ref = trnsparse.kernel_matmul_reference(
+        X, None if self_op else Y, V, kernel, 0.1, 1.0, noise=1e-4 if self_op else 0.0
+    )
+    assert _rel(multi, ref) < 2e-5

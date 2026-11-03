@@ -2679,7 +2679,7 @@ _KMV_BLOCK_WORK = 6 * 10**10
 _KMV_BLOCK_QUANTUM = 2 * _KMV_ACC_BANKS * _TILE_M
 
 
-def kmv_block_rows(n: int, m: int, work: int = _KMV_BLOCK_WORK) -> int:
+def kmv_block_rows(n: int, m: int, work: int = _KMV_BLOCK_WORK, parts: int = 1) -> int:
     """Output rows per kernel launch: n (one launch) when n * m <= work entries.
 
     Otherwise as few launches as the budget allows, of equal size: the
@@ -2690,15 +2690,27 @@ def kmv_block_rows(n: int, m: int, work: int = _KMV_BLOCK_WORK) -> int:
     wastes little (n = 524288: 5 blocks of 105472 rows, 0.6% padding,
     instead of 5 of 113664, 8%). Rows of the product are independent, so a
     row block of the output is the kernel applied to that row block of X.
+
+    `parts > 1` (the blocks go to that many logical cores, #102) rounds the
+    block count up to a multiple of `parts`, so each core gets the same
+    number of blocks (n = m = 2^20 on 4 cores: 20 blocks of 53248 rows
+    instead of 19 of 55296), and splits even an under-budget product into
+    `parts` blocks. Where rounding to the quantum would leave fewer blocks
+    than that (small n), blocks round to 128-row tiles instead. With
+    `parts = 1` the rule is the single-core one above, unchanged.
     """
     m = max(1, m)
-    if n * m <= work:
+    parts = max(1, parts)
+    if n * m <= work and parts == 1:
         return n
     rows = work // m
     q = _KMV_BLOCK_QUANTUM if rows >= _KMV_BLOCK_QUANTUM else _TILE_M
     rows = max(_TILE_M, rows // q * q)
     nblk = -(-n // rows)
+    nblk = -(-nblk // parts) * parts
     per = -(-n // nblk)  # rows per block, balanced
+    if parts > 1 and -(-n // (-(-per // q) * q)) < nblk:
+        q = _TILE_M  # the quantum would drop blocks (leave cores idle)
     return min(n, -(-per // q) * q)
 
 

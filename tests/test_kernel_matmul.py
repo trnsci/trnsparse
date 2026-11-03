@@ -379,3 +379,173 @@ def test_kernel_operator_row_blocked_under_nki_backend(monkeypatch):
     b = op(V)
     assert len(calls) == 1 + 3  # three 256-row blocks: 256, 256, 188 (padded)
     assert torch.equal(a, b)
+
+
+# ── Row blocks across logical NeuronCores (#102) ─────────────────────────────
+
+
+def test_kmv_block_rows_parts():
+    W = K._KMV_BLOCK_WORK
+    n = 1 << 20
+    # parts=1 is the single-core rule, unchanged.
+    assert K.kmv_block_rows(n, n, W, parts=1) == K.kmv_block_rows(n, n, W) == 55296
+    # 4 cores at n = m = 2^20: 20 blocks of 53248 rows, 5 per core, under budget.
+    rows = K.kmv_block_rows(n, n, W, parts=4)
+    assert rows == 53248 and rows * n <= W and -(-n // rows) == 20
+    for n, m, work, parts in [
+        (1 << 20, 1 << 20, W, 2),
+        (1 << 20, 1 << 20, W, 3),
+        (524_288, 524_288, W, 4),  # 5 single-core blocks -> 8, 2 per core
+        (300_000, 300_000, W, 4),  # 2 single-core blocks -> 4
+        (5000, 5000, W, 4),  # under budget: still split into 4
+        (5000, 3000, 1024 * 3000, 4),
+        (1000, 77, 1, 3),
+    ]:
+        rows = K.kmv_block_rows(n, m, work, parts=parts)
+        nblk = -(-n // rows)
+        assert rows % 128 == 0, (n, m, parts, rows)
+        assert nblk % parts == 0 or rows == 128  # at the one-tile floor: as many as fit
+        assert rows * m <= max(work, 128 * m)
+        assert nblk >= -(-n // K.kmv_block_rows(n, m, work))  # never fewer launches
+    # Fewer than one 128-row tile per core: as many tiles as there are.
+    assert K.kmv_block_rows(300, 50, 10**9, parts=4) == 128
+    assert K.kmv_block_rows(100, 50, 10**9, parts=4) == 100
+
+
+def test_kmv_core_count_and_env(monkeypatch):
+    from trnsparse.nki import dispatch as D
+
+    W = K._KMV_BLOCK_WORK
+    big, small = (1 << 20, 1 << 20), (1000, 1000)
+    # auto: every visible core once the product is row-blocked, else one.
+    assert D._kmv_core_count(*big, 4, "auto", W) == 4
+    assert D._kmv_core_count(*small, 4, "auto", W) == 1
+    assert D._kmv_core_count(*big, 1, "auto", W) == 1
+    # all / k: always split, capped at the visible count; 1 is single-core.
+    assert D._kmv_core_count(*small, 4, "all", W) == 4
+    assert D._kmv_core_count(*small, 4, 2, W) == 2
+    assert D._kmv_core_count(*big, 2, 8, W) == 2
+    assert D._kmv_core_count(*big, 4, 1, W) == 1
+    for raw, want in [("", "auto"), ("auto", "auto"), ("ALL", "all"), (" 3 ", 3), ("1", 1)]:
+        monkeypatch.setenv("TRNSPARSE_KMV_CORES", raw)
+        assert D._kmv_cores_setting() == want
+    for bad in ["0", "-2", "four", "1.5"]:
+        monkeypatch.setenv("TRNSPARSE_KMV_CORES", bad)
+        with pytest.raises(ValueError, match="TRNSPARSE_KMV_CORES"):
+            D._kmv_cores_setting()
+    # Off the native path there is nothing to split over.
+    monkeypatch.setenv("TRNSPARSE_KMV_CORES", "all")
+    monkeypatch.setattr(D, "_get_dispatch_path", lambda: "cpu")
+    assert D._kmv_core_devices(*big, (torch.zeros(1),)) == []
+
+
+def _multicore_standin(monkeypatch, k, threads=False):
+    """Route `nki_kernel_matmul` through the multi-core path on host "cores".
+
+    Core 0 keeps the caller's tensors; every other core gets its own copies
+    (`_kmv_place` -> clone), so the operand storage a launch sees names the
+    core it ran on.
+    """
+    from trnsparse.nki import dispatch as D
+
+    monkeypatch.setattr(D, "_use_simulator", lambda: False)
+    monkeypatch.setattr(D, "_kmv_core_devices", lambda n, m, t: [torch.device("cpu")] * k)
+    placed = []
+
+    def place(t, dev):
+        c = t.clone()
+        placed.append(c)
+        return c
+
+    monkeypatch.setattr(D, "_kmv_place", place)
+    if threads:
+        monkeypatch.setenv("TRNSPARSE_KMV_THREADS", "1")
+    else:
+        monkeypatch.delenv("TRNSPARSE_KMV_THREADS", raising=False)
+    return placed
+
+
+@pytest.mark.parametrize("threads", [False, True], ids=["async", "threads"])
+@pytest.mark.parametrize("k", [2, 3, 4])
+@pytest.mark.parametrize("self_op", [True, False], ids=["square", "cross"])
+@pytest.mark.parametrize("n", [300, 1000, 2500])
+def test_multicore_row_blocks_match_single_core(monkeypatch, self_op, n, k, threads):
+    import threading
+
+    from trnsparse.kernel_matmul import _params
+    from trnsparse.nki import dispatch as D
+
+    g = torch.Generator().manual_seed(n + k)
+    m = n if self_op else 77
+    x = torch.rand(n, 3, generator=g)
+    y = None if self_op else torch.rand(m, 3, generator=g)
+    v = torch.randn(m, 5, generator=g)
+    params = _params(-0.5 / 0.3**2, 1.0, 1e-2 if self_op else 0.0, "cpu")
+    fake = _fake_launch(calls := [])
+    monkeypatch.setattr(D, "_kmv_launch", fake)
+
+    # Single core: one launch, and the single-core 128-row blocking.
+    monkeypatch.setattr(D, "_use_simulator", lambda: True)
+    monkeypatch.delenv("TRNSPARSE_KMV_BLOCK_WORK", raising=False)
+    one = D.nki_kernel_matmul(x, y, v, params, 0, 4)
+    monkeypatch.setenv("TRNSPARSE_KMV_BLOCK_WORK", "1")
+    single = D.nki_kernel_matmul(x, y, v, params, 0, 4)
+    assert torch.equal(one, single)
+
+    # k host "cores", on the same forced 128-row-tile budget.
+    placed = _multicore_standin(monkeypatch, k, threads)
+    on_thread = []
+
+    def launch(*a):
+        on_thread.append(threading.current_thread() is threading.main_thread())
+        return fake(*a)
+
+    monkeypatch.setattr(D, "_kmv_launch", launch)
+    calls.clear()
+    multi = D.nki_kernel_matmul(x, y, v, params, 0, 4)
+    assert torch.equal(multi, single)  # gather in row order, bitwise
+    assert multi.device == x.device
+
+    rows = K.kmv_block_rows(n, m, 1, parts=k)
+    nblk = -(-n // rows)
+    kk = min(k, nblk)
+    assert len(calls) == nblk
+    assert {c[0] for c in calls} == {(rows, 3)}  # one block shape (ragged tail padded)
+    assert all(c[2] is self_op for c in calls)
+    # Y, V and params placed once per core: copies for cores 1.., none for core 0.
+    assert len(placed) == (kk - 1) * (3 if self_op else 4)
+    Y_in = x if self_op else y
+    core_ops = [c[3] for c in calls[:kk]]
+    assert core_ops[0] == (Y_in.data_ptr(), v.data_ptr(), params.data_ptr())
+    assert len(set(core_ops)) == kk
+    # Round robin: block b on core b % k, so each core gets the same count.
+    if threads:
+        by_core = {}
+        for c in calls:
+            by_core.setdefault(c[3], 0)
+            by_core[c[3]] += 1
+        assert set(by_core) == set(core_ops)
+        assert all(on_thread[:kk])  # first block of every core traced on the caller
+    else:
+        assert [c[3] for c in calls] == [core_ops[b % kk] for b in range(nblk)]
+        assert all(on_thread)  # every launch from the calling thread
+    counts = [sum(1 for c in calls if c[3] == ops) for ops in core_ops]
+    assert max(counts) - min(counts) <= (0 if nblk % kk == 0 else 1)
+
+
+def test_multicore_under_budget_auto_stays_single(monkeypatch):
+    """`auto` below the blocking budget is one launch on one core, as before."""
+    from trnsparse.kernel_matmul import _params
+    from trnsparse.nki import dispatch as D
+
+    calls = []
+    monkeypatch.setattr(D, "_kmv_launch", _fake_launch(calls))
+    monkeypatch.setattr(D, "_use_simulator", lambda: False)
+    monkeypatch.setattr(D, "_get_dispatch_path", lambda: "native")
+    monkeypatch.setattr(D, "_visible_cores", lambda: 4)
+    monkeypatch.setattr(D, "_to_device", lambda *t: (list(t), t[0].device))
+    monkeypatch.delenv("TRNSPARSE_KMV_CORES", raising=False)
+    monkeypatch.delenv("TRNSPARSE_KMV_BLOCK_WORK", raising=False)
+    x, v = torch.rand(500, 3), torch.randn(500, 2)
+    D.nki_kernel_matmul(x, None, v, _params(-1.0, 1.0, 1e-2, "cpu"), 0, 4)
+    assert len(calls) == 1 and calls[0][0] == (500, 3)

@@ -71,7 +71,24 @@ launches the budget allows, as equal blocks of a multiple of 1024 rows (19
 blocks of 55296 rows at n = m = 2^20), the last one zero-padded to the same
 shape, so every block reuses one compile and one cached handle. Rows are
 independent, so the blocked result is bit-identical to a single
-launch. Per 128 x 512 tile the squared
+launch.
+
+Multi-core (#102): with several visible logical cores
+(`NEURON_RT_VISIBLE_CORES=0-3` on trn2.3xlarge at LNC=2) a row-blocked
+product spreads its blocks round-robin over the cores. The block count is
+rounded up to a multiple of the core count (20 blocks of 53248 rows on 4
+cores at n = m = 2^20), so every core gets the same number. Each core gets
+its own copy of `Y`, `V` and the parameters, staged through the host once
+per product, before any kernel is queued. All launches are issued from the
+calling thread and run asynchronously, and the blocks are gathered in row
+order on the operands' device. The result is bit-identical to one core.
+`TRNSPARSE_KMV_CORES` is `auto` (the default: every visible core when
+`n * m` exceeds the block budget, one core below it), `all`, or a number
+of cores (`1` turns it off). `TRNSPARSE_KMV_THREADS=1` issues each core's
+blocks from its own worker thread instead, after the first block of every
+core has been launched (and the handle traced) on the calling thread.
+
+Per 128 x 512 tile the squared
 distances are one TensorEngine matmul on augmented coordinates
 `[x, |x|^2, 1] . [-2y, 1, |y|^2]` into PSUM, the kernel function runs on
 ScalarE reading PSUM (`exp(a D + log s)` for RBF), and the product with `V`
