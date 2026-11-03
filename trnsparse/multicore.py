@@ -204,11 +204,9 @@ class ShardedBSR:
         for p, (S, key, b) in enumerate(zip(self.shards, self._keys, B, strict=True)):
             if self._direct(b, S):
                 if self.pretransposed:
-                    op = _d._get_native_ops()["bsr_spmm_t_keyed"]
-                    outs.append(op(self._blocks_t[p], b, key))
+                    outs.append(_d._native_call("bsr_spmm_t_keyed", [self._blocks_t[p], b, key]))
                 else:
-                    op = _d._get_native_ops()["bsr_spmm_keyed"]
-                    outs.append(op(S.blocks, b, key))
+                    outs.append(_d._native_call("bsr_spmm_keyed", [S.blocks, b, key]))
             else:
                 outs.append(bsr_spmm(S, b))
         return outs
@@ -305,9 +303,9 @@ class ShardedAttention:
         """
         if not _d._native_path():
             raise RuntimeError("ShardedAttention needs the native TorchNeuron path")
-        op = _d._get_native_ops()["attn_fwd_keyed"]
         return [
-            op(q_t, k_t, v, key)[0] for q_t, (k_t, v), key in zip(Qts, KVs, self._keys, strict=True)
+            _d._native_call("attn_fwd_keyed", [q_t, k_t, v, key])[0]
+            for q_t, (k_t, v), key in zip(Qts, KVs, self._keys, strict=True)
         ]
 
     def gather(self, outs: Sequence[torch.Tensor], device="cpu") -> torch.Tensor:
