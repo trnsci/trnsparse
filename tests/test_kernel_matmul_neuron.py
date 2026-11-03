@@ -91,6 +91,19 @@ def test_square_operator_on_device(kernel, n):
     assert _rel(op(V.to(DEV)), ref) < 2e-5
 
 
+@pytest.mark.parametrize("R", [1, 33, 130])
+@pytest.mark.parametrize("group", [4, 8, 16, 32])
+def test_group_sizes_on_device(monkeypatch, group, R):
+    """Every loop-body size (#103: default `kmv_group(m)`, 16 here) is accurate on the device."""
+    monkeypatch.setenv("TRNSPARSE_KMV_GROUP", str(group))
+    g = torch.Generator().manual_seed(R)
+    n = 8192 + 77  # a ragged Y tile and ragged rows
+    X, V = torch.rand(n, 3, generator=g), torch.randn(n, R, generator=g)
+    op = trnsparse.KernelOperator(X, "matern32", 0.1, 1.0, noise=1e-4, device=DEV)
+    ref = trnsparse.kernel_matmul_reference(X, None, V, "matern32", 0.1, 1.0, noise=1e-4)
+    assert _rel(op(V.to(DEV)), ref) < 2e-5
+
+
 def test_handle_and_custom_op_agree(monkeypatch):
     g = torch.Generator().manual_seed(3)
     X, V = torch.rand(3000, 3, generator=g), torch.randn(3000, 17, generator=g)

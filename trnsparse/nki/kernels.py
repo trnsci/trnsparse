@@ -29,6 +29,7 @@ except ImportError:
 
 
 import hashlib
+import math
 import os
 
 _TILE_M = 128
@@ -2595,8 +2596,14 @@ if HAS_NKI:
 # 2. K^T = exp(a * D^T + log s) by one ScalarE activation reading PSUM
 #    directly (Matern: VectorE clamp from PSUM, ScalarE sqrt and exp,
 #    VectorE polynomial).
-# 3. out[i-chunk] += K^T[:, i-chunk]^T @ V_j, accumulated in PSUM across all
-#    Y tiles (TensorEngine); stored once per output tile.
+# 3. out^T[:, i-block] += V_j^T @ K^T: V's tile (Y rows x <= 128 columns) is
+#    the stationary operand and K^T the moving one, so one nc_matmul per
+#    128 columns of V covers all NI X points of the tile (#103: it was one
+#    per 128-row chunk of X, four per tile, with K^T stationary), and the
+#    accumulator out^T (columns of V x NI) is one PSUM bank per 128
+#    columns. Accumulated in PSUM over the Y tiles of a loop body, then
+#    in SBUF across bodies; transposed back (`nisa.nc_transpose`) and
+#    stored once per output block.
 #
 # The augmented, transposed coordinates are built on chip in a prologue
 # (`nl.load` of 128-row tiles, |x|^2 by a ScalarE square-and-reduce,
@@ -2610,26 +2617,48 @@ if HAS_NKI:
 
 _KMV_KINDS = ("rbf", "matern12", "matern32", "matern52")
 _KMV_MAX_D = 126  # contraction d + 2 <= 128 partitions
-_KMV_RT = 512  # V columns per PSUM accumulator (one 2 KiB bank of fp32)
-_KMV_ACC_BANKS = 4  # PSUM banks for the accumulators of one output block
-_KMV_GROUP = 4  # Y tiles per loop body (overlap TE / ScalarE within it)
+_KMV_NI = 512  # X points per output block: the moving free size of one PSUM bank (fp32)
+_KMV_RT = 128  # V columns per accumulator (the stationary operand's free size)
+_KMV_PASS_RT = 6  # accumulators (V column tiles) per pass over Y; leaves >= 2 PSUM banks
+_KMV_GROUP = 4  # Y tiles per rolled-loop body (one SBUF partial-sum add per body)
+_KMV_MAX_GROUP = 32  # cap on the body size (SBUF for the body's K^T and V tiles)
+_KMV_AUTO_GROUP_MAX = 16  # largest body `kmv_group` picks
+_KMV_V_BATCH_BYTES = 64 * 1024  # SBUF per partition for one body's V rows in one DMA
 _KMV_PSUM_BANKS = 8  # 16 KiB of PSUM per partition in 2 KiB banks
 
 
 def kmv_plan(n: int, R: int, n_prog: int = 1):
     """(NI, r_groups): X points per output block and the V column tiles per pass.
 
-    Each output block is NI rows x one group of <= 512-column tiles, with one
-    PSUM accumulator per (128-row chunk, column tile), `_KMV_ACC_BANKS` in
-    all. R <= 512 gives NI = 512 (the 128 x 512 distance tile of #93). NI
-    shrinks when there are fewer blocks than cores.
+    Each output block is NI X points x one group of <= 128-column tiles of
+    V, one PSUM accumulator (columns x NI, one bank) per tile, at most
+    `_KMV_PASS_RT` per pass over Y (R <= 768: one pass). NI = 512 (the
+    128 x 512 distance tile of #93), halved while there are fewer blocks
+    than cores.
     """
     rtiles = [(r0, min(_KMV_RT, R - r0)) for r0 in range(0, R, _KMV_RT)]
-    NI = _TILE_M * max(1, _KMV_ACC_BANKS // min(len(rtiles), _KMV_ACC_BANKS))
+    NI = _KMV_NI
     while NI > _TILE_M and -(-n // NI) < n_prog:
         NI //= 2
-    per = max(1, _KMV_ACC_BANKS // (NI // _TILE_M))
+    per = _KMV_PASS_RT
     return NI, [rtiles[i : i + per] for i in range(0, len(rtiles), per)]
+
+
+def kmv_group(m: int) -> int:
+    """Y tiles per rolled-loop body for m points of Y (#103): about sqrt(m / 128), in [4, 16].
+
+    Each body sums its tiles in PSUM and adds that partial to a running sum
+    in SBUF, so an output entry is a sum of `g` terms then of `nt / g`
+    partials (nt = m / 128 Y tiles): its fp32 rounding error grows like
+    g + nt / g, smallest at g = sqrt(nt). Bigger bodies also pay the loop's
+    per-trip overhead less often. At most 16 (SBUF for the body's K^T and V
+    tiles); at least 4, so a small problem (m < 3200) runs exactly the
+    summation, and gives exactly the bits, of the fixed 4-tile body before.
+    The group depends on m only, so row blocks, cores and LNC=1/2 all get
+    the same summation order.
+    """
+    nt = max(1, m // _TILE_M)
+    return max(_KMV_GROUP, min(_KMV_AUTO_GROUP_MAX, math.isqrt(nt)))
 
 
 def kmv_split(n: int, NI: int, n_prog: int, pid: int):
@@ -2676,7 +2705,7 @@ _KMV_BLOCK_WORK = 6 * 10**10
 # Row-block granularity: two physical cores x NI = 512 rows, so at LNC=2 a
 # block splits into whole output blocks per core (`kmv_split`). Blocks
 # smaller than that (tiny budgets, tests) round to 128-row tiles instead.
-_KMV_BLOCK_QUANTUM = 2 * _KMV_ACC_BANKS * _TILE_M
+_KMV_BLOCK_QUANTUM = 2 * _KMV_NI
 
 
 def kmv_block_rows(n: int, m: int, work: int = _KMV_BLOCK_WORK, parts: int = 1) -> int:
@@ -2792,7 +2821,7 @@ if HAS_NKI:
                     square operator (x = rows of y, #100); None otherwise
             params: (128, 4) per-partition replicated [a, log s, noise, 0]
             kind:   0 rbf, 1 matern12, 2 matern32, 3 matern52 (static)
-            group:  Y tiles per rolled-loop body (static; capped by PSUM)
+            group:  Y tiles per rolled-loop body (static, 1 to `_KMV_MAX_GROUP`)
         Returns:
             out:    (n, R) fp32
 
@@ -2811,6 +2840,7 @@ if HAS_NKI:
         n_prog, pid = _program_split()
         NI, r_groups = kmv_plan(n, R, n_prog)
         b_lo, b_hi, t0, tn = kmv_split(n, NI, n_prog, pid)
+        group = max(1, min(group, _KMV_MAX_GROUP))
 
         out = nl.ndarray((n, R), dtype=nl.float32, buffer=nl.shared_hbm)
 
@@ -2830,87 +2860,101 @@ if HAS_NKI:
         def block(i0, ni, rg):
             xb = nl.load(xt[:, nl.ds(i0, ni)])  # (d + 2, ni): moving operand
             chunks = [(c, min(_TILE_M, ni - c)) for c in range(0, ni, _TILE_M)]
-            # One PSUM bank per (column tile, 128-row chunk) accumulator: an
-            # accumulation group is per bank, so chunks do not share one.
-            # The loop-body size follows NI, not ni, so tail blocks run the
-            # same loops as full ones (same control flow on every core).
-            acc_banks = (NI // _TILE_M) * len(rg)
-            # A loop body's distance tiles (one bank each) and its partial
-            # accumulators share PSUM's eight banks.
-            g_eff = max(1, min(group, _KMV_PSUM_BANKS - acc_banks))
-            # Running sums in SBUF: a PSUM accumulator cannot stay live
-            # across a rolled loop, so each loop body accumulates its Y tiles
-            # in PSUM and VectorE adds that partial to the running sum.
-            acc = [
-                [nl.ndarray((cr, rr), dtype=nl.float32, buffer=nl.sbuf) for _, cr in chunks]
-                for _, rr in rg
-            ]
+            # V columns of this pass, and the pass's PSUM: one accumulator
+            # bank per column tile, the rest a ring of distance tiles.
+            p0 = rg[0][0]
+            pr = rg[-1][0] + rg[-1][1] - p0
+            n_dist = _KMV_PSUM_BANKS - len(rg)
+            # Running sums of out^T in SBUF: a PSUM accumulator cannot stay
+            # live across a rolled loop, so each loop body accumulates its Y
+            # tiles in PSUM and VectorE adds that partial to the running sum.
+            acc = [nl.ndarray((rr, ni), dtype=nl.float32, buffer=nl.sbuf) for _, rr in rg]
 
             def part(j0, sizes, init):
+                # Full-size allocations, sliced: one PSUM shape for every
+                # tile lets the allocator reuse banks across bodies.
                 ps = [
-                    [
-                        nl.ndarray((_TILE_M, rr), dtype=nl.float32, buffer=nl.psum)[0:cr, :]
-                        for _, cr in chunks
-                    ]
+                    nl.ndarray((_TILE_M, NI), dtype=nl.float32, buffer=nl.psum)[0:rr, 0:ni]
                     for _, rr in rg
+                ]
+                ring = [
+                    nl.ndarray((_TILE_M, NI), dtype=nl.float32, buffer=nl.psum)
+                    for _ in range(min(n_dist, len(sizes)))
                 ]
                 # The body's Y coordinates in one DMA: (d + 2, sum(sizes)).
                 y_all = nl.load(yt[:, nl.ds(j0, sum(sizes))])
+                # One DMA when every tile is full and the rows fit the budget.
+                full = all(jr == _TILE_M for jr in sizes)
+                full = full and len(sizes) * pr * 4 <= _KMV_V_BATCH_BYTES
+                if full:
+                    # The body's V rows in one DMA: (128, tiles, columns), Y
+                    # tile k of the body at [:, k, :].
+                    src = v[nl.ds(j0, len(sizes) * _TILE_M), p0 : p0 + pr]
+                    v_all = nl.load(src.reshape_dim(0, (len(sizes), _TILE_M)).permute((1, 0, 2)))
                 j = j0
                 for k, jr in enumerate(sizes):
                     off = sum(sizes[:k])
                     yb = y_all[:, off : off + jr]  # (d + 2, jr): stationary
-                    # Full-size allocation, sliced: one PSUM shape for every
-                    # tile lets the allocator reuse banks across bodies.
-                    d_full = nl.ndarray((_TILE_M, NI), dtype=nl.float32, buffer=nl.psum)
-                    d_ps = d_full[0:jr, 0:ni]
+                    d_ps = ring[k % len(ring)][0:jr, 0:ni]
                     nisa.nc_matmul(d_ps, yb, xb, accumulate=False)  # D^T, Y on partitions
                     kt = _kmv_entries(d_ps, prm, kind, jr, ni)
+                    vk = v_all[:, k, :] if full else nl.load(v[nl.ds(j, jr), p0 : p0 + pr])
                     for ri, (r0, rr) in enumerate(rg):
-                        vb = nl.load(v[nl.ds(j, jr), r0 : r0 + rr])
-                        for ci, (c, cr) in enumerate(chunks):
-                            # The body's first Y tile opens the accumulation
-                            # group (accumulate=False).
-                            nisa.nc_matmul(ps[ri][ci], kt[:, c : c + cr], vb, accumulate=k > 0)
+                        # out^T += V_j^T K^T; the body's first Y tile opens
+                        # the accumulation group (accumulate=False).
+                        vb = vk[0:jr, r0 - p0 : r0 - p0 + rr]  # (jr, rr): stationary
+                        nisa.nc_matmul(ps[ri], vb, kt, accumulate=k > 0)
                     j = j + jr
                 for ri in range(len(rg)):
-                    for ci in range(len(chunks)):
-                        if init:
-                            nisa.tensor_copy(acc[ri][ci], ps[ri][ci])
-                        else:
-                            nisa.tensor_tensor(acc[ri][ci], acc[ri][ci], ps[ri][ci], op=nl.add)
+                    if init:
+                        nisa.tensor_copy(acc[ri], ps[ri])
+                    else:
+                        nisa.tensor_tensor(acc[ri], acc[ri], ps[ri], op=nl.add)
 
             # First body (initialises the sums), rolled loop over full
-            # groups of g_eff tiles, then the leftover full tiles and the
+            # groups of `group` tiles, then the leftover full tiles and the
             # ragged tile.
             # The static parts run as one-trip loops: allocations live for
             # their enclosing region, so this scopes each part's PSUM tiles
             # to the part instead of the whole block.
-            k0 = min(g_eff, nt)
+            k0 = min(group, nt)
             nl.fori_loop(0, 1, lambda _: part(0, [_TILE_M] * k0 if k0 else [jt], True))
-            n_groups = (nt - k0) // g_eff
-            span = g_eff * _TILE_M
+            n_groups = (nt - k0) // group
+            span = group * _TILE_M
             if n_groups:
                 nl.fori_loop(
                     0,
                     n_groups,
-                    lambda gi: part(k0 * _TILE_M + gi * span, [_TILE_M] * g_eff, False),
+                    lambda gi: part(k0 * _TILE_M + gi * span, [_TILE_M] * group, False),
                 )
-            rest = [_TILE_M] * (nt - k0 - n_groups * g_eff) + ([jt] if jt and k0 else [])
+            rest = [_TILE_M] * (nt - k0 - n_groups * group) + ([jt] if jt and k0 else [])
             if rest:
-                nl.fori_loop(0, 1, lambda _: part((k0 + n_groups * g_eff) * _TILE_M, rest, False))
+                nl.fori_loop(0, 1, lambda _: part((k0 + n_groups * group) * _TILE_M, rest, False))
 
-            for ri, (r0, rr) in enumerate(rg):
-                for ci, (c, cr) in enumerate(chunks):
-                    if noisy:
+            def finish():
+                # out = (out^T)^T, 128 X rows at a time, through a pair of
+                # PSUM tiles (each takes a bank; up to 6 x 4 transposes).
+                t_ring = [
+                    nl.ndarray((_TILE_M, _TILE_M), dtype=nl.float32, buffer=nl.psum)
+                    for _ in range(2)
+                ]
+                t = 0
+                for ri, (r0, rr) in enumerate(rg):
+                    for c, cr in chunks:
+                        t_ps = t_ring[t % 2][0:cr, 0:rr]
+                        t += 1
+                        nisa.nc_transpose(t_ps, acc[ri][:, c : c + cr], engine=nisa.engine.tensor)
                         o = nl.ndarray((cr, rr), dtype=nl.float32, buffer=nl.sbuf)
-                        vi = nl.load(v_noise[nl.ds(i0 + c, cr), r0 : r0 + rr])
-                        nisa.scalar_tensor_tensor(
-                            o, vi, nl.multiply, prm[0:cr, 2:3], nl.add, acc[ri][ci]
-                        )
-                    else:
-                        o = acc[ri][ci]
-                    nl.store(out[nl.ds(i0 + c, cr), r0 : r0 + rr], value=o)
+                        if noisy:
+                            vi = nl.load(v_noise[nl.ds(i0 + c, cr), r0 : r0 + rr])
+                            nisa.scalar_tensor_tensor(
+                                o, vi, nl.multiply, prm[0:cr, 2:3], nl.add, t_ps
+                            )
+                        else:
+                            nisa.tensor_copy(o, t_ps)
+                        nl.store(out[nl.ds(i0 + c, cr), r0 : r0 + rr], value=o)
+
+            nl.fori_loop(0, 1, lambda _: finish())
 
         for rg in r_groups:
             # The same trip count on every core (`kmv_split`).

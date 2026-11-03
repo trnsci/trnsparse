@@ -73,6 +73,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`kernel_matmul`: about 70% fewer instructions per launch** (#103). The
+  Trn2 profile on #93 showed the kernel issue-bound: 41% of a launch with
+  no engine active. The @V product now takes V's tile as the stationary
+  operand and the kernel tile as the moving one. That makes one
+  `nc_matmul` per 128 columns of V over all 512 X points of a tile, where
+  it was four (one per 128-row chunk, kernel tile stationary). The
+  accumulator, out^T, is now one PSUM bank per 128 columns, against four,
+  and is transposed back (`nisa.nc_transpose`) once per output block.
+  The freed PSUM holds a ring of distance tiles, so a loop body is no
+  longer capped at 4 Y tiles. Each body loads its V rows in one DMA,
+  against one per Y tile. The body size now defaults to `kmv_group(m)`:
+  about sqrt(m / 128) Y tiles, from 4 to 16 (`TRNSPARSE_KMV_GROUP` still
+  overrides it, 1 to 32).
+  - Instructions per launch, n = 131072, LNC=2, both physical cores,
+    counted from the compiled NEFF: **11.5M before, 3.5M now** at group
+    16; 6.2M with the old body of 4. That is 44 against 13 instructions per
+    128 x 512 tile per core.
+  - **Summation order:** with a body of 4 Y tiles (m < 3200 by default,
+    or `TRNSPARSE_KMV_GROUP=4`) the result is bit-identical to 0.13.0.
+    That is checked in the simulator, with its matmul summed in
+    contraction order like the TensorEngine; the device check is on the
+    PR. Larger bodies change where the PSUM partial sums are split, so the
+    bits change.
+  - **Error against float64** goes from about g + m/(128 g) fp32 roundings
+    to its minimum: at m = 131072 the max relative error drops from
+    9.0e-7 to 5.2e-7 (simulator, rbf and Matern-5/2, R = 1 and 33).
+  - Bit-identical at LNC=1 and LNC=2, across row blocks and across cores,
+    as before: the body size depends on m only.
+  - The simulator tests now run `nc_matmul` as a sum in contraction order
+    (numpy's BLAS rounds a column differently with the moving operand's
+    width). So the LNC=1 against LNC=2 and row-blocked checks are bitwise
+    at every d and every ragged tail. The ragged tails were tolerance-only
+    before.
+  - `benchmarks/bench_kernel_matmul_trn2.py --dump DIR` saves the results,
+    to compare two checkouts with `--compare`.
 - **float64 under `auto` now computes in torch at float64 accuracy
   (previously cast to fp32 on the NKI path)** — the trnsci suite fp64
   policy (#84). Trainium computes float64 at fp32 precision, so no kernel
