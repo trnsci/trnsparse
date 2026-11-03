@@ -46,6 +46,67 @@
 `jacobi_preconditioner_bsr`, `bsr_diagonal`. See
 [Iterative solvers](iterative_solvers.md).
 
+## Kernel-matrix products (`kernel_matmul`, #93)
+
+`K(X, Y) @ V` without forming `K`, for stationary kernels of the distance:
+`"rbf"`, `"matern12"`, `"matern32"`, `"matern52"` (`trnsparse.KERNELS`).
+The operator of matrix-free Gaussian-process regression and kernel ridge
+regression.
+
+- `kernel_matmul(X, Y, V, kernel="rbf", lengthscale=1.0, outputscale=1.0, noise=0.0)`
+  — `Y=None` gives `(K(X, X) + noise I) @ V`. `lengthscale` is a float or a
+  `(d,)` tensor (per-dimension lengthscales). `V` is `(m,)` or `(m, R)`.
+- `KernelOperator(X, kernel, lengthscale, outputscale, noise, device=None)` —
+  prepares `X` once (centred, rescaled, fp32 on the device) for repeated
+  applications: `op(V)`, `op.cross(Y, W)` = `K(Y, X) @ W`, `op.diag()`,
+  `op.rows(idx)` (rows of `K` for pivoted-Cholesky preconditioners).
+- `kernel_matmul_reference(...)` — dense float64 `torch.cdist` reference.
+
+NKI path: one launch per application, or one per row block of `X` when the
+product exceeds 6e10 kernel entries `n * m` (#100): the Neuron runtime
+stops a launch after 30 s, and a single launch at n = 2^20 takes 40-80 s on
+Trn2. The rate is flat in R, so the budget counts entries only: about 2.2 s
+per launch at LNC=2, 4.5 s at LNC=1. The product runs in the fewest
+launches the budget allows, as equal blocks of a multiple of 1024 rows (19
+blocks of 55296 rows at n = m = 2^20), the last one zero-padded to the same
+shape, so every block reuses one compile and one cached handle. Rows are
+independent, so the blocked result is bit-identical to a single
+launch.
+
+Multi-core (#102): with several visible logical cores
+(`NEURON_RT_VISIBLE_CORES=0-3` on trn2.3xlarge at LNC=2) a row-blocked
+product spreads its blocks round-robin over the cores. The block count is
+rounded up to a multiple of the core count (20 blocks of 53248 rows on 4
+cores at n = m = 2^20), so every core gets the same number. Each core gets
+its own copy of `Y`, `V` and the parameters, staged through the host once
+per product, before any kernel is queued. All launches are issued from the
+calling thread and run asynchronously, and the blocks are gathered in row
+order on the operands' device. The result is bit-identical to one core.
+`TRNSPARSE_KMV_CORES` is `auto` (the default: every visible core when
+`n * m` exceeds the block budget, one core below it), `all`, or a number
+of cores (`1` turns it off). `TRNSPARSE_KMV_THREADS=1` issues each core's
+blocks from its own worker thread instead, after the first block of every
+core has been launched (and the handle traced) on the calling thread.
+
+Per 128 x 512 tile the squared
+distances are one TensorEngine matmul on augmented coordinates
+`[x, |x|^2, 1] . [-2y, 1, |y|^2]` into PSUM, the kernel function runs on
+ScalarE reading PSUM (`exp(a D + log s)` for RBF), and the product with `V`
+accumulates on the TensorEngine. Lengthscale, outputscale and noise are a
+tensor argument, so new hyperparameters do not recompile. Output rows are
+split over both physical cores (LNC=2); results are bit-identical at LNC=1
+and LNC=2 by construction (same Y-tile order). `d <= 126`.
+
+Precision: fp32, with inputs centred on the host. The distance expansion
+cancels for near-coincident points (relative error about
+`u (|x|^2 + |y|^2) / |x - y|^2`); the smooth kernels see that at first order,
+Matern-1/2 (a cusp at 0) as `sqrt(u |x|^2) / l`. float64 follows the suite
+policy: `auto` computes in torch float64, explicit `nki` casts with a
+warning, `TRNSPARSE_REQUIRE_NKI` raises. Env: `TRNSPARSE_KMV_GROUP` (Y tiles
+per loop body, default 4), `TRNSPARSE_KMV_BLOCK_WORK` (kernel entries
+per launch, default `6e10`), `TRNSPARSE_NKI_EAGER_HANDLE=0` (custom op instead
+of the cached `wrap_nki` handle).
+
 ## Screening
 
 - `schwarz_bounds(shell_pair_integrals)` — Cauchy-Schwarz bounds $Q_{pq} = \sqrt{(pq|pq)}$

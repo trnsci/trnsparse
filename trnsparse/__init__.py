@@ -21,6 +21,7 @@ from .iterative import (
     prepare_cg_bsr,
     richardson_bsr,
 )
+from .kernel_matmul import KERNELS, KernelOperator, kernel_matmul, kernel_matmul_reference
 from .nki import HAS_NKI, get_backend, set_backend
 from .ops import (
     block_sparse_attention_tiled,
@@ -68,6 +69,10 @@ __all__ = [
     "power_iteration_bsr_fused",
     "jacobi_preconditioner_bsr",
     "bsr_diagonal",
+    "kernel_matmul",
+    "kernel_matmul_reference",
+    "KernelOperator",
+    "KERNELS",
     "HAS_NKI",
     "set_backend",
     "get_backend",

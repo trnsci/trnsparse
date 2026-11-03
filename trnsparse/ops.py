@@ -140,7 +140,12 @@ def spmm(
     assert B.shape[0] == n, f"Dimension mismatch: A is {A.shape}, B is {B.shape}"
 
     if _use_nki():
-        result = _scaled(alpha, nki_spmm(A, B))
+        if B.dim() == 1:
+            # The NKI GEMM takes a 2-D (K, N) operand: a vector goes in as one
+            # column and comes back as a vector, as on the pytorch backend (#105).
+            result = _scaled(alpha, nki_spmm(A, B.unsqueeze(1)).squeeze(1))
+        else:
+            result = _scaled(alpha, nki_spmm(A, B))
     else:
         result = _scaled(alpha, _csr_matmul(A, B))
     if C is not None and beta != 0.0:

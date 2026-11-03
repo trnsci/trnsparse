@@ -507,11 +507,111 @@ bsr_spmm_t_keyed.register_autograd(_bsr_spmm_t_keyed_backward, setup_context=_sa
 # autograd link is attached in _native_attn.
 
 
+# Fused kernel-matrix product (#93). No autograd: the GP solves use the
+# operator in CG only; gradients through K come with hyperparameter fitting.
+@nki_op(
+    "trnsparse::kmv_self",
+    mutates_args={},
+    fake_fn=lambda x, v, params, kind, group: v.new_empty((x.shape[0], v.shape[1])),
+)
+def kmv_self(
+    x: torch.Tensor, v: torch.Tensor, params: torch.Tensor, kind: int, group: int
+) -> torch.Tensor:
+    # (K(X, X) + noise I) V; kind / group are compile-time, params a tensor.
+    return _k._kmv_self_kernel(x, v, params, int(kind), int(group))
+
+
+@nki_op(
+    "trnsparse::kmv_cross",
+    mutates_args={},
+    fake_fn=lambda x, y, v, params, kind, group: v.new_empty((x.shape[0], v.shape[1])),
+)
+def kmv_cross(
+    x: torch.Tensor, y: torch.Tensor, v: torch.Tensor, params: torch.Tensor, kind: int, group: int
+) -> torch.Tensor:
+    return _k._kmv_cross_kernel(x, y, v, params, int(kind), int(group))
+
+
+@nki_op(
+    "trnsparse::kmv_selfblk",
+    mutates_args={},
+    fake_fn=lambda x, y, v, vn, params, kind, group: v.new_empty((x.shape[0], v.shape[1])),
+)
+def kmv_selfblk(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    v: torch.Tensor,
+    vn: torch.Tensor,
+    params: torch.Tensor,
+    kind: int,
+    group: int,
+) -> torch.Tensor:
+    # One row block of the square operator (#100): x = rows of y, vn = those rows of v.
+    return _k._kmv_selfblk_kernel(x, y, v, vn, params, int(kind), int(group))
+
+
 # Composite attention ops (forward/backward over Q, K, V with host mask
 # structure). Registered once per process; see `_native_attn.py`.
 from . import _native_attn  # noqa: E402
 
 # Keyed by the short op name used in `dispatch._launch` / `dispatch._run`.
+# The kernel each single-kernel op's body calls, as (module, attribute) plus,
+# for ops whose body converts its static arguments, the conversion applied to
+# each argument position (None: passed as is). Used by the eager handle in
+# `dispatch._native_call`, which resolves the kernel at call time and applies
+# the same conversions. `bsr_attn` / `bsr_attn_bwd` run whole drivers and are
+# not listed (their kernel launches inside take the handle on their own).
+# Also not listed, though single kernel calls: `kmv_self` / `kmv_cross` /
+# `kmv_selfblk`, whose launches (`dispatch._kmv_launch`) take a handle from the
+# same cache keyed by operand shapes, and `screened_tiles_keyed` (#61), which
+# `dispatch` still calls through the custom op (its handle path has not been
+# validated on the device yet).
+KERNELS = {
+    "spmm_dense": (_k, "_spmm_dense_kernel"),
+    "bsr_spmm": (_k, "_bsr_spmm_kernel"),
+    "screened_spmm": (_k, "_screened_spmm_kernel"),
+    "bsr_spmm_static": (_k, "_bsr_spmm_static_kernel", (None, None, tuple, tuple)),
+    "bsr_spmm_static_t": (_k, "_bsr_spmm_static_t_kernel", (None, None, tuple, tuple)),
+    "bsr_spmm_keyed": (_k, "_bsr_spmm_keyed_kernel", (None, None, int)),
+    "bsr_spmm_t_keyed": (_k, "_bsr_spmm_t_keyed_kernel", (None, None, int)),
+    "attn_fwd_keyed": (_k, "_attn_fwd_keyed_kernel", (None, None, None, int)),
+    "attn_fwd_static": (_k, "_attn_fwd_static_kernel", (None, None, None, tuple, tuple)),
+    "attn_bwd_static": (
+        _k,
+        "_attn_bwd_static_kernel",
+        (
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            tuple,
+            tuple,
+            tuple,
+            tuple,
+            float,
+        ),
+    ),
+    "attn_stats": (_k, "_attn_stats_kernel"),
+    "attn_out": (_k, "_attn_out_kernel"),
+    "attn_bwd_dq": (_k, "_attn_bwd_dq_kernel"),
+    "attn_bwd_dkdv": (_k, "_attn_bwd_dkdv_kernel"),
+    "cg_bsr_keyed": (
+        _k,
+        "_cg_bsr_keyed_kernel",
+        (None, None, None, int, int, int, int, int, int, int, int),
+    ),
+    "power_bsr_keyed": (_k, "_power_bsr_keyed_kernel", (None, None, int, int, int, int, int, int)),
+}
+
 OPS = {
     "spmm_dense": spmm_dense,
     "bsr_spmm": bsr_spmm,
@@ -532,4 +632,7 @@ OPS = {
     "attn_bwd_dkdv": attn_bwd_dkdv,
     "bsr_attn": _native_attn.bsr_attn,
     "bsr_attn_bwd": _native_attn.bsr_attn_bwd,
+    "kmv_self": kmv_self,
+    "kmv_cross": kmv_cross,
+    "kmv_selfblk": kmv_selfblk,
 }

@@ -256,6 +256,130 @@ def _skewed_bsr(n_rows, n_cols, seed):
     return dense, trnsparse.BSRMatrix.from_dense(dense, block_size=P)
 
 
+class TestEagerHandle:
+    """Eager calls take the cached handle; results match the custom op bit for bit."""
+
+    @pytest.fixture
+    def D(self, monkeypatch):
+        from trnsparse.nki import dispatch
+
+        monkeypatch.setattr(dispatch, "_eager_handles", {})
+        return dispatch
+
+    @staticmethod
+    def _on_off(D, monkeypatch, fn):
+        """fn() with the handle off (custom op), then on; outputs on the host."""
+
+        def host(out):
+            if isinstance(out, tuple | list):
+                return tuple(host(o) for o in out)
+            return out.detach().cpu() if isinstance(out, torch.Tensor) else out
+
+        monkeypatch.setattr(D, "_EAGER_HANDLE_ENABLED", False)
+        ref = host(fn())
+        assert D._eager_handles == {}
+        monkeypatch.setattr(D, "_EAGER_HANDLE_ENABLED", True)
+        return host(fn()), ref
+
+    @staticmethod
+    def _equal(a, b):
+        if isinstance(a, tuple):
+            return len(a) == len(b) and all(
+                TestEagerHandle._equal(x, y) for x, y in zip(a, b, strict=True)
+            )
+        return torch.equal(a, b) if isinstance(a, torch.Tensor) else a == b
+
+    def test_spmm_dense_handle_matches_op_and_is_cached(self, D, monkeypatch):
+        from trnsparse.nki import kernels
+
+        monkeypatch.setattr(D, "_EAGER_HANDLE_ENABLED", True)
+
+        g = torch.Generator().manual_seed(0)
+        a, b = (t.to(DEV) for t in (torch.randn(256, 256, generator=g), torch.randn(256, 128)))
+        op = _get_native_ops()["spmm_dense"](a, b).cpu()
+        for _ in range(3):
+            out = D._native_call("spmm_dense", [a, b])
+            assert out.device.type == DEV
+            assert torch.equal(out.cpu(), op)
+        assert list(D._eager_handles) == [(id(kernels._spmm_dense_kernel), ())]
+
+    def test_keyed_bsr_spmm_int_key(self, D, monkeypatch):
+        from trnsparse.nki import kernels
+
+        dense, A = _skewed_bsr(6, 4, seed=3)
+        A.blocks = A.blocks.to(DEV)
+        B = torch.randn(4 * P, 256, generator=torch.Generator().manual_seed(1)).to(DEV)
+        out, ref = self._on_off(D, monkeypatch, lambda: trnsparse.bsr_spmm(A, B))
+        assert torch.equal(out, ref)
+        assert {k for k, _ in D._eager_handles} & {
+            id(kernels._bsr_spmm_keyed_kernel),
+            id(kernels._bsr_spmm_static_kernel),
+        }
+        torch.testing.assert_close(out, dense @ B.cpu(), atol=ATOL, rtol=RTOL)
+
+    def _attention(self):
+        torch.manual_seed(5)
+        seq_len, hd = 3 * P, 64
+        return _block_causal_mask(seq_len), [torch.randn(seq_len, hd) for _ in range(4)]
+
+    def test_attention_forward(self, D, monkeypatch):
+        """No grad: the kernel launches inside the composite `bsr_attn` op
+        (which keeps the custom op itself) take the handle, `int(key)` applied."""
+        mask, (Q, K, V, _) = self._attention()
+        Qd, Kd, Vd = (t.to(DEV) for t in (Q, K, V))
+        fwd = lambda: trnsparse.block_sparse_attention_tiled(Qd, Kd, Vd, mask)  # noqa: E731
+        out, ref = self._on_off(D, monkeypatch, fwd)
+        assert torch.equal(out, ref)
+        assert D._eager_handles, "no attention kernel went through the handle"
+
+    def test_attention_backward_unchanged(self, D, monkeypatch):
+        """With grad, the launches see grad-requiring inputs and keep the op;
+        the results are the same bits either way."""
+        mask, (Q, K, V, dO) = self._attention()
+
+        def run():
+            Qd, Kd, Vd = (t.to(DEV).requires_grad_(True) for t in (Q, K, V))
+            out = trnsparse.block_sparse_attention_tiled(Qd, Kd, Vd, mask)
+            out.backward(dO.to(DEV))
+            return out, Qd.grad, Kd.grad, Vd.grad
+
+        out, ref = self._on_off(D, monkeypatch, run)
+        assert self._equal(out, ref)
+
+    def test_fused_cg_int_settings(self, D, monkeypatch):
+        n = 256
+        g = torch.Generator().manual_seed(6)
+        M = torch.randn(n, n, generator=g)
+        S = M @ M.T / n + torch.eye(n) * 4.0
+        A = trnsparse.BSRMatrix.from_dense(S, block_size=P)
+        b = torch.randn(n, generator=g).to(DEV)
+        out, ref = self._on_off(
+            D, monkeypatch, lambda: trnsparse.cg_bsr_fused(A, b, tol=1e-5, max_iter=200)
+        )
+        assert self._equal(out, ref)
+        from trnsparse.nki import kernels
+
+        assert (id(kernels._cg_bsr_keyed_kernel), ()) in D._eager_handles
+        torch.testing.assert_close(out[0], torch.linalg.solve(S, b.cpu()), atol=1e-3, rtol=1e-3)
+
+    def test_flag_off_uses_op(self, D, monkeypatch):
+        monkeypatch.setattr(D, "_EAGER_HANDLE_ENABLED", False)
+        a, b = torch.randn(256, 256), torch.randn(256, 128)
+        out = D._native_call("spmm_dense", [a.to(DEV), b.to(DEV)]).cpu()
+        assert D._eager_handles == {}
+        torch.testing.assert_close(out, a @ b, atol=ATOL, rtol=RTOL)
+
+    def test_native_call_inside_compile_uses_op(self, D):
+        @torch.compile(backend="neuron", fullgraph=True)
+        def f(a, b):
+            return D._native_call("spmm_dense", [a, b]) * 2.0
+
+        a, b = torch.randn(256, 256), torch.randn(256, 128)
+        out = f(a.to(DEV), b.to(DEV)).cpu()
+        assert D._eager_handles == {}
+        torch.testing.assert_close(out, (a @ b) * 2.0, atol=2 * ATOL, rtol=RTOL)
+
+
 class TestTwoCoreAndBf16:
     """Static kernels split across both physical cores (LNC=2), fp32 and bf16 (#30).
 

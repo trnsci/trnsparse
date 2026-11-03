@@ -79,6 +79,26 @@ kernel argument, and `tests/test_trace_cache_safety.py` enforces this. If you
 write your own NKI kernels with a factory, set `NKI_ENABLE_TRACE_CACHE=0`
 before importing `torch_neuronx`.
 
+## Known issues in earlier releases
+
+Silent wrong results fixed in the 2026-10-31 to 2026-11-02 releases. If you
+use an affected version, upgrade. Details are in the [CHANGELOG](CHANGELOG.md).
+
+| Bug | Affected | Fixed in |
+|---|---|---|
+| `block_sparse_attention_tiled` returned zero rows for a partial last block (PyTorch path) (#44) | 0.6.0–0.10.0 | 0.11.0 |
+| `block_sparse_attention_tiled` ignored a custom `scale` on the NKI paths (#47) | 0.6.0–0.11.0 | 0.12.0 |
+| `spmv_symmetric` ignored `uplo` and used both triangles (#52) | through 0.12.0 | 0.12.1 |
+| `COOMatrix.to_dense` dropped duplicate entries instead of summing them (#56) | 0.1.1–0.12.1 | 0.13.0 |
+| `from_scipy` dropped the imaginary part of complex matrices (#58) | 0.1.1–0.12.1 | 0.13.0 |
+| Second derivatives of `block_sparse_attention_tiled` were wrong (#65) | 0.6.0–0.12.1 | 0.13.0 |
+| `spmv` / `spmm` accepted a `y` / `C` that broadcast the output to a larger shape (#67) | 0.1.1–0.12.1 | 0.13.0 |
+| `chebyshev_coeffs` / `chebyshev_bsr` were not the Chebyshev polynomial for K >= 2 (#73) | 0.4.3–0.12.1 | 0.13.0 |
+| `bsr_diagonal` returned length m (zero-padded) for a tall matrix (#74) | 0.3.2–0.12.1 | 0.13.0 |
+| `bsr_spmm` dropped the imaginary part of complex operands on the NKI backend (#78) | 0.8.0–0.12.1 | 0.13.0 |
+| `spmv` / `spmm` returned float32 for integer operands on the device (#79) | through 0.12.1 (device CSR path) | 0.13.0 |
+| `block_sparse_attention_tiled` accepted a mask smaller than `seq_len` on the NKI path (#82) | 0.10.0–0.12.1 | 0.13.0 |
+
 ## Usage
 
 ```python

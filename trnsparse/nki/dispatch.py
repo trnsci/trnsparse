@@ -27,6 +27,7 @@ import dataclasses
 import functools
 import importlib.util
 import os
+import sys
 import warnings
 
 import numpy as np
@@ -201,6 +202,10 @@ _KERNEL_OPERAND_DTYPES: dict[str, tuple[frozenset, ...]] = {
     "attn_bwd_dkdv": (_MM,) * 4 + (_F32,) * 3,
     "cg_bsr_keyed": (_MM, _F32, _F32),
     "power_bsr_keyed": (_MM, _F32),
+    # kernel_matmul (#93): X, (Y,) V, (V's noise rows,) params; fp32 throughout.
+    "kmv_self": (_F32,) * 3,
+    "kmv_cross": (_F32,) * 4,
+    "kmv_selfblk": (_F32,) * 5,
     # Composite ops (several kernel launches; each launch is checked again).
     "bsr_attn": (_ANYF, _ANYF, _ANYF, _IDX, _IDX),
     "bsr_attn_bwd": (_ANYF,) * 5 + (_IDX, _IDX) + (_ANYF, _ANYF),
@@ -397,6 +402,32 @@ def _move_to(x, device: torch.device):
     return x
 
 
+def _warn_fp64_host(op: str, stacklevel: int = 3) -> None:
+    """One UserWarning per op: device-resident float64 computed on the host."""
+    if op in _fp64_host_warned:
+        return
+    _fp64_host_warned.add(op)
+    warnings.warn(
+        f"trnsparse {op}: float64 on the neuron device is computed on the "
+        "host for float64 accuracy (device arithmetic is fp32); pass "
+        "float32 to stay on device, or set TRNSPARSE_FP64_ON_DEVICE=1 to "
+        "keep device aten at fp32 precision.",
+        UserWarning,
+        stacklevel=stacklevel,
+    )
+
+
+def _fp64_device_on_host(op: str) -> bool:
+    """True, with the one-time warning, when float64 bound for the neuron
+    device computes on the host instead: backend `auto`, no
+    TRNSPARSE_REQUIRE_NKI, no TRNSPARSE_FP64_ON_DEVICE. For a route that
+    `_fp64_host_guard` cannot see (`KernelOperator` keeps its operands)."""
+    if _backend != "auto" or _REQUIRE_NKI or _FP64_ON_DEVICE:
+        return False
+    _warn_fp64_host(op, stacklevel=4)
+    return True
+
+
 def _fp64_host_guard(op: str):
     """Decorator for a public op: device-resident float64 runs in host torch.
 
@@ -428,16 +459,7 @@ def _fp64_host_guard(op: str):
                 ),
                 None,
             )
-            if op not in _fp64_host_warned:
-                _fp64_host_warned.add(op)
-                warnings.warn(
-                    f"trnsparse {op}: float64 on the neuron device is computed on the "
-                    "host for float64 accuracy (device arithmetic is fp32); pass "
-                    "float32 to stay on device, or set TRNSPARSE_FP64_ON_DEVICE=1 to "
-                    "keep device aten at fp32 precision.",
-                    UserWarning,
-                    stacklevel=2,
-                )
+            _warn_fp64_host(op, stacklevel=3)
             out = fn(
                 *(_move_neuron_to_host(a) for a in args),
                 **{k: _move_neuron_to_host(v) for k, v in kwargs.items()},
@@ -616,14 +638,128 @@ def _to_device(*tensors: torch.Tensor):
     return _to_xla(*tensors)
 
 
+# ── Eager call handles (native path) ─────────────────────────────────────────
+#
+# Same fix as trnblas#92. A `trnsparse::` custom-op call costs ~0.10 ms of host
+# time before the kernel is queued; an aten op costs ~0.02 ms (trn2, SDK 2.33).
+# Most of the gap is per-call work that never changes for a given kernel:
+#   - nki's `Kernel.__call__` rebuilds the torch handle on every call
+#     (`inspect.signature`, a fresh `TorchNativeKernel` hashed into the
+#     registry, LNC resolution): ~0.06 ms;
+#   - the `torch.library` custom-op layer: ~0.01-0.02 ms.
+# So eager calls on plain neuron tensors build a handle once per kernel with
+# the public `torch_neuronx.wrap_nki` and call it directly (~0.02 ms). The
+# handle is gridless, so NKI resolves the LNC grid itself.
+# Static arguments (keyed-structure ids, solver settings, structure lists) pass
+# through it with the same conversions the op body applies (`int(key)`,
+# `tuple(row_ptrs)`, `float(scale)`), listed per op in `_native.KERNELS`.
+# Only ops whose body is a single kernel call qualify: `_native.KERNELS`
+# names the kernel each one calls, and the handle wraps that kernel (looked
+# up when called, as the op body does; not the caller's), so it runs exactly
+# what the op body runs. Ops that are not listed keep the op.
+# Under torch.compile, for tensor subclasses (fake / functional), tensors that
+# require grad, and int64 inputs (the custom op applies the TorchNeuron int64
+# policy), the custom op is used as before.
+# `TRNSPARSE_NKI_EAGER_HANDLE=0` turns the fast path off.
+#
+# This is the one handle cache in the module: `_native_call` (one handle per
+# kernel, `shapes=()`) and the `kernel_matmul` launches (`_kmv_launch`, one
+# handle per kernel and launch shape, shared by every row block and every
+# logical core, #100 / #102) both use `_eager_handle` and `_eager_call_ok`,
+# so the env toggle covers both.
+
+_EAGER_HANDLE_ENABLED: bool = os.environ.get(
+    "TRNSPARSE_NKI_EAGER_HANDLE", "1"
+).strip().lower() not in ("0", "false", "no", "off")
+# (id(kernel), shapes) -> (kernel, handle); holding the kernel keeps its id unique.
+_eager_handles: dict[tuple, tuple[object, object]] = {}
+_wrap_nki: object = None  # torch_neuronx.wrap_nki, resolved on first use; False if absent
+
+
+def _eager_handle(kernel, shapes=()):
+    """Torch call handle for `kernel`, built once per (kernel, `shapes`); None if
+    unavailable. `_native_call` passes no shapes (one handle per kernel);
+    `_kmv_launch` passes the operand shapes (one handle per launch shape)."""
+    key = (id(kernel), tuple(shapes))
+    entry = _eager_handles.get(key)
+    if entry is not None:
+        return entry[1]
+    global _wrap_nki
+    if _wrap_nki is None:
+        try:
+            import torch_neuronx
+
+            _wrap_nki = getattr(torch_neuronx, "wrap_nki", False)
+        except ImportError:
+            _wrap_nki = False
+    if _wrap_nki is False or not hasattr(kernel, "func"):
+        return None  # no torch_neuronx.wrap_nki, or not an @nki.jit kernel
+    handle = _wrap_nki(kernel)
+    _eager_handles[key] = (kernel, handle)
+    return handle
+
+
+def _eager_call_ok(tensors) -> bool:
+    """True when calling the cached handle is equivalent to the custom op."""
+    if not _EAGER_HANDLE_ENABLED or torch.compiler.is_compiling():
+        return False
+    for t in tensors:
+        if (
+            type(t) is not torch.Tensor
+            or t.device.type != _NEURON_DEVICE
+            or t.requires_grad
+            or t.dtype == torch.int64
+        ):
+            return False
+    return True
+
+
+def _native_kernel(op_name: str):
+    """`(kernel, conversions)` for the kernel the `trnsparse::<op_name>` op body
+    calls (looked up now, as the body does), or None for an op that is not a
+    single kernel call. `conversions[i]` is what the body applies to
+    positional argument i (`int`, `tuple`, `float`), or None to pass it as is."""
+    native = sys.modules.get(__package__ + "._native")  # loaded by _get_native_ops
+    entry = None if native is None else native.KERNELS.get(op_name)
+    if entry is None:
+        return None
+    kernel = getattr(entry[0], entry[1], None)
+    return None if kernel is None else (kernel, entry[2] if len(entry) > 2 else ())
+
+
+def _native_call(op_name: str, args):
+    """Run `trnsparse::<op_name>` on `args` (tensors already on the device, then
+    the op's static arguments): through the cached handle when
+    that is equivalent (see above), else the custom op."""
+    ops = _get_native_ops()
+    if _eager_call_ok([a for a in args if isinstance(a, torch.Tensor)]):
+        entry = _native_kernel(op_name)
+        if entry is not None:
+            # The handle skips the op body, so check the operands here, as the
+            # guarded op does (`_guard_op`, trnsci/trnsci#35).
+            _check_kernel_operands(op_name, args)
+        handle = None if entry is None else _eager_handle(entry[0])
+        if handle is not None:
+            conv = entry[1]
+            if conv:
+                args = [
+                    conv[i](a) if i < len(conv) and conv[i] is not None else a
+                    for i, a in enumerate(args)
+                ]
+            return handle(*args)
+    return ops[op_name](*args)
+
+
 def _run(kernel, op_name: str, *device_tensors: torch.Tensor):
     """Call one kernel on operands already placed by `_to_device`.
 
     `op_name` is the `trnsparse::<op_name>` custom op used on the native
-    path; the XLA path calls `kernel` directly on torch_xla tensors.
+    path (eager calls on plain tensors skip the op layer through a cached
+    handle, see `_native_call`); the XLA path calls `kernel` directly on
+    torch_xla tensors.
     """
     if _get_dispatch_path() == "native":
-        return _get_native_ops()[op_name](*device_tensors)
+        return _native_call(op_name, device_tensors)
     _check_kernel_operands(op_name, device_tensors)
     return kernel(*device_tensors)
 
@@ -1168,7 +1304,7 @@ def _nki_bsr_spmm_static(A, B: torch.Tensor) -> torch.Tensor:
     blocks = A.blocks.contiguous().to(device=dev, dtype=kdt)
     b_dev = B.contiguous().to(device=dev, dtype=kdt)
     key = _kernels.register_structure(row_ptrs, cols)
-    out = _get_native_ops()["bsr_spmm_keyed"](blocks, b_dev, key)
+    out = _native_call("bsr_spmm_keyed", [blocks, b_dev, key])
     return out[:m, :out_cols].to(device=orig, dtype=out_dtype)
 
 
@@ -1732,8 +1868,8 @@ def _nki_attn_fwd_static(Q, K, V, mask_bsr, scale: float, return_stats: bool):
     q_t = (Qd.float() * scale).to(kdt).T.contiguous()
     Kd, Vd = Kd.to(kdt), Vd.to(kdt)
     key = _kernels.register_structure(row_ptrs, cols)
-    out, row_max, row_denom = _get_native_ops()["attn_fwd_keyed"](
-        q_t, Kd.T.contiguous(), Vd.contiguous(), key
+    out, row_max, row_denom = _native_call(
+        "attn_fwd_keyed", [q_t, Kd.T.contiguous(), Vd.contiguous(), key]
     )
     out, row_max, row_denom = (t.to(orig) for t in (out, row_max, row_denom))
     out = out.to(dtype)
@@ -1780,25 +1916,28 @@ def _nki_attn_bwd_static(Q, K, V, dO, O, mask_bsr, row_max, row_denom, scale: fl
     rm = row_max.to(device=dev, dtype=torch.float32).reshape(seq_len, 1)
     rinv = 1.0 / row_denom.to(device=dev, dtype=torch.float32).reshape(seq_len, 1)
     d = (dO.float() * O.float()).sum(dim=-1, keepdim=True)
-    dQ, dK, dV = _get_native_ops()["attn_bwd_static"](
-        q_s.T.contiguous(),
-        k.T.contiguous(),
-        V.to(kdt).T.contiguous(),
-        do.T.contiguous(),
-        q_s,
-        k,
-        do,
-        rm.contiguous(),
-        rinv.contiguous(),
-        d.contiguous(),
-        rm.reshape(1, seq_len).contiguous(),
-        rinv.reshape(1, seq_len).contiguous(),
-        d.reshape(1, seq_len).contiguous(),
-        row_ptrs,
-        cols,
-        col_ptrs,
-        rows,
-        float(scale),
+    dQ, dK, dV = _native_call(
+        "attn_bwd_static",
+        [
+            q_s.T.contiguous(),
+            k.T.contiguous(),
+            V.to(kdt).T.contiguous(),
+            do.T.contiguous(),
+            q_s,
+            k,
+            do,
+            rm.contiguous(),
+            rinv.contiguous(),
+            d.contiguous(),
+            rm.reshape(1, seq_len).contiguous(),
+            rinv.reshape(1, seq_len).contiguous(),
+            d.reshape(1, seq_len).contiguous(),
+            row_ptrs,
+            cols,
+            col_ptrs,
+            rows,
+            float(scale),
+        ],
     )
     return tuple(t.to(device=orig, dtype=dtype) for t in (dQ, dK, dV))
 
@@ -2125,3 +2264,292 @@ def nki_bsr_attn_bwd(
         return _block_sparse_attn_backward(
             Q, K, V, O, dO, mask_bsr, scale, row_max=row_max, row_denom=row_denom
         )
+
+
+# ── Fused kernel-matrix product K(X, Y) @ V (#93) ────────────────────────────
+#
+# Eager native launches go through a `torch_neuronx.wrap_nki` handle built
+# once per kernel (the trnblas#92 pattern, aws-neuron-sdk#1456): the custom-op
+# layer and nki `Kernel.__call__` rebuild a handle on every call, about
+# 0.08 ms. A CG iteration is one launch, so that floor is per iteration.
+# The cache and gate are the module's (`_eager_handle` / `_eager_call_ok`,
+# above), keyed here by (kernel, operand shapes).
+# TRNSPARSE_NKI_EAGER_HANDLE=0 uses the `trnsparse::kmv_*` custom ops instead.
+
+
+def _kmv_block_work() -> int:
+    """Per-launch budget in kernel entries, rows x m (`kernels._KMV_BLOCK_WORK`).
+
+    TRNSPARSE_KMV_BLOCK_WORK overrides it (tests force tiny blocks with it).
+    """
+    env = os.environ.get("TRNSPARSE_KMV_BLOCK_WORK", "").strip()
+    return max(1, int(float(env))) if env else _kernels._KMV_BLOCK_WORK
+
+
+def _kmv_launch(x, y, v, vn, params, kind: int, group: int, sim: bool) -> torch.Tensor:
+    """One kernel launch on operands already placed (device, or host for the simulator)."""
+    from . import kernels as _k
+
+    if y is None:
+        kernel, name, tensors = _k._kmv_self_kernel, "kmv_self", (x, v, params)
+    elif vn is None:
+        kernel, name, tensors = _k._kmv_cross_kernel, "kmv_cross", (x, y, v, params)
+    else:
+        kernel, name, tensors = _k._kmv_selfblk_kernel, "kmv_selfblk", (x, y, v, vn, params)
+    # Every route below (simulator, eager handle, custom op, XLA) checks the
+    # operand dtypes first, as `_launch` / `_run` / `_simulate` do.
+    _check_kernel_operands(name, tensors)
+    if sim:
+        out = nki.simulate(kernel)(*(_sim_np(t) for t in tensors), int(kind), int(group))
+        return _sim_torch(out, v.device)
+    if _get_dispatch_path() == "native":
+        shapes = tuple(tuple(t.shape) for t in tensors)
+        handle = _eager_handle(kernel, shapes) if _eager_call_ok(tensors) else None
+        if handle is not None:
+            return handle(*tensors, int(kind), int(group))
+        return _get_native_ops()[name](*tensors, int(kind), int(group))
+    return kernel(*tensors, int(kind), int(group))
+
+
+# ── Row blocks across logical NeuronCores (#102) ─────────────────────────────
+#
+# The row blocks of one product are independent, so on a chip with several
+# visible logical cores (trn2.3xlarge at LNC=2: neuron:0..3 with
+# NEURON_RT_VISIBLE_CORES=0-3) they are spread over the cores. Placement
+# follows `trnsparse.multicore` and trnblas#24: TorchNeuron does not copy
+# between logical cores, and a copy out of a busy core waits behind its
+# queued kernels, so the operands are staged through the host once, before
+# any kernel is queued, and each core gets its own Y, V and params. Launches
+# are asynchronous: all of them are issued from the calling thread,
+# round-robin over the cores, so the cores run together and NKI tracing
+# (not thread-safe, aws-neuron-sdk#1453) stays on one thread. The results
+# come back through the host in row order.
+#
+# TRNSPARSE_KMV_CORES: "auto" (default) uses every visible core when the
+# product is row-blocked anyway (n * m above `_kmv_block_work()`), and one
+# core below that; "all" or an int k always splits over that many cores
+# (at most the visible count). "1" keeps everything on the operands' core.
+# TRNSPARSE_KMV_THREADS=1 issues each core's blocks from its own worker
+# thread instead (a fallback in case launches block the host); the first
+# block of every core is launched on the calling thread first, so the
+# cached `wrap_nki` handle is traced there.
+
+_KMV_CORES_ENV = "TRNSPARSE_KMV_CORES"
+_kmv_pool = None
+
+
+def _kmv_cores_setting() -> int | str:
+    """`TRNSPARSE_KMV_CORES` parsed: "auto", "all" or a positive int."""
+    raw = os.environ.get(_KMV_CORES_ENV, "").strip().lower()
+    if raw in ("", "auto"):
+        return "auto"
+    if raw == "all":
+        return "all"
+    try:
+        k = int(raw)
+    except ValueError:
+        k = 0
+    if k < 1:
+        raise ValueError(f"{_KMV_CORES_ENV} must be a positive int, 'all' or 'auto'; got {raw!r}")
+    return k
+
+
+def _kmv_threads() -> bool:
+    raw = os.environ.get("TRNSPARSE_KMV_THREADS", "").strip().lower()
+    return raw not in ("", "0", "false", "no", "off")
+
+
+def _visible_cores() -> int:
+    """Visible logical NeuronCores (`torch_neuronx.device_count()`), 1 if unknown."""
+    try:
+        import torch_neuronx
+
+        return max(1, int(torch_neuronx.device_count()))
+    except Exception:
+        return 1
+
+
+def _kmv_core_count(n: int, m: int, visible: int, setting: int | str, work: int) -> int:
+    """Logical cores one n x m product is split over (1: the single-core path)."""
+    if visible <= 1 or setting == 1:
+        return 1
+    if setting == "auto":
+        k = visible if n * m > work else 1
+    elif setting == "all":
+        k = visible
+    else:
+        k = min(int(setting), visible)
+    return max(1, k)
+
+
+def _kmv_core_devices(n: int, m: int, tensors) -> list[torch.device]:
+    """The cores for one product, the operands' core first; one entry = single core."""
+    if _get_dispatch_path() != "native":
+        return []
+    k = _kmv_core_count(n, m, _visible_cores(), _kmv_cores_setting(), _kmv_block_work())
+    if k <= 1:
+        return []
+    home = _kernel_device(*tensors)
+    if home.index is None:
+        try:
+            import torch_neuronx
+
+            home = torch.device(_NEURON_DEVICE, int(torch_neuronx.current_device()))
+        except Exception:
+            home = torch.device(_NEURON_DEVICE, 0)
+    visible = _visible_cores()
+    return [torch.device(_NEURON_DEVICE, (home.index + i) % visible) for i in range(k)]
+
+
+def _kmv_place(t: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """A host operand copied to one core (the CPU tests swap in a copy)."""
+    return t.to(device)
+
+
+def _kmv_block(xs, ys, vs, ps, i0: int, rows: int, n: int, kind, group, sim):
+    """Launch the row block of x starting at i0 on the core its operands are on.
+
+    `ys` None is the square operator (Y = X): the block takes its rows of V
+    for the noise term (`_kmv_selfblk_kernel`).
+
+    The ragged last block is zero-padded to `rows` (padding rows are computed
+    and dropped), so every block has one shape and one handle. Returns the
+    (rows, R) block output; rows past n are padding.
+    """
+    nb = min(rows, n - i0)
+    self_op = ys is None
+    xb = xs[i0 : i0 + nb]
+    vb = vs[i0 : i0 + nb] if self_op else None
+    if nb < rows:
+        xb = torch.cat([xb, xb.new_zeros(rows - nb, xs.shape[1])])
+        if self_op:
+            vb = torch.cat([vb, vb.new_zeros(rows - nb, vs.shape[1])])
+    return _kmv_launch(xb, xs if self_op else ys, vs, vb, ps, kind, group, sim)
+
+
+def _kmv_multicore(tensors, self_op: bool, n: int, R: int, rows: int, devices, kind, group):
+    """Row blocks of one product spread over `devices`, gathered on the host.
+
+    Block b runs on core b % k (k = len(devices)), with the operands placed
+    on that core once. `rows` comes from `kmv_block_rows(..., parts=k)`, so
+    with a block count that is a multiple of k every core gets the same
+    number of blocks. Every block is the same kernel at one shape, and a row
+    of the product runs the same instructions whatever block it is in (the
+    #100/#101 bitwise check on Trn2), so the result is bit-identical to
+    single-core.
+    """
+    orig = tensors[0].device
+    # Stage through the host first: a D2H copy queues behind the kernels of
+    # the core it reads from, so nothing is launched until every core has
+    # its operands.
+    host = [t.detach().cpu() for t in tensors]
+    placed = []
+    for p, dev in enumerate(devices):
+        if p == 0:
+            placed.append(
+                [
+                    t if t.device == dev else _kmv_place(h, dev)
+                    for t, h in zip(tensors, host, strict=True)
+                ]
+            )
+        else:
+            placed.append([_kmv_place(h, dev) for h in host])
+    k = len(devices)
+    starts = list(range(0, n, rows))
+    outs: list = [None] * len(starts)
+
+    def launch(b):
+        ops = placed[b % k]
+        xs, ys, vs, ps = (ops[0], None, *ops[1:]) if self_op else ops
+        outs[b] = _kmv_block(xs, ys, vs, ps, starts[b], rows, n, kind, group, False)
+
+    if _kmv_threads() and len(starts) > k:
+        global _kmv_pool
+        # The first block of every core on this thread: traces the one block
+        # shape into the cached handle before any worker launches.
+        for b in range(k):
+            launch(b)
+        if _kmv_pool is None or _kmv_pool._max_workers < k:
+            from concurrent.futures import ThreadPoolExecutor
+
+            _kmv_pool = ThreadPoolExecutor(max_workers=k, thread_name_prefix="trnsparse-kmv")
+
+        def run_core(p):
+            for b in range(k + p, len(starts), k):
+                launch(b)
+
+        for f in [_kmv_pool.submit(run_core, p) for p in range(k)]:
+            f.result()
+    else:
+        for b in range(len(starts)):
+            launch(b)
+
+    out = torch.empty(n, R, dtype=torch.float32)
+    for b, i0 in enumerate(starts):
+        nb = min(rows, n - i0)
+        out[i0 : i0 + nb] = outs[b][:nb].cpu()
+    return out.to(orig)
+
+
+def nki_kernel_matmul(
+    x: torch.Tensor,
+    y: torch.Tensor | None,
+    v: torch.Tensor,
+    params: torch.Tensor,
+    kind: int,
+    group: int,
+) -> torch.Tensor:
+    """The fused kernel-matrix product (see `kernels._kmv_body`), row-blocked.
+
+    x (n, d), y (m, d) or None (Y = X, noise added), v (m, R) and params
+    (128, 4) are fp32 and contiguous, prepared by `trnsparse.kernel_matmul`.
+    The result is fp32 on v's device. Raises on any kernel-path failure;
+    the caller decides whether to fall back.
+
+    A product of more than `_kmv_block_work()` kernel entries (n * m)
+    runs as several launches over row blocks of x (`kernels.kmv_block_rows`),
+    so no launch reaches the runtime's 30 s execution timeout (#100). Below
+    the budget it is one launch, exactly as before. Rows of the product are
+    independent and each row runs the same instructions in a block as in one
+    launch, so the blocked result is bit-identical. The last, ragged block
+    is zero-padded to the block shape (padding rows are computed and
+    dropped): every launch has one shape, one compile and one cached handle.
+
+    With several visible logical cores the blocks are spread over them
+    (`TRNSPARSE_KMV_CORES`, #102; see the section comment above): the
+    block count rounds up to a multiple of the core count, each core gets
+    its own copy of Y, V and params, and the result is gathered on the
+    host and returned on the operands' device, bit-identical to one core.
+    """
+    n, d = x.shape
+    m = n if y is None else y.shape[0]
+    R = v.shape[1]
+    sim = _use_simulator()
+    tensors = (x, v, params) if y is None else (x, y, v, params)
+    devices = [] if sim else _kmv_core_devices(n, m, tensors)
+    if len(devices) > 1:
+        rows = _kernels.kmv_block_rows(n, m, _kmv_block_work(), parts=len(devices))
+        if rows < n:
+            k = min(len(devices), -(-n // rows))
+            return _kmv_multicore(tensors, y is None, n, R, rows, devices[:k], kind, group)
+    rows = _kernels.kmv_block_rows(n, m, _kmv_block_work())
+    # Placed once: every block launch gets the same device Y, V and params,
+    # and its X (and noise) rows as views of the placed X (and V).
+    if sim:
+        placed, orig = list(tensors), v.device
+    else:
+        placed, orig = _to_device(*tensors)
+    if y is None:
+        xs, vs, ps = placed
+        ys = None
+    else:
+        xs, ys, vs, ps = placed
+    if rows >= n:
+        return _kmv_launch(xs, ys, vs, None, ps, kind, group, sim).to(orig)
+
+    out = torch.empty(n, R, dtype=torch.float32, device=vs.device)
+    for i0 in range(0, n, rows):
+        nb = min(rows, n - i0)
+        ob = _kmv_block(xs, ys, vs, ps, i0, rows, n, kind, group, sim)
+        out[i0 : i0 + nb] = ob[:nb].to(out.device)
+    return out.to(orig)

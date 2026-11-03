@@ -65,11 +65,16 @@ KERNEL_TAKES = {
     "attn_bwd_dkdv": (MM,) * 4 + (F32,) * 3,
     "cg_bsr_keyed": (MM, F32, F32),
     "power_bsr_keyed": (MM, F32),
+    "kmv_self": (F32,) * 3,
+    "kmv_cross": (F32,) * 4,
+    "kmv_selfblk": (F32,) * 5,
 }
 # Composite ops (not kernels; each inner launch is checked by its own stub).
 COMPOSITE = {"bsr_attn", "bsr_attn_bwd"}
 # No public API launches these today (the keyed variants replaced them).
 UNREACHED = {"bsr_spmm_static", "bsr_spmm_static_t", "attn_fwd_static", "bsr_spmm_t_keyed"}
+# kernel_matmul's row-blocked launch: only above `_kmv_block_work()` entries.
+UNREACHED |= {"kmv_selfblk"}
 
 DTYPES = [
     torch.float32,
@@ -193,6 +198,11 @@ def _install_stubs(monkeypatch, path, backend, require):
     for attr, name in _XLA_KERNELS.items():
         stub = _native.OPS[name]  # a _StubOp: same check, same fake
         monkeypatch.setattr(dispatch, attr, stub, raising=False)
+    # `_kmv_launch` (kernel_matmul) names its kernels in `nki.kernels`.
+    from trnsparse.nki import kernels as _kernels
+
+    for name in ("kmv_self", "kmv_cross", "kmv_selfblk"):
+        monkeypatch.setattr(_kernels, f"_{name}_kernel", _native.OPS[name], raising=False)
     if path == "xla":
         monkeypatch.setattr(dispatch, "_dispatch_path", "xla")
         monkeypatch.setattr(dispatch, "_to_xla", lambda *t: (list(t), t[0].device))
@@ -294,6 +304,13 @@ def _case(api, dtype):
             pytest.skip("power iteration takes a float matrix")
         A = trnsparse.BSRMatrix.from_dense(Ad, block_size=P)
         return lambda: trnsparse.power_iteration_bsr_fused(A, max_iter=3)[1]
+    if api in ("kernel_matmul", "kernel_matmul_cross"):
+        X = _rnd((40, 3), dtype, g)
+        V = _rnd((40, 2), dtype, g)
+        if api == "kernel_matmul":
+            return lambda: trnsparse.kernel_matmul(X, None, V, noise=0.1)
+        Y = _rnd((30, 3), dtype, g)
+        return lambda: trnsparse.kernel_matmul(Y, X, V)
     raise AssertionError(api)
 
 
@@ -301,6 +318,7 @@ def _case(api, dtype):
 # complex / integer / bool). The fused solvers pack b into an fp32 kernel
 # state on every backend (see the needs-decision issue in the PR).
 ROUTED_APIS = {"spmm", "spmm_f32_rhs", "bsr_spmm", "screened_spmm", "attention", "attention_grad"}
+ROUTED_APIS |= {"kernel_matmul", "kernel_matmul_cross"}
 APIS = sorted(ROUTED_APIS | {"cg_bsr", "cg_bsr_fused", "power_fused"})
 
 
@@ -706,6 +724,9 @@ def _device_case(api, dtype):
     if api == "jacobi_preconditioner_bsr":
         A = _spd_bsr_dtype(dtype)
         return (lambda r: trnsparse.jacobi_preconditioner_bsr(A)(r)), (b,)
+    if api == "kernel_matmul":
+        X, V = _rnd((40, 3), dtype, g), _rnd((40, 2), dtype, g)
+        return (lambda X, V: trnsparse.kernel_matmul(X, None, V, noise=0.1)), (X, V)
     raise AssertionError(api)
 
 
@@ -722,6 +743,7 @@ DEVICE_APIS = [
     "richardson_bsr",
     "power_iteration_bsr",
     "jacobi_preconditioner_bsr",
+    "kernel_matmul",
 ]
 DEVICE_CASES = [(a, torch.float64) for a in DEVICE_APIS] + [
     (a, torch.complex128) for a in ("spmv", "spmm", "bsr_spmm", "cg_bsr")
@@ -868,3 +890,34 @@ def test_fp64_on_host_unchanged(monkeypatch):
         _, ws = _call(fn, args)
         assert ws == [], api
     assert calls == []
+
+
+def test_fp64_on_device_kernel_operator_computes_on_host(monkeypatch):
+    """`KernelOperator` keeps its operands, so `_fp64_host_guard` cannot see
+    them: a float64 operator bound for the neuron device under `auto` is built
+    and applied on the host (one warning), and the product goes to V's device.
+    The override, explicit `nki` and the pytorch backend keep the device."""
+    g = torch.Generator().manual_seed(5)
+    X, V = _rnd((40, 3), torch.float64, g), _rnd((40, 2), torch.float64, g)
+    ref = trnsparse.kernel_matmul_reference(X, None, V, "rbf", 1.0, 1.0, 0.1)
+    _fake_neuron(monkeypatch)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        op = trnsparse.KernelOperator(_neuron(X), noise=0.1)
+        outs = [op(V) for _ in range(2)]
+        trnsparse.KernelOperator(_neuron(X), noise=0.1)
+    ws = _host_warnings(caught)
+    assert len(ws) == 1 and "trnsparse KernelOperator:" in str(ws[0].message)
+    assert op.device == torch.device("cpu") and op._home is not None
+    assert op.route == "torch" and op.X.dtype == torch.float64
+    for out in outs:
+        assert out.dtype == torch.float64
+        torch.testing.assert_close(out, ref, rtol=1e-12, atol=1e-12)
+    monkeypatch.setattr(dispatch, "_FP64_ON_DEVICE", True)
+    assert trnsparse.KernelOperator(_neuron(X))._home is None
+    monkeypatch.setattr(dispatch, "_FP64_ON_DEVICE", False)
+    for backend in ("nki", "pytorch"):
+        monkeypatch.setattr(dispatch, "_backend", backend)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            assert trnsparse.KernelOperator(_neuron(X))._home is None

@@ -24,6 +24,7 @@ trnsparse/
 │   ├── screening.py     # schwarz_bounds, screen_quartets, density_screen
 │   ├── iterative.py     # cg_bsr, cg_bsr_fused, power_iteration_bsr(_fused), jacobi_preconditioner_bsr
 │   ├── multicore.py     # ShardedBSR, ShardedAttention (logical NeuronCores of one chip)
+│   ├── kernel_matmul.py # kernel_matmul, KernelOperator: fused K(X, Y) @ V, K never formed (#93)
 │   └── nki/
 │       ├── __init__.py
 │       ├── kernels.py       # _bsr_spmm_kernel, _screened_spmm_kernel, attention kernels
