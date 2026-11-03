@@ -555,6 +555,63 @@ def kmv_selfblk(
 from . import _native_attn  # noqa: E402
 
 # Keyed by the short op name used in `dispatch._launch` / `dispatch._run`.
+# The kernel each single-kernel op's body calls, as (module, attribute) plus,
+# for ops whose body converts its static arguments, the conversion applied to
+# each argument position (None: passed as is). Used by the eager handle in
+# `dispatch._native_call`, which resolves the kernel at call time and applies
+# the same conversions. `bsr_attn` / `bsr_attn_bwd` run whole drivers and are
+# not listed (their kernel launches inside take the handle on their own).
+# Also not listed, though single kernel calls: `kmv_self` / `kmv_cross` /
+# `kmv_selfblk`, whose launches (`dispatch._kmv_launch`) take a handle from the
+# same cache keyed by operand shapes, and `screened_tiles_keyed` (#61), which
+# `dispatch` still calls through the custom op (its handle path has not been
+# validated on the device yet).
+KERNELS = {
+    "spmm_dense": (_k, "_spmm_dense_kernel"),
+    "bsr_spmm": (_k, "_bsr_spmm_kernel"),
+    "screened_spmm": (_k, "_screened_spmm_kernel"),
+    "bsr_spmm_static": (_k, "_bsr_spmm_static_kernel", (None, None, tuple, tuple)),
+    "bsr_spmm_static_t": (_k, "_bsr_spmm_static_t_kernel", (None, None, tuple, tuple)),
+    "bsr_spmm_keyed": (_k, "_bsr_spmm_keyed_kernel", (None, None, int)),
+    "bsr_spmm_t_keyed": (_k, "_bsr_spmm_t_keyed_kernel", (None, None, int)),
+    "attn_fwd_keyed": (_k, "_attn_fwd_keyed_kernel", (None, None, None, int)),
+    "attn_fwd_static": (_k, "_attn_fwd_static_kernel", (None, None, None, tuple, tuple)),
+    "attn_bwd_static": (
+        _k,
+        "_attn_bwd_static_kernel",
+        (
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            tuple,
+            tuple,
+            tuple,
+            tuple,
+            float,
+        ),
+    ),
+    "attn_stats": (_k, "_attn_stats_kernel"),
+    "attn_out": (_k, "_attn_out_kernel"),
+    "attn_bwd_dq": (_k, "_attn_bwd_dq_kernel"),
+    "attn_bwd_dkdv": (_k, "_attn_bwd_dkdv_kernel"),
+    "cg_bsr_keyed": (
+        _k,
+        "_cg_bsr_keyed_kernel",
+        (None, None, None, int, int, int, int, int, int, int, int),
+    ),
+    "power_bsr_keyed": (_k, "_power_bsr_keyed_kernel", (None, None, int, int, int, int, int, int)),
+}
+
 OPS = {
     "spmm_dense": spmm_dense,
     "bsr_spmm": bsr_spmm,
