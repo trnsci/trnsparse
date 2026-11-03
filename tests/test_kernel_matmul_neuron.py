@@ -109,3 +109,63 @@ def test_bitwise_deterministic():
         lnc = os.environ.get("NEURON_LOGICAL_NC_CONFIG", "default")
         os.makedirs(out, exist_ok=True)
         torch.save(a, os.path.join(out, f"kmv_n{n}_lnc{lnc}.pt"))
+
+
+@pytest.mark.parametrize("kernel", ["rbf", "matern52"])
+@pytest.mark.parametrize("self_op", [True, False], ids=["square", "cross"])
+def test_row_blocked_is_bitwise_one_launch(monkeypatch, kernel, self_op):
+    """Forced small row blocks (#100) == one launch, bit for bit, on the device.
+
+    n = 5000 in 1024-row blocks: four full blocks and a padded ragged one.
+    """
+    g = torch.Generator().manual_seed(100)
+    n, R = 5000, 33
+    m = n if self_op else 3000
+    X = torch.rand(n, 3, generator=g)
+    Y = None if self_op else torch.rand(m, 3, generator=g)
+    V = torch.randn(m, R, generator=g)
+    op = trnsparse.KernelOperator(
+        X if self_op else Y, kernel, 0.1, 1.0, noise=1e-4 if self_op else 0.0, device=DEV
+    )
+    Vd = V.to(DEV)
+
+    def apply():
+        return (op(Vd) if self_op else op.cross(X, Vd)).cpu()
+
+    monkeypatch.delenv("TRNSPARSE_KMV_BLOCK_WORK", raising=False)
+    one = apply()
+    monkeypatch.setenv("TRNSPARSE_KMV_BLOCK_WORK", str(1024 * m * (3 + R)))
+    assert _d._kernels.kmv_block_rows(n, m, 3, R, _d._kmv_block_work()) == 1024
+    n_handles = len(_d._eager_handles)
+    blocked = apply()
+    assert torch.equal(one, blocked)
+    assert len(_d._eager_handles) - n_handles <= 1  # one handle for every block shape
+    ref = trnsparse.kernel_matmul_reference(
+        X, None if self_op else Y, V, kernel, 0.1, 1.0, noise=1e-4 if self_op else 0.0
+    )
+    assert _rel(blocked, ref) < 2e-5
+
+
+@pytest.mark.skipif(
+    os.environ.get("TRNSPARSE_KMV_BIG") != "1", reason="set TRNSPARSE_KMV_BIG=1 (minutes)"
+)
+def test_one_million_rows_under_the_runtime_timeout():
+    """n = 2^20, R = 33: was one 40-80 s launch (NRT status 5 at 30 s); now 2048-row blocks."""
+    import time
+
+    n = 1 << 20
+    g = torch.Generator().manual_seed(7)
+    X, V = torch.rand(n, 3, generator=g), torch.randn(n, 33, generator=g)
+    op = trnsparse.KernelOperator(X, "rbf", 0.05, 1.0, noise=1e-4, device=DEV)
+    Vd = V.to(DEV)
+    out = op(Vd)  # compile + first run
+    torch.neuron.synchronize()
+    t0 = time.perf_counter()
+    out = op(Vd)
+    torch.neuron.synchronize()
+    dt = time.perf_counter() - t0
+    print(f"\nn={n} R=33 rbf: {dt:.2f} s, {n * n / dt:.3e} entries/s")
+    idx = torch.linspace(0, n - 1, 64).long()
+    ref = trnsparse.kernel_matmul_reference(X[idx], X, V, "rbf", 0.05, 1.0)
+    ref += 1e-4 * V[idx].double()
+    assert _rel(out.cpu()[idx], ref) < 2e-5

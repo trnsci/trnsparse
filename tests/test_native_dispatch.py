@@ -64,7 +64,7 @@ AUTOGRAD_OPS = {
 }
 COMPOSITE_OPS = {"bsr_attn", "bsr_attn_bwd"}
 # Fused kernel-matrix product (#93): tensors plus static `kind` / `group` ints.
-KMV_OPS = {"kmv_self", "kmv_cross"}
+KMV_OPS = {"kmv_self", "kmv_cross", "kmv_selfblk"}
 STATIC_OPS |= KMV_OPS
 P = 128
 

@@ -146,6 +146,81 @@ def test_dispatch_path_under_simulator():
         trnsparse.set_backend(old)
 
 
+def _run_blocked(x, y, v, params, kind, lnc, self_op, rows, group=4):
+    """The product as zero-padded row blocks of `rows`, as `nki_kernel_matmul` launches it (#100)."""
+    n, d = x.shape
+    yy = x if self_op else y
+    outs = []
+    for i0 in range(0, n, rows):
+        nb = min(rows, n - i0)
+        xb = np.zeros((rows, d), np.float32)
+        xb[:nb] = x[i0 : i0 + nb]
+        if self_op:
+            vb = np.zeros((rows, v.shape[1]), np.float32)
+            vb[:nb] = v[i0 : i0 + nb]
+            args = (xb, yy, v, vb, params, kind, group)
+            kern = K._kmv_selfblk_kernel
+        else:
+            args = (xb, yy, v, params, kind, group)
+            kern = K._kmv_cross_kernel
+        ob = np.asarray(simulate_kernel(kern, args, {}, lnc=lnc, target="trn2"))
+        outs.append(ob[:nb])
+    return np.concatenate(outs)
+
+
+def _assert_blocked_matches(one, blocked):
+    """Bitwise, except the simulator's ragged last 128-row chunk (n % 128 rows).
+
+    In one launch that chunk is a matmul of n % 128 columns; in a padded
+    block it is part of a full 128-column one. The simulator runs each as a
+    numpy matmul, whose summation order changes with the width (a 1-row
+    product is a GEMV), so those rows may differ in the last bit there. The
+    TensorEngine computes every output column the same way at any width,
+    which the neuron-marked test checks bit for bit on the device.
+    """
+    n = one.shape[0]
+    head = n - n % _TILE
+    assert np.array_equal(one[:head], blocked[:head])
+    np.testing.assert_allclose(blocked[head:], one[head:], rtol=1e-6, atol=1e-6)
+
+
+_TILE = 128
+
+
+@pytest.mark.parametrize("lnc", [1, 2])
+@pytest.mark.parametrize("self_op", [True, False], ids=["square", "cross"])
+@pytest.mark.parametrize("kernel", ["rbf", "matern52"])
+@pytest.mark.parametrize("n,rows", [(1000, 256), (1280, 1024), (1300, 1024), (513, 128)])
+def test_simulate_row_blocked_is_bitwise_one_launch(n, rows, kernel, self_op, lnc):
+    """Row blocks (ragged tail zero-padded) give the one-launch result bit for bit (#100)."""
+    m = n if self_op else 700
+    x, y, v, params, ref = _inputs(n, m, 3, 33, kernel, self_op, seed=n)
+    kind = _KINDS.index(kernel)
+    one = _run(x, y, v, params, kind, lnc, self_op)
+    blocked = _run_blocked(x, y, v, params, kind, lnc, self_op, rows)
+    _assert_blocked_matches(one, blocked)
+
+
+@pytest.mark.skipif(not dispatch._use_simulator(), reason="needs TRNSPARSE_USE_SIMULATOR=1")
+@pytest.mark.parametrize("self_op", [True, False], ids=["square", "cross"])
+def test_dispatch_row_blocked_under_simulator(monkeypatch, self_op):
+    """`nki_kernel_matmul` with a forced tiny budget == the one-launch kernel, bitwise."""
+    n = 640 + 60  # five 128-row chunks and a ragged one
+    m = n if self_op else 300
+    x, y, v, params, _ = _inputs(n, m, 3, 5, "rbf", self_op, seed=11)
+    args = [torch.from_numpy(a) for a in (x, v, params)]
+    xt, vt, pt = args
+    yt = None if self_op else torch.from_numpy(y)
+    monkeypatch.delenv("TRNSPARSE_KMV_BLOCK_WORK", raising=False)
+    one = dispatch.nki_kernel_matmul(xt, yt, vt, pt, 0, 4)
+    monkeypatch.setenv("TRNSPARSE_KMV_BLOCK_WORK", str(256 * m * 8))  # 256-row blocks
+    assert K.kmv_block_rows(n, m, 3, 5, dispatch._kmv_block_work()) == 256
+    blocked = dispatch.nki_kernel_matmul(xt, yt, vt, pt, 0, 4)
+    _assert_blocked_matches(one.numpy(), blocked.numpy())
+    direct = _run(x, y, v, params, 0, 1, self_op)
+    assert np.array_equal(one.numpy(), direct)
+
+
 def _compile_cases():
     f = np.zeros
     p = f((128, 4), np.float32)
@@ -183,6 +258,21 @@ def _compile_cases():
                 f((m, R), np.float32),
                 p,
                 kind,
+                4,
+            ),
+        )
+    # Row blocks of the square operator (#100): 2048 rows of n = 1M at R = 33,
+    # and a small ragged-free block.
+    for nb, m, R in [(2048, 1 << 20, 33), (256, 1000, 7)]:
+        cases[f"selfblk-nb{nb}-m{m}-R{R}"] = (
+            "_kmv_selfblk_kernel",
+            lambda nb=nb, m=m, R=R: (
+                f((nb, 3), np.float32),
+                f((m, 3), np.float32),
+                f((m, R), np.float32),
+                f((nb, R), np.float32),
+                p,
+                0,
                 4,
             ),
         )

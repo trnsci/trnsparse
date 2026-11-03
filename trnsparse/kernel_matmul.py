@@ -15,7 +15,9 @@ Kernels (stationary, of the distance r = |x - y| / lengthscale):
 with s the outputscale. A tensor lengthscale of shape (d,) gives per-dimension
 (ARD) lengthscales by rescaling X and Y on the host.
 
-On the NKI backend one kernel launch computes the whole product: squared
+On the NKI backend one kernel launch computes the whole product (row blocks
+of X in several launches above `kernels._KMV_BLOCK_WORK`, so no launch
+reaches the runtime's 30 s timeout, #100; bit-identical either way): squared
 distances as one TensorEngine matmul per 128 x 512 tile on augmented
 coordinates, the kernel function on ScalarE reading PSUM, and the product
 with V on the TensorEngine, accumulated in PSUM (see

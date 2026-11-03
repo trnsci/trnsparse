@@ -245,3 +245,108 @@ def test_kmv_split_covers_rows_with_equal_trip_counts(n, R, n_prog):
             owner[r] = pid if owner[r] is None else owner[r]
     assert len(trips) == 1  # same rolled-loop trip count on every core
     assert all(o is not None for o in owner)
+
+
+# ── Row-blocked launches (#100): no launch reaches the 30 s runtime timeout ──
+
+
+def test_kmv_block_rows_rule():
+    W = K._KMV_BLOCK_WORK
+    # Under the budget: one launch, blocking is a no-op.
+    assert K.kmv_block_rows(1000, 1000, 3, 33, W) == 1000
+    # n = 1M, d = 3, R = 33 (the Trn2 timeout of #100): 2048-row blocks, 512 launches.
+    rows = K.kmv_block_rows(1 << 20, 1 << 20, 3, 33, W)
+    assert rows == 2048 and rows % K._KMV_BLOCK_QUANTUM == 0
+    assert rows * (1 << 20) * 36 <= W < (rows + K._KMV_BLOCK_QUANTUM) * (1 << 20) * 36
+    for n, m, d, R in [
+        (1 << 20, 1 << 20, 1, 1),
+        (1 << 20, 1 << 20, 126, 1500),
+        (10**6, 10**7, 3, 1),
+    ]:
+        rows = K.kmv_block_rows(n, m, d, R, W)
+        assert rows % 128 == 0 and 128 <= rows < n
+        assert rows * m * (d + R) <= W or rows == 128
+    # Tiny budgets round to 128-row tiles, never below one tile.
+    assert K.kmv_block_rows(1000, 50, 3, 2, 50 * 5 * 300) == 256
+    assert K.kmv_block_rows(1000, 50, 3, 2, 1) == 128
+    assert K.kmv_block_rows(100, 50, 3, 2, 1) == 100
+
+
+def _fake_launch(calls):
+    """Stand-in for one kernel launch: row-local float64 math, one row at a time.
+
+    Every output row is computed by the same operations whatever block it is
+    in, so blocked == unblocked bitwise exactly when the host-side blocking
+    (slicing, padding, the noise rows, stitching) is right.
+    """
+
+    def launch(x, y, v, vn, params, kind, group, sim):
+        calls.append((tuple(x.shape), None if y is None else tuple(y.shape), vn is not None))
+        Y = x if y is None else y
+        a, noise = float(params[0, 0]), float(params[0, 2])
+        Y64, V64 = Y.double(), v.double()
+        out = torch.empty(x.shape[0], v.shape[1], dtype=torch.float64)
+        for i in range(x.shape[0]):
+            D = ((x[i].double() - Y64) ** 2).sum(1)
+            out[i] = torch.exp(a * D) @ V64
+        if y is None:
+            out += noise * V64
+        elif vn is not None:
+            out += noise * vn.double()
+        return out.float()
+
+    return launch
+
+
+@pytest.mark.parametrize("self_op", [True, False], ids=["square", "cross"])
+@pytest.mark.parametrize("n", [1, 128, 300, 513, 1000])
+def test_row_blocked_launch_matches_one_launch(monkeypatch, self_op, n):
+    from trnsparse.kernel_matmul import _params
+    from trnsparse.nki import dispatch as D
+
+    g = torch.Generator().manual_seed(n)
+    m = n if self_op else 77
+    x = torch.rand(n, 3, generator=g)
+    y = None if self_op else torch.rand(m, 3, generator=g)
+    v = torch.randn(m, 5, generator=g)
+    params = _params(-0.5 / 0.3**2, 1.0, 1e-2 if self_op else 0.0, "cpu")
+    calls = []
+    monkeypatch.setattr(D, "_kmv_launch", _fake_launch(calls))
+    monkeypatch.setattr(D, "_use_simulator", lambda: True)  # host tensors, no device move
+
+    monkeypatch.delenv("TRNSPARSE_KMV_BLOCK_WORK", raising=False)
+    one = D.nki_kernel_matmul(x, y, v, params, 0, 4)
+    assert len(calls) == 1 and calls[0][2] is False  # under the budget: one plain launch
+
+    calls.clear()
+    monkeypatch.setenv("TRNSPARSE_KMV_BLOCK_WORK", "1")  # force 128-row blocks
+    blocked = D.nki_kernel_matmul(x, y, v, params, 0, 4)
+    assert torch.equal(one, blocked)
+    rows = K.kmv_block_rows(n, m, 3, 5, 1)
+    assert len(calls) == -(-n // rows)
+    if n > rows:
+        # Every launch has the block shape (ragged tail padded), Y whole, and
+        # the square operator's blocks carry their rows of V for the noise.
+        assert {c[0] for c in calls} == {(rows, 3)}
+        assert {c[1] for c in calls} == {(m, 3)}
+        assert all(c[2] is self_op for c in calls)
+
+
+def test_kernel_operator_row_blocked_under_nki_backend(monkeypatch):
+    """KernelOperator on the nki route goes through the blocked launcher."""
+    from trnsparse.nki import dispatch as D
+
+    calls = []
+    monkeypatch.setattr(D, "_kmv_launch", _fake_launch(calls))
+    monkeypatch.setattr(D, "_use_simulator", lambda: True)
+    monkeypatch.setattr(D, "_use_nki", lambda: True)
+    g = torch.Generator().manual_seed(9)
+    X, V = torch.rand(700, 3, generator=g), torch.randn(700, 4, generator=g)
+    op = KernelOperator(X, "rbf", 0.3, 1.0, noise=1e-3)
+    assert op.route == "nki"
+    monkeypatch.delenv("TRNSPARSE_KMV_BLOCK_WORK", raising=False)
+    a = op(V)
+    monkeypatch.setenv("TRNSPARSE_KMV_BLOCK_WORK", str(256 * 700 * 7))
+    b = op(V)
+    assert len(calls) == 1 + 3  # 256-row blocks: 256, 256, 188 (padded)
+    assert torch.equal(a, b)
