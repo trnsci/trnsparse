@@ -165,6 +165,73 @@ Restricted to square A (`M == K`) with 1-D `diag_integrals` in v0.4.0
 — the common Fock-build case. Rectangular / asymmetric-bounds
 extension is a follow-up if asked for.
 
+## Precision and dtypes
+
+Every NKI kernel computes in fp32 or bf16 with fp32 PSUM accumulation.
+Trainium computes float64 at fp32 precision, so no kernel can return a
+float64-accurate result. float64 operands (and complex128 in `bsr_spmm`,
+whose complex path runs as real kernel launches) follow one rule across
+the trnsci suite (#84):
+
+| configuration | float64 / complex128 operands |
+|---|---|
+| `set_backend("auto")` (default) | the PyTorch path, at float64 accuracy, the same code as `set_backend("pytorch")`; on the host, also for operands that live on the `neuron` device (see below) |
+| `set_backend("nki")` | cast to fp32 (complex64) for the kernel; one `UserWarning` per op per process says precision is reduced to fp32 |
+| `TRNSPARSE_REQUIRE_NKI=1` | `NotImplementedError` (takes precedence over the explicit-nki cast) |
+
+This covers `spmm`, `bsr_spmm`, `screened_spmm`,
+`block_sparse_attention_tiled` (forward and backward), `cg_bsr` (through
+`bsr_spmm`) and the fused solvers `cg_bsr_fused` /
+`power_iteration_bsr_fused`, whose host path then runs in float64. A
+call with any float64 value operand counts (for example fp32 CSR values
+with a float64 `B`). `screened_spmm` decides on `A` and `B`; the Schwarz
+bound vector `diag_integrals` only builds the mask.
+
+The result dtype is always what `set_backend("pytorch")` returns for the
+same inputs, including bf16 / fp16 operands and mixed-dtype promotion
+(`torch.promote_types` of the operands); a kernel that computes in fp32
+has its result cast to that dtype. fp32, bf16 and fp16 operands take the
+kernels unchanged. Integer, bool and complex operands (outside
+`bsr_spmm`) have no kernel and take the PyTorch path, or raise
+`NotImplementedError` under `TRNSPARSE_REQUIRE_NKI`.
+
+Before 0.14.0 (0.2.0 through 0.13.0), float64 under `auto` was cast to
+fp32 on the NKI path without a warning.
+
+### float64 on the `neuron` device
+
+On the `neuron` device the PyTorch path would be device aten, and device
+aten computes float64 at fp32 precision too (measured on Trn2). So under
+`auto`, when any float64 or complex128 operand of a public op lives on a
+`neuron` device (a dense tensor, or the values / blocks of a CSR, COO or
+BSR matrix), the op runs on the host instead: the device-resident operands
+are copied to the CPU (indices included), host torch computes at float64,
+and the result is copied back to the dense operand's device in float64
+(complex128). The copies are differentiable, so autograd flows through
+them. The first such call of each op emits one `UserWarning`: "float64 on
+the neuron device is computed on the host for float64 accuracy (device
+arithmetic is fp32); pass float32 to stay on device".
+
+This covers `spmv`, `spmm`, `spmv_symmetric`, `bsr_spmm`, `screened_spmm`,
+`block_sparse_attention_tiled` (forward and backward), `cg_bsr`,
+`chebyshev_bsr`, `richardson_bsr`, `power_iteration_bsr` and the
+preconditioner returned by `jacobi_preconditioner_bsr`; a solver moves its
+operands once, not once per iteration. The fused solvers `cg_bsr_fused` /
+`power_iteration_bsr_fused` already run float64 on their host path.
+
+To keep float64 on the device anyway (faster, fp32 precision), set
+`TRNSPARSE_FP64_ON_DEVICE=1`: device-resident float64 then runs in device
+aten, without copies or the warning. The explicit `set_backend("nki")`
+cast, the pytorch backend and host-resident float64 are not affected.
+float32, bf16 and fp16 operands on the device stay on the device.
+
+Under `TRNSPARSE_REQUIRE_NKI=1` (backends `auto` and `nki`), a float64 /
+complex128 operand on the `neuron` device raises `NotImplementedError` at
+every public op, before any host copy or kernel, also with
+`TRNSPARSE_FP64_ON_DEVICE=1`: no kernel computes float64 at float64
+accuracy, and the routes without a kernel (CSR `spmv` / `spmv_symmetric` /
+`spmm`) would otherwise run device aten at fp32 precision with no error.
+
 ## Known limits
 
 - **BSR block size.** The NKI kernels take `block_size=128` only. Other block

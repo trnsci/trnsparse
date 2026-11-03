@@ -179,15 +179,20 @@ def test_float64_policy_on_nki(monkeypatch):
     monkeypatch.setattr(dispatch, "nki_kernel_matmul", fake)
     X = torch.rand(20, 3, dtype=torch.float64)
     V = torch.rand(20, 1, dtype=torch.float64)
-    monkeypatch.setattr(dispatch, "get_backend", lambda: "nki")
+    # The suite float64 policy (#84), as `dispatch._fp64_route` applies it to
+    # every trnsparse kernel route.
+    monkeypatch.setattr(dispatch, "_backend", "nki")
+    monkeypatch.setattr(dispatch, "_fp64_warned", set())
     monkeypatch.setattr(dispatch, "_REQUIRE_NKI", False)
-    with pytest.warns(UserWarning, match="float32"):
+    with pytest.warns(UserWarning, match="float32") as rec:
         out = kernel_matmul(X, None, V)
+        kernel_matmul(X, None, V)
+    assert sum("kernel_matmul" in str(w.message) for w in rec) == 1  # once per op
     assert seen["dtype"] == torch.float32 and out.dtype == torch.float64
     monkeypatch.setattr(dispatch, "_REQUIRE_NKI", True)
-    with pytest.raises(TypeError, match="REQUIRE_NKI"):
+    with pytest.raises(NotImplementedError, match="REQUIRE_NKI"):
         kernel_matmul(X, None, V)
-    monkeypatch.setattr(dispatch, "get_backend", lambda: "auto")
+    monkeypatch.setattr(dispatch, "_backend", "auto")
     monkeypatch.setattr(dispatch, "_REQUIRE_NKI", False)
     seen.clear()
     kernel_matmul(X, None, V)  # auto: float64 stays on torch

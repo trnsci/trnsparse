@@ -23,6 +23,8 @@ device of the dense operand.
 
 from __future__ import annotations
 
+import dataclasses
+import functools
 import importlib.util
 import os
 import sys
@@ -50,6 +52,16 @@ if HAS_NKI:
 # When set, kernel-path failures re-raise instead of falling back to
 # PyTorch. Used by the hardware validation suite.
 _REQUIRE_NKI = os.environ.get("TRNSPARSE_REQUIRE_NKI", "").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
+# float64 / complex128 on the `neuron` device under `auto` (#84): device aten
+# computes them at fp32 precision (measured on Trn2), so the op runs in host
+# torch instead and the result comes back to the device (`_fp64_host_guard`).
+# TRNSPARSE_FP64_ON_DEVICE=1 keeps device aten (fp32 precision, no copies).
+_FP64_ON_DEVICE = os.environ.get("TRNSPARSE_FP64_ON_DEVICE", "").lower() in (
     "1",
     "true",
     "yes",
@@ -137,6 +149,367 @@ def _nki_block_ok(op: str, block_size: int) -> bool:
             "or unset TRNSPARSE_REQUIRE_NKI to use the PyTorch path."
         )
     return False
+
+
+# ── Kernel operand dtypes: one guard at the kernel boundary ─────────────────
+#
+# Every NKI kernel computes in fp32 / bf16 (fp32 PSUM). float64, complex,
+# integer and bool tensors must never reach one: before 0.12.2 some did, and
+# came back as garbage, a dropped imaginary part, or the wrong dtype
+# (#78, #79, trnsci/trnsci#35). Two layers:
+#
+# 1. `_kernel_route` (with `_no_kernel_for_dtype` / `_fp64_route`), at each
+#    public entry: which value dtypes a kernel path can take. Complex (outside
+#    `bsr_spmm`), integer and bool values have no kernel: they take the PyTorch
+#    path (what `set_backend("pytorch")` does), or raise `NotImplementedError`
+#    under TRNSPARSE_REQUIRE_NKI. float64 (and complex128 in `bsr_spmm`'s
+#    complex kernel path) follows the suite fp64 policy (#84): Trainium
+#    computes fp64 at fp32 precision, so under `auto` it takes the PyTorch
+#    path at float64 accuracy; under an explicit `set_backend("nki")` it is
+#    cast to fp32 for the kernel with a one-time `UserWarning` per op; under
+#    TRNSPARSE_REQUIRE_NKI it raises `NotImplementedError`. The result dtype
+#    is always the pytorch backend's for the same inputs.
+# 2. `_check_kernel_operands`, enforced by every launch itself (the native op
+#    table from `_get_native_ops`, `_run` on the XLA path, `_simulate` on the
+#    simulator): each tensor operand of each op, by position, must have a dtype
+#    in `_KERNEL_OPERAND_DTYPES[op]`, else `TypeError`. A wrapper that forgets
+#    layer 1 fails loudly instead of handing a kernel an unsupported dtype.
+
+_F32 = frozenset({torch.float32})
+_MM = frozenset({torch.float32, torch.bfloat16})  # static / attention matmul operands
+_MM16 = _MM | {torch.float16}  # the gather GEMM kernels also take fp16 (as before)
+_ANYF = _MM16 | {torch.float64}  # composite ops: cast internally per kernel
+_IDX = frozenset({torch.int32, torch.int64})
+
+# Allowed dtypes per tensor operand, in argument order (non-tensor arguments
+# such as structure lists, keys and flags are skipped). Keyed by the short op
+# name used in `_native.OPS`, `_launch`, `_run` and `_simulate`.
+_KERNEL_OPERAND_DTYPES: dict[str, tuple[frozenset, ...]] = {
+    "spmm_dense": (_MM16, _MM16),
+    "bsr_spmm": (_MM16, _MM16),
+    "screened_spmm": (_MM16, _MM16, _MM16, _MM16),
+    "screened_tiles_keyed": (_MM, _F32, _F32, _F32, _MM),  # A, Q col / row, tau, B
+    "bsr_spmm_static": (_MM, _MM),
+    "bsr_spmm_static_t": (_MM, _MM),
+    "bsr_spmm_keyed": (_MM, _MM),
+    "bsr_spmm_t_keyed": (_MM, _MM),
+    "attn_fwd_keyed": (_MM, _MM, _MM),
+    "attn_fwd_static": (_MM, _MM, _MM),
+    "attn_bwd_static": (_MM,) * 7 + (_F32,) * 6,
+    "attn_stats": (_MM, _MM),
+    "attn_out": (_MM, _MM, _MM, _F32, _F32),
+    "attn_bwd_dq": (_MM,) * 4 + (_F32,) * 3,
+    "attn_bwd_dkdv": (_MM,) * 4 + (_F32,) * 3,
+    "cg_bsr_keyed": (_MM, _F32, _F32),
+    "power_bsr_keyed": (_MM, _F32),
+    # kernel_matmul (#93): X, (Y,) V, (V's noise rows,) params; fp32 throughout.
+    "kmv_self": (_F32,) * 3,
+    "kmv_cross": (_F32,) * 4,
+    "kmv_selfblk": (_F32,) * 5,
+    # Composite ops (several kernel launches; each launch is checked again).
+    "bsr_attn": (_ANYF, _ANYF, _ANYF, _IDX, _IDX),
+    "bsr_attn_bwd": (_ANYF,) * 5 + (_IDX, _IDX) + (_ANYF, _ANYF),
+}
+
+# Value dtypes a kernel path takes at the public entry (float64 only through
+# the explicit-nki fp32 cast, see `_fp64_route`).
+_KERNEL_VALUE_DTYPES = _ANYF
+
+# Dtypes the device computes at fp32 precision only (#84).
+_FP64_DTYPES = frozenset({torch.float64, torch.complex128})
+
+# Ops that already warned about the explicit-nki fp32 cast (one warning per op).
+_fp64_warned: set[str] = set()
+
+
+def _check_kernel_operands(op_name: str, args) -> None:
+    """Raise `TypeError` unless every tensor in `args` has an allowed dtype for `op_name`."""
+    allowed = _KERNEL_OPERAND_DTYPES.get(op_name)
+    if allowed is None:
+        raise TypeError(f"trnsparse kernel {op_name!r} has no operand dtype table entry")
+    tensors = [a for a in args if isinstance(a, torch.Tensor)]
+    if len(tensors) != len(allowed) or any(
+        t.dtype not in ok for t, ok in zip(tensors, allowed, strict=False)
+    ):
+        got = [str(t.dtype) for t in tensors]
+        want = [sorted(str(d) for d in ok) for ok in allowed]
+        raise TypeError(
+            f"trnsparse kernel {op_name!r}: operand dtypes {got} not allowed (expected {want})"
+        )
+
+
+def _guard_op(op_name: str, op):
+    """`op` with its operand dtypes checked on every call (see `_check_kernel_operands`)."""
+
+    def guarded(*args, **kwargs):
+        _check_kernel_operands(op_name, args)
+        return op(*args, **kwargs)
+
+    guarded.__name__ = guarded.__qualname__ = op_name
+    guarded.__wrapped__ = op
+    return guarded
+
+
+def _kernel_values_ok(*tensors: torch.Tensor) -> bool:
+    """True when every value operand has a kernel dtype (float64 through a cast)."""
+    return all(t.dtype in _KERNEL_VALUE_DTYPES for t in tensors)
+
+
+def _no_kernel_for_dtype(what: str, *tensors: torch.Tensor) -> None:
+    """Under TRNSPARSE_REQUIRE_NKI, refuse value dtypes the kernels do not take.
+
+    Without it the caller runs the PyTorch path instead (as `set_backend("pytorch")`).
+    """
+    if _REQUIRE_NKI:
+        dts = sorted({str(t.dtype) for t in tensors})
+        raise NotImplementedError(
+            f"trnsparse {what}: the NKI kernels take float32/bfloat16/float16 "
+            f"values, got {dts}. Unset TRNSPARSE_REQUIRE_NKI to compute in torch."
+        )
+
+
+def _fp64_route(what: str, *dtypes: torch.dtype) -> bool:
+    """The fp64 policy (#84) for value dtypes headed to a kernel.
+
+    True: a kernel path (no float64 / complex128, or an explicit
+    `set_backend("nki")`, where the caller casts to fp32 / complex64 and
+    this warns once per op). False: the PyTorch path at float64 accuracy
+    (backend `auto`). Under TRNSPARSE_REQUIRE_NKI, float64 / complex128
+    raise `NotImplementedError` (the kernels cannot give fp64 accuracy).
+    """
+    wide = sorted({str(d) for d in dtypes if d in _FP64_DTYPES})
+    if not wide:
+        return True
+    if _REQUIRE_NKI:
+        raise NotImplementedError(
+            f"trnsparse {what}: no NKI kernel computes {', '.join(wide)} at full "
+            "precision (Trainium computes float64 at fp32 precision). Unset "
+            "TRNSPARSE_REQUIRE_NKI to compute in torch at float64 accuracy, or pass "
+            "float32 operands."
+        )
+    if _backend != "nki":
+        return False
+    key = what.removesuffix(" backward")
+    if key not in _fp64_warned:
+        _fp64_warned.add(key)
+        warnings.warn(
+            f"trnsparse {key}: {', '.join(wide)} operands on the explicit NKI backend "
+            "are cast to float32 / complex64 for the kernel, so precision is reduced "
+            "to fp32 (the result keeps the pytorch-backend dtype). Use "
+            'set_backend("auto") for float64 accuracy in torch.',
+            UserWarning,
+            stacklevel=3,
+        )
+    return True
+
+
+def _kernel_route(what: str, *tensors: torch.Tensor) -> bool:
+    """True: a kernel path. False: the PyTorch path.
+
+    Complex / integer / bool values: the PyTorch path (raises under
+    REQUIRE_NKI). float64: `_fp64_route` (torch under `auto`, an fp32 cast
+    with a one-time warning under explicit `nki`, raise under REQUIRE_NKI).
+    """
+    if not _kernel_values_ok(*tensors):
+        _no_kernel_for_dtype(what, *tensors)
+        return False
+    return _fp64_route(what, *(t.dtype for t in tensors))
+
+
+# ── Device-resident float64 under `auto`: host torch (#84) ───────────────────
+#
+# `auto` promises float64 accuracy for float64 (and complex128) operands. On
+# the host that is host torch; on the `neuron` device the torch fallback
+# would be device aten, which computes float64 at fp32 precision. So every
+# public op is wrapped in `_fp64_host_guard`: under `auto` (not
+# TRNSPARSE_REQUIRE_NKI, which raises for such operands first, on every
+# route, `_refuse_device_fp64`; and not
+# TRNSPARSE_FP64_ON_DEVICE), a float64 / complex128 tensor operand on a
+# `neuron` device (directly, or as a CSR / COO / BSR container's values)
+# sends the whole call to the host: neuron-resident operands are copied to
+# the CPU (indices included), the op runs there (host torch at float64),
+# and tensor results go back to the device of the dense operand, keeping
+# their dtype. The copies are `.to()` calls, so autograd flows through.
+# One `UserWarning` per op.
+
+_fp64_host_warned: set[str] = set()
+
+
+def _on_neuron_device(t: torch.Tensor) -> bool:
+    """True when `t` lives on a `neuron` device (patched in the CPU tests)."""
+    return t.device.type == "neuron"
+
+
+_SPARSE_CONTAINERS: tuple[type, ...] | None = None
+
+
+def _sparse_containers() -> tuple[type, ...]:
+    global _SPARSE_CONTAINERS
+    if _SPARSE_CONTAINERS is None:
+        from ..formats import BSRMatrix, COOMatrix, CSRMatrix
+
+        _SPARSE_CONTAINERS = (CSRMatrix, COOMatrix, BSRMatrix)
+    return _SPARSE_CONTAINERS
+
+
+def _operand_tensors(x):
+    """The tensors in one operand (a tensor, sparse container, tuple or list)."""
+    if isinstance(x, torch.Tensor):
+        yield x
+    elif isinstance(x, _sparse_containers()):
+        for f in dataclasses.fields(x):
+            v = getattr(x, f.name)
+            if isinstance(v, torch.Tensor):
+                yield v
+    elif isinstance(x, tuple | list):
+        for y in x:
+            yield from _operand_tensors(y)
+
+
+def _host_copy(t: torch.Tensor) -> torch.Tensor:
+    """`t` copied to the CPU (differentiable)."""
+    return t.to("cpu")
+
+
+def _move_neuron_to_host(x):
+    """`x` with every neuron-resident tensor (also inside containers) on the CPU."""
+    if isinstance(x, torch.Tensor):
+        return _host_copy(x) if _on_neuron_device(x) else x
+    if isinstance(x, _sparse_containers()):
+        moved = {
+            f.name: _move_neuron_to_host(getattr(x, f.name))
+            for f in dataclasses.fields(x)
+            if isinstance(getattr(x, f.name), torch.Tensor)
+        }
+        return dataclasses.replace(x, **moved)
+    if isinstance(x, tuple | list):
+        return type(x)(_move_neuron_to_host(y) for y in x)
+    return x
+
+
+def _move_to(x, device: torch.device):
+    """Result `x` (tensors, containers, tuples, lists) with its tensors on `device`."""
+    if isinstance(x, torch.Tensor):
+        return x.to(device)
+    if isinstance(x, _sparse_containers()):
+        moved = {
+            f.name: getattr(x, f.name).to(device)
+            for f in dataclasses.fields(x)
+            if isinstance(getattr(x, f.name), torch.Tensor)
+        }
+        return dataclasses.replace(x, **moved)
+    if isinstance(x, tuple | list):
+        return type(x)(_move_to(y, device) for y in x)
+    return x
+
+
+def _warn_fp64_host(op: str, stacklevel: int = 3) -> None:
+    """One UserWarning per op: device-resident float64 computed on the host."""
+    if op in _fp64_host_warned:
+        return
+    _fp64_host_warned.add(op)
+    warnings.warn(
+        f"trnsparse {op}: float64 on the neuron device is computed on the "
+        "host for float64 accuracy (device arithmetic is fp32); pass "
+        "float32 to stay on device, or set TRNSPARSE_FP64_ON_DEVICE=1 to "
+        "keep device aten at fp32 precision.",
+        UserWarning,
+        stacklevel=stacklevel,
+    )
+
+
+def _refuse_device_fp64(op: str, operands) -> None:
+    """Under TRNSPARSE_REQUIRE_NKI (backends `auto` and `nki`), a float64 /
+    complex128 operand on the `neuron` device raises `NotImplementedError`:
+    no kernel gives float64 accuracy there, and the routes without a kernel
+    would compute it in device aten at fp32 precision. Raised before any host
+    copy, kernel or device aten, and over TRNSPARSE_FP64_ON_DEVICE=1."""
+    if not _REQUIRE_NKI or _backend == "pytorch":
+        return
+    wide = sorted(
+        {
+            str(t.dtype)
+            for x in operands
+            for t in _operand_tensors(x)
+            if t.dtype in _FP64_DTYPES and _on_neuron_device(t)
+        }
+    )
+    if wide:
+        raise NotImplementedError(
+            f"trnsparse {op}: no NKI kernel computes {', '.join(wide)} on the neuron "
+            "device at float64 accuracy (device arithmetic is fp32). Unset "
+            "TRNSPARSE_REQUIRE_NKI to compute on the host at float64 accuracy, or "
+            "pass float32."
+        )
+
+
+def _fp64_device_on_host(op: str) -> bool:
+    """True, with the one-time warning, when float64 bound for the neuron
+    device computes on the host instead: backend `auto`, no
+    TRNSPARSE_REQUIRE_NKI, no TRNSPARSE_FP64_ON_DEVICE. For a route that
+    `_fp64_host_guard` cannot see (`KernelOperator` keeps its operands).
+    Under TRNSPARSE_REQUIRE_NKI (backends `auto` / `nki`) NotImplementedError."""
+    if _REQUIRE_NKI and _backend != "pytorch":
+        raise NotImplementedError(
+            f"trnsparse {op}: no NKI kernel computes torch.float64 on the neuron "
+            "device at float64 accuracy (device arithmetic is fp32). Unset "
+            "TRNSPARSE_REQUIRE_NKI to compute on the host at float64 accuracy, or "
+            "pass float32."
+        )
+    if _backend != "auto" or _REQUIRE_NKI or _FP64_ON_DEVICE:
+        return False
+    _warn_fp64_host(op, stacklevel=4)
+    return True
+
+
+def _fp64_host_guard(op: str):
+    """Decorator for a public op: device-resident float64 runs in host torch.
+
+    See the section comment above. The result goes back to the device of the
+    first neuron-resident dense (non-container) tensor operand: trnsparse
+    results land on the dense operand's device. When only a sparse container
+    was on the device, the dense operand is on the host and so is the result.
+    """
+
+    def deco(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            operands = (*args, *kwargs.values())
+            _refuse_device_fp64(op, operands)
+            if _backend != "auto" or _REQUIRE_NKI or _FP64_ON_DEVICE:
+                return fn(*args, **kwargs)
+            if not any(
+                t.dtype in _FP64_DTYPES and _on_neuron_device(t)
+                for x in operands
+                for t in _operand_tensors(x)
+            ):
+                return fn(*args, **kwargs)
+            home = next(
+                (
+                    t.device
+                    for x in operands
+                    if not isinstance(x, _sparse_containers())
+                    for t in _operand_tensors(x)
+                    if _on_neuron_device(t)
+                ),
+                None,
+            )
+            _warn_fp64_host(op, stacklevel=3)
+            out = fn(
+                *(_move_neuron_to_host(a) for a in args),
+                **{k: _move_neuron_to_host(v) for k, v in kwargs.items()},
+            )
+            return out if home is None else _move_to(out, home)
+
+        return wrapper
+
+    return deco
+
+
+def _simulate(kernel, op_name: str, *tensors: torch.Tensor):
+    """`nki.simulate(kernel)` on host numpy views of `tensors`, dtype-checked."""
+    _check_kernel_operands(op_name, tensors)
+    return nki.simulate(kernel)(*(_sim_np(t) for t in tensors))
 
 
 def _round_up(n: int, multiple: int) -> int:
@@ -245,7 +618,10 @@ def _get_native_ops() -> dict:
     if _native_ops is None:
         from . import _native
 
-        _native_ops = _native.OPS
+        missing = set(_native.OPS) - set(_KERNEL_OPERAND_DTYPES)
+        if missing:
+            raise TypeError(f"trnsparse native ops without an operand dtype entry: {missing}")
+        _native_ops = {name: _guard_op(name, op) for name, op in _native.OPS.items()}
     return _native_ops
 
 
@@ -393,6 +769,10 @@ def _native_call(op_name: str, args):
     ops = _get_native_ops()
     if _eager_call_ok([a for a in args if isinstance(a, torch.Tensor)]):
         entry = _native_kernel(op_name)
+        if entry is not None:
+            # The handle skips the op body, so check the operands here, as the
+            # guarded op does (`_guard_op`, trnsci/trnsci#35).
+            _check_kernel_operands(op_name, args)
         handle = None if entry is None else _eager_handle(entry[0])
         if handle is not None:
             conv = entry[1]
@@ -415,6 +795,7 @@ def _run(kernel, op_name: str, *device_tensors: torch.Tensor):
     """
     if _get_dispatch_path() == "native":
         return _native_call(op_name, device_tensors)
+    _check_kernel_operands(op_name, device_tensors)
     return kernel(*device_tensors)
 
 
@@ -451,7 +832,8 @@ class _MaskPattern:
 def _kernel_input(t: torch.Tensor) -> torch.Tensor:
     """Cast a kernel operand to a dtype the NeuronCore datapath supports.
 
-    Trainium has no fp64 datapath; the native device silently hands fp64
+    float64 reaches a kernel wrapper only on the explicit `nki` backend
+    (`_fp64_route`, #84; `auto` takes torch). Trainium has no fp64 datapath; the native device silently hands fp64
     operands to the kernel as fp32, and the kernel output (whose dtype
     follows its input) then comes back as fp32. Downcast explicitly so the
     kernel always sees fp32, and have callers cast the result back to the
@@ -599,7 +981,7 @@ def _nki_spmm_impl(A_dense: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
         if _use_simulator():
             # CPU-side: feed NumPy arrays to nki.simulate(kernel). Bypasses
             # torch_xla entirely.
-            out_np = nki.simulate(_spmm_dense_kernel)(A_feed.cpu().numpy(), B_feed.cpu().numpy())
+            out_np = _simulate(_spmm_dense_kernel, "spmm_dense", A_feed, B_feed)
             result = torch.from_numpy(np.asarray(out_np)).to(A_dense.device)
         else:
             result = _launch(_spmm_dense_kernel, "spmm_dense", A_feed, B_feed)
@@ -653,6 +1035,10 @@ def nki_spmm(A, B: torch.Tensor) -> torch.Tensor:
     `register_autograd`) runs the kernel. B may live on the host or on
     `neuron`; the result is on B's device.
     """
+    if not _kernel_route("spmm", A.values, B):
+        from ..ops import _csr_matmul
+
+        return _csr_matmul(A, B)
     if _native_path():
         A_dense = _csr_to_dense_on(A, B.device)
         return _nki_spmm_impl(A_dense, B)
@@ -676,7 +1062,7 @@ def _nki_bsr_spmm_impl(
         bg_feed = _kernel_input(b_gathered.contiguous())
 
         if _use_simulator():
-            out_np = nki.simulate(_bsr_spmm_kernel)(bp_feed.cpu().numpy(), bg_feed.cpu().numpy())
+            out_np = _simulate(_bsr_spmm_kernel, "bsr_spmm", bp_feed, bg_feed)
             result = torch.from_numpy(np.asarray(out_np)).to(blocks_pad.device)
         else:
             result = _launch(_bsr_spmm_kernel, "bsr_spmm", bp_feed, bg_feed)
@@ -857,7 +1243,16 @@ def nki_bsr_spmm(A, B: torch.Tensor) -> torch.Tensor:
 
         return _bsr_spmm_pytorch(A, B)
     if A.blocks.is_complex() or B.is_complex():
-        return _nki_bsr_spmm_complex(A, B)
+        # complex128 / float64 parts: the fp64 policy (#84) before the real launches.
+        if not _fp64_route("bsr_spmm", A.blocks.dtype, B.dtype):
+            from ..ops import _bsr_spmm_pytorch
+
+            return _bsr_spmm_pytorch(A, B)
+        return _nki_bsr_spmm_complex(A, B)  # real kernel launches (#78)
+    if not _kernel_route("bsr_spmm", A.blocks, B):
+        from ..ops import _bsr_spmm_pytorch
+
+        return _bsr_spmm_pytorch(A, B)
     if _native_path():
         out_cols = B.shape[1]
         n_tiles = 1 if out_cols <= _TILE_N else -(-out_cols // _TILE_N)
@@ -1009,11 +1404,8 @@ def _nki_screened_spmm_impl(
         threshold_sqrt_t = _kernel_input(threshold_sqrt_t)
 
         if _use_simulator():
-            out_np = nki.simulate(_screened_spmm_kernel)(
-                A_feed.cpu().numpy(),
-                Q_feed.cpu().numpy(),
-                threshold_sqrt_t.cpu().numpy(),
-                B_feed.cpu().numpy(),
+            out_np = _simulate(
+                _screened_spmm_kernel, "screened_spmm", A_feed, Q_feed, threshold_sqrt_t, B_feed
             )
             result = torch.from_numpy(np.asarray(out_np)).to(A.device)
         else:
@@ -1210,6 +1602,10 @@ def nki_screened_spmm(
     op carries the autograd (no gradient to `diag_integrals` or
     `threshold`). The result is on B's device.
     """
+    if not _kernel_route("screened_spmm", A, B):
+        from ..ops import _screened_spmm_pytorch
+
+        return _screened_spmm_pytorch(A, diag_integrals, B, threshold)
     if B.dim() == 1:  # matrix-vector: one right-hand side
         return nki_screened_spmm(A, diag_integrals, B[:, None], threshold, symmetric)[:, 0]
     if _native_path():
@@ -1405,6 +1801,10 @@ def nki_bsr_attn_tiled(
         from ..ops import _block_sparse_attn_pytorch
 
         return _block_sparse_attn_pytorch(Q, K, V, mask_bsr, scale, return_stats=return_stats)
+    if not _kernel_route("block_sparse_attention_tiled", Q, K, V):
+        from ..ops import _block_sparse_attn_pytorch
+
+        return _block_sparse_attn_pytorch(Q, K, V, mask_bsr, scale, return_stats=return_stats)
 
     if (
         _native_path()
@@ -1432,7 +1832,7 @@ def nki_bsr_attn_tiled(
 
     try:
         if _use_simulator():
-            tile_max_np, tile_sumexp_np = nki.simulate(_attn_stats_kernel)(_sim_np(qs), _sim_np(kg))
+            tile_max_np, tile_sumexp_np = _simulate(_attn_stats_kernel, "attn_stats", qs, kg)
             tile_max = _sim_torch(tile_max_np, Q.device)
             tile_sumexp = _sim_torch(tile_sumexp_np, Q.device)
             # NKI 0.3.0 keepdims: tile_max/tile_sumexp are (M_tiles, K_max, 128, 1)
@@ -1445,9 +1845,7 @@ def nki_bsr_attn_tiled(
             rm = row_max.unsqueeze(-1).contiguous()
             rd = row_denom.unsqueeze(-1).contiguous()
 
-            out_np = nki.simulate(_attn_out_kernel)(
-                _sim_np(qs), _sim_np(kg), _sim_np(vg), _sim_np(rm), _sim_np(rd)
-            )
+            out_np = _simulate(_attn_out_kernel, "attn_out", qs, kg, vg, rm, rd)
             result = _sim_torch(out_np, Q.device)
         else:
             # Q/K/V tiles cross to the device once and feed both passes.
@@ -1763,6 +2161,12 @@ def nki_bsr_attn_bwd(
         return _block_sparse_attn_backward(
             Q, K, V, O, dO, mask_bsr, scale, row_max=row_max, row_denom=row_denom
         )
+    if not _kernel_route("block_sparse_attention_tiled backward", Q, K, V, dO, O):
+        from ..ops import _block_sparse_attn_backward
+
+        return _block_sparse_attn_backward(
+            Q, K, V, O, dO, mask_bsr, scale, row_max=row_max, row_denom=row_denom
+        )
 
     if (
         _native_path()
@@ -1803,25 +2207,29 @@ def nki_bsr_attn_bwd(
 
     try:
         if _use_simulator():
-            dQ_np = nki.simulate(_attn_bwd_dq_kernel)(
-                _sim_np(rf["q_scaled"]),
-                _sim_np(rf["k_gathered"]),
-                _sim_np(rf["v_gathered"]),
-                _sim_np(rf["do_gathered"]),
-                _sim_np(rf["D_blocks"]),
-                _sim_np(rm_in),
-                _sim_np(rd_in),
+            dQ_np = _simulate(
+                _attn_bwd_dq_kernel,
+                "attn_bwd_dq",
+                rf["q_scaled"],
+                rf["k_gathered"],
+                rf["v_gathered"],
+                rf["do_gathered"],
+                rf["D_blocks"],
+                rm_in,
+                rd_in,
             )
             dQ_raw = _sim_torch(dQ_np, Q.device)
 
-            dK_np, dV_np = nki.simulate(_attn_bwd_dkdv_kernel)(
-                _sim_np(cf["k_blocks"]),
-                _sim_np(cf["v_blocks"]),
-                _sim_np(cf["q_gathered"]),
-                _sim_np(cf["do_gathered"]),
-                _sim_np(cf["D_gathered"]),
-                _sim_np(cf["row_max_gathered"]),
-                _sim_np(cf["row_denom_gathered"]),
+            dK_np, dV_np = _simulate(
+                _attn_bwd_dkdv_kernel,
+                "attn_bwd_dkdv",
+                cf["k_blocks"],
+                cf["v_blocks"],
+                cf["q_gathered"],
+                cf["do_gathered"],
+                cf["D_gathered"],
+                cf["row_max_gathered"],
+                cf["row_denom_gathered"],
             )
             dK_raw = _sim_torch(dK_np, Q.device)
             dV_raw = _sim_torch(dV_np, Q.device)
@@ -1923,6 +2331,9 @@ def _kmv_launch(x, y, v, vn, params, kind: int, group: int, sim: bool) -> torch.
         kernel, name, tensors = _k._kmv_cross_kernel, "kmv_cross", (x, y, v, params)
     else:
         kernel, name, tensors = _k._kmv_selfblk_kernel, "kmv_selfblk", (x, y, v, vn, params)
+    # Every route below (simulator, eager handle, custom op, XLA) checks the
+    # operand dtypes first, as `_launch` / `_run` / `_simulate` do.
+    _check_kernel_operands(name, tensors)
     if sim:
         out = nki.simulate(kernel)(*(_sim_np(t) for t in tensors), int(kind), int(group))
         return _sim_torch(out, v.device)

@@ -32,9 +32,12 @@ u * (|x|^2 + |y|^2) with u = 2^-24, so the relative error of a distance is
 about u * (|x|^2 + |y|^2) / |x - y|^2: small for well-separated points and
 large only for near-duplicates, where the kernel value is ~s anyway (the
 error in k is then about u * (|x|^2 + |y|^2) / (2 l^2), relative). Centring
-keeps |x|^2 small. float64 inputs follow the 2026-11-02 suite policy:
-backend "auto" computes them with torch in float64, explicit "nki" casts
-to float32 with a warning, and TRNSPARSE_REQUIRE_NKI raises.
+keeps |x|^2 small. float64 inputs follow the suite float64 policy (#84),
+as every other trnsparse kernel route (`dispatch._fp64_route`): backend
+"auto" computes them with torch in float64 (on the host when they are on
+the neuron device, whose arithmetic is fp32; one warning), explicit "nki"
+casts to float32 with a one-time warning, and TRNSPARSE_REQUIRE_NKI raises
+NotImplementedError.
 """
 
 from __future__ import annotations
@@ -194,20 +197,20 @@ def _route(dtype: torch.dtype, d: int) -> str:
             )
         return "torch"
     if dtype == torch.float64:
-        if _dispatch._REQUIRE_NKI:
-            raise TypeError(
-                "trnsparse kernel_matmul: float64 under TRNSPARSE_REQUIRE_NKI; the NKI "
-                "kernel computes in float32. Pass float32, or unset TRNSPARSE_REQUIRE_NKI."
-            )
-        if _dispatch.get_backend() == "auto":
+        # torch under `auto`; under explicit `nki` the fp32 kernel with one
+        # warning per op; NotImplementedError under TRNSPARSE_REQUIRE_NKI.
+        if not _dispatch._fp64_route("kernel_matmul", dtype):
             return "torch"
-        warnings.warn(
-            "trnsparse kernel_matmul: float64 inputs on the nki backend are computed in "
-            "float32 (the NeuronCore has no float64 datapath)",
-            stacklevel=3,
-        )
     elif dtype not in (torch.float32, torch.float16, torch.bfloat16):
-        raise TypeError(f"trnsparse kernel_matmul: unsupported dtype {dtype}")
+        # Integer, bool and complex: the PyTorch path, so the result (or the
+        # error) is the pytorch backend's; NotImplementedError under
+        # TRNSPARSE_REQUIRE_NKI (trnsci/trnsci#35, as `_no_kernel_for_dtype`).
+        if _dispatch._REQUIRE_NKI:
+            raise NotImplementedError(
+                "trnsparse kernel_matmul: the NKI kernel takes float32/bfloat16/float16 "
+                f"values, got {dtype}. Unset TRNSPARSE_REQUIRE_NKI to compute in torch."
+            )
+        return "torch"
     return "nki"
 
 
@@ -261,6 +264,18 @@ class KernelOperator:
         if dtype not in (torch.float32, torch.float64):
             dtype = torch.float32
         self.dtype = dtype
+        # float64 torch route bound for the neuron device: device aten computes
+        # float64 at fp32 precision, so under `auto` the operator computes on
+        # the host and each product goes back to V's device (#84).
+        self._home = None
+        if (
+            self.route == "torch"
+            and dtype == torch.float64
+            and (self.device.type == "neuron" or _dispatch._on_neuron_device(X))
+            and _dispatch._fp64_device_on_host("KernelOperator")
+        ):
+            self._home = self.device
+            self.device = torch.device("cpu")
         X64 = X.detach().to("cpu", torch.float64)
         ls, ell = _lengthscale(lengthscale, d, torch.float64, "cpu")
         self._ard = ls
@@ -303,6 +318,8 @@ class KernelOperator:
         if out is None:
             out = _torch_kernel_matmul(Xa, Yb, Vk, self.kind, self._a, self.outputscale, noise)
         out = out.to(dtype=out_dtype) if out_dtype.is_floating_point else out
+        if self._home is not None:
+            out = out.to(V.device)
         return out[:, 0] if vec else out
 
     def __call__(self, V: torch.Tensor) -> torch.Tensor:
@@ -335,6 +352,7 @@ class KernelOperator:
         return _kernel_of_sqdist(self.kind, D, self._a, self.outputscale)
 
 
+@_dispatch._fp64_host_guard("kernel_matmul")
 def kernel_matmul(
     X: torch.Tensor,
     Y: torch.Tensor | None,

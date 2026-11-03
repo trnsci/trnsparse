@@ -500,8 +500,9 @@ class TestLaunchRouting:
             raise AssertionError("native ops must not load on the XLA path")
 
         monkeypatch.setattr(dispatch, "_get_native_ops", no_ops)
-        out = dispatch._launch(lambda x: x * 3, "unused", torch.ones(4, 1))
-        assert moved == [1]
+        # A real op name: the XLA launch checks its operand dtype table too.
+        out = dispatch._launch(lambda x, y: x * 3, "spmm_dense", torch.ones(4, 1), torch.ones(1, 1))
+        assert moved == [2]
         assert torch.equal(out, torch.full((4, 1), 3.0))
 
     def test_cpu_launch_keeps_pre_native_behaviour(self, monkeypatch):
@@ -531,6 +532,9 @@ class _FakeKernel:
     func = None
 
 
+_REAL_CHECK = dispatch._check_kernel_operands
+
+
 class TestEagerHandle:
     """Eager native calls go through a cached handle, not the custom op."""
 
@@ -557,7 +561,26 @@ class TestEagerHandle:
         entries = {"k": (kernels["k"], ()), "k2": (kernels["k2"], ())}
         entries["conv"] = (kernels["conv"], (None, int, tuple))
         monkeypatch.setattr(dispatch, "_native_kernel", entries.get)
+        # The fake ops are not in the kernel dtype table; the handle path's
+        # dtype check has its own test below.
+        monkeypatch.setattr(dispatch, "_check_kernel_operands", lambda name, args: None)
         return built, kernels
+
+    def test_handle_path_checks_operand_dtypes(self, eager, monkeypatch):
+        """The handle skips the guarded op body, so `_native_call` checks the
+        operands against the dtype table first (trnsci/trnsci#35)."""
+        built, kernels = eager
+        monkeypatch.setattr(dispatch, "_check_kernel_operands", _REAL_CHECK)
+        monkeypatch.setattr(dispatch, "_native_kernel", lambda name: (kernels["k"], ()))
+        a = torch.ones(2, 2, dtype=torch.float64)
+        with pytest.raises(TypeError, match="spmm_dense"):
+            dispatch._native_call("spmm_dense", [a, a])
+        self._kmv(monkeypatch)
+        x, v, p = torch.ones(4, 3, dtype=torch.float64), torch.ones(4, 2), torch.ones(128, 4)
+        with pytest.raises(TypeError, match="kmv_self"):
+            dispatch._kmv_launch(x, None, v, None, p, 0, 1, sim=False)
+        assert built == []
+        assert dispatch._native_call("spmm_dense", [a.float(), a.float()])[0] == "handle"
 
     def test_handle_built_once_and_skips_op(self, eager):
         built, kernels = eager
@@ -1212,7 +1235,17 @@ class TestNativePathOnCpu:
         dense[:128, 128:] = 0
         A = trnsparse.BSRMatrix.from_dense(dense, block_size=P)
         B = rnd(384, 5, dtype=b_dtype)
-        C = trnsparse.bsr_spmm(A, B)
+        if torch.complex128 in (a_dtype, b_dtype):
+            # The fp64 policy (#84): complex128 raises under REQUIRE_NKI, and
+            # the explicit nki backend casts to complex64 with a warning.
+            with pytest.raises(NotImplementedError, match="complex128"):
+                trnsparse.bsr_spmm(A, B)
+            monkeypatch.setattr(dispatch, "_REQUIRE_NKI", False)
+            monkeypatch.setattr(dispatch, "_fp64_warned", set())
+            with pytest.warns(UserWarning, match="reduced to fp32"):
+                C = trnsparse.bsr_spmm(A, B)
+        else:
+            C = trnsparse.bsr_spmm(A, B)
         want = dense.to(torch.complex128) @ B.to(torch.complex128)
         assert C.dtype == torch.promote_types(a_dtype, b_dtype)
         err = (C.to(torch.complex128) - want).abs().max() / want.abs().max()

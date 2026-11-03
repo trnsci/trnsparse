@@ -28,6 +28,7 @@ import warnings
 import torch
 
 from .formats import BSRMatrix, COOMatrix, CSRMatrix, _csr_to_dense_host
+from .nki.dispatch import _fp64_host_guard
 
 
 def _as_torch_csr(A: CSRMatrix) -> torch.Tensor:
@@ -63,6 +64,7 @@ def _scaled(s: float, t: torch.Tensor) -> torch.Tensor:
     return t if s == 1 else s * t
 
 
+@_fp64_host_guard("spmv")
 def spmv(
     A: CSRMatrix,
     x: torch.Tensor,
@@ -109,6 +111,7 @@ def _check_epilogue_shape(op: str, name: str, t: torch.Tensor, result: torch.Ten
         )
 
 
+@_fp64_host_guard("spmm")
 def spmm(
     A: CSRMatrix,
     B: torch.Tensor,
@@ -151,6 +154,7 @@ def spmm(
     return result
 
 
+@_fp64_host_guard("spmv_symmetric")
 def spmv_symmetric(
     A: CSRMatrix, x: torch.Tensor, alpha: float = 1.0, uplo: str = "upper"
 ) -> torch.Tensor:
@@ -330,6 +334,7 @@ def _bsr_spmm_pytorch(A: BSRMatrix, B: torch.Tensor) -> torch.Tensor:
     return out[:m]
 
 
+@_fp64_host_guard("bsr_spmm")
 def bsr_spmm(A: BSRMatrix, B: torch.Tensor) -> torch.Tensor:
     """Block-sparse × dense matmul: C = A @ B.
 
@@ -357,6 +362,7 @@ def bsr_spmm(A: BSRMatrix, B: torch.Tensor) -> torch.Tensor:
     return _bsr_spmm_pytorch(A, B)
 
 
+@_fp64_host_guard("screened_spmm")
 def screened_spmm(
     A: torch.Tensor,
     diag_integrals: torch.Tensor,
@@ -417,7 +423,12 @@ def screened_spmm(
         from .nki.dispatch import nki_screened_spmm
 
         return nki_screened_spmm(A, diag_integrals, B, threshold, symmetric)
+    return _screened_spmm_pytorch(A, diag_integrals, B, threshold)
 
+
+def _screened_spmm_pytorch(
+    A: torch.Tensor, diag_integrals: torch.Tensor, B: torch.Tensor, threshold: float
+) -> torch.Tensor:
     # PyTorch fallback — semantic spec for the kernel.
     # Requires diag_integrals 1-D of length matching A's rows and cols
     # (common chemistry case: A is square (n, n) with a per-shell bound vector).
@@ -770,6 +781,7 @@ class _AttnTiledFunction(torch.autograd.Function):
         return dQ, dK, dV, None, None, None, None, None
 
 
+@_fp64_host_guard("block_sparse_attention_tiled")
 def block_sparse_attention_tiled(
     Q: torch.Tensor,
     K: torch.Tensor,
@@ -858,10 +870,12 @@ def block_sparse_attention_tiled(
     if scale is None:
         scale = head_dim**-0.5
 
-    from .nki.dispatch import _native_path, _nki_block_ok, _use_nki
+    from .nki.dispatch import _kernel_route, _native_path, _nki_block_ok, _use_nki
 
     # Block sizes the kernels do not take go straight to PyTorch (#46).
     use_nki = _use_nki() and _nki_block_ok("block_sparse_attention_tiled", b)
+    if use_nki and not _kernel_route("block_sparse_attention_tiled", Q, K, V):
+        use_nki = False  # complex / integer / bool: the PyTorch reference
     if use_nki and _native_path():
         from .nki.dispatch import _get_native_ops
 

@@ -108,8 +108,94 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     before.
   - `benchmarks/bench_kernel_matmul_trn2.py --dump DIR` saves the results,
     to compare two checkouts with `--compare`.
+- **float64 under `auto` now computes in torch at float64 accuracy
+  (previously cast to fp32 on the NKI path)** — the trnsci suite fp64
+  policy (#84). Trainium computes float64 at fp32 precision, so no kernel
+  can give a float64-accurate result. For `spmm`, `bsr_spmm`,
+  `screened_spmm`, `block_sparse_attention_tiled` (forward and backward),
+  `cg_bsr` (through `bsr_spmm`), `cg_bsr_fused` and
+  `power_iteration_bsr_fused`, a float64 value operand (and complex128 in
+  `bsr_spmm`, whose complex path runs as real kernel launches):
+  - under `set_backend("auto")` (the default) takes the PyTorch path that
+    `set_backend("pytorch")` takes, at float64 accuracy, and no kernel runs
+    (the fused solvers take their host path);
+  - under an explicit `set_backend("nki")` is cast to fp32 (complex64) for
+    the kernel as before, now with a one-time `UserWarning` per op saying
+    precision is reduced to fp32;
+  - under `TRNSPARSE_REQUIRE_NKI=1` raises `NotImplementedError` (on either
+    backend; this takes precedence over the explicit-nki cast).
+
+  The result dtype always equals the pytorch backend's for the same inputs,
+  including bf16 / fp16 and mixed-dtype promotion; a kernel result computed
+  in fp32 is cast to that dtype. Callers of 0.2.0 through 0.13.0 who
+  relied on float64 inputs running on the kernels under `auto` now get
+  torch (more precise; on the host or device aten instead of the kernel):
+  pass float32 operands, or select `set_backend("nki")`, to keep the
+  kernel. float64 validation runs under REQUIRE_NKI must pass fp32 operands
+  (or call the autograd Functions directly, as the hardware gradchecks do).
+  Lands in 0.14.0. `screened_spmm` decides on `A` and `B`; a float64 bound
+  vector `diag_integrals` alone does not change the route. See
+  docs/architecture.md, "Precision and dtypes".
+
+  **float64 on the `neuron` device runs on the host under `auto`.** Device
+  aten computes float64 at fp32 precision as well (measured on Trn2), so
+  the torch path alone does not give float64 accuracy for device-resident
+  data. When a float64 / complex128 operand of `spmv`, `spmm`,
+  `spmv_symmetric`, `bsr_spmm`, `screened_spmm`,
+  `block_sparse_attention_tiled` (forward and backward), `cg_bsr`,
+  `chebyshev_bsr`, `richardson_bsr`, `power_iteration_bsr` or the
+  `jacobi_preconditioner_bsr` preconditioner lives on a `neuron` device
+  (dense, or a CSR / COO / BSR matrix's values), the operands are copied to
+  the host, host torch computes at float64, and the result returns to the
+  dense operand's device in float64, with one `UserWarning` per op ("float64
+  on the neuron device is computed on the host for float64 accuracy (device
+  arithmetic is fp32); pass float32 to stay on device").
+  `TRNSPARSE_FP64_ON_DEVICE=1` keeps device aten (fp32 precision, no
+  copies). Host-resident float64, explicit `nki` and the pytorch backend
+  are unchanged; the fused solvers already ran float64 on the host.
+  **`TRNSPARSE_REQUIRE_NKI=1` raises for float64 / complex128 on the neuron
+  device** at every public op (backends `auto` and `nki`, also with
+  `TRNSPARSE_FP64_ON_DEVICE=1`), before any host copy or kernel. Before, the
+  routes with no kernel (CSR `spmv`, `spmv_symmetric`, `spmm`, the Jacobi
+  preconditioner) ran device aten at fp32 precision with no error under
+  REQUIRE_NKI and `auto` (Trn2 conformance: `test_spmv[float64-*]` rel err
+  1e-8..2e-7 against the 1e-10 tolerance).
+
+  `kernel_matmul` / `KernelOperator` (#93, new in this release) follow the
+  same rules through `dispatch._fp64_route`: under REQUIRE_NKI float64 now
+  raises `NotImplementedError` (it raised `TypeError`), and the explicit-nki
+  fp32 warning fires once per op (it fired on every call). Integer, bool and
+  complex inputs on the NKI path take the PyTorch path, as the pytorch
+  backend does (they raised `TypeError`), or raise `NotImplementedError`
+  under REQUIRE_NKI. Device-resident float64 under `auto`: `kernel_matmul`
+  is guarded like the other ops, and a float64 `KernelOperator` bound for
+  the neuron device is built and applied on the host (one `UserWarning`),
+  returning each product on V's device.
 
 ### Fixed
+
+- **No NKI kernel is reached with an operand dtype it does not take** (one
+  guard at the kernel boundary; trnsci/trnsci#35, the class of #78 and #79).
+  At each entry (`spmm`, `bsr_spmm`, `screened_spmm`,
+  `block_sparse_attention_tiled` forward and backward), integer and bool
+  values, and complex values except in `bsr_spmm` (real kernel launches,
+  #78), now take the PyTorch path that `set_backend("pytorch")` takes, or
+  raise `NotImplementedError` under `TRNSPARSE_REQUIRE_NKI`. Before, they went
+  into the fp32/bf16 kernels on the NKI and auto backends: complex operands of
+  `spmm` / `screened_spmm` reached the kernel unchanged, the static attention
+  kernels cast complex Q/K/V to fp32 (imaginary part dropped), the static
+  `bsr_spmm` and attention kernels cast integers to fp32 and back, and
+  REQUIRE_NKI failed with whatever error the kernel raised. float64 follows
+  the fp64 policy below (#84); fp32, bf16 and fp16 are unchanged. Every
+  launch now also checks a per-kernel, per-operand dtype table itself
+  (`_KERNEL_OPERAND_DTYPES`: the native op table, `_run` on the XLA path and
+  the simulator) and raises `TypeError` naming the op and dtypes, so a future
+  wrapper without the entry check cannot hand a kernel an unsupported dtype.
+  The eager-handle fast path (`_native_call`, and `_kmv_launch` for
+  `kernel_matmul`, whose kernels `kmv_self` / `kmv_cross` / `kmv_selfblk`
+  are now in the table as fp32-only) skips the guarded op body, so it checks
+  the table itself before the launch.
+  Affects every release with NKI kernels, through 0.13.0.
 
 - **`spmm` with a 1-D `B` raised on the NKI path (#105).** Affected
   0.2.0–0.13.0: under `set_backend("nki")` / `"auto"` on a Neuron host,

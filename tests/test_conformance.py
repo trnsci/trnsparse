@@ -24,12 +24,22 @@ on a Trn2 box against the NKI paths:
         --conformance-device neuron
 
 Dense operands go to `--conformance-device`; sparse structure (CSR / BSR
-indices) stays on the host, which is the documented placement. With a
-non-pytorch backend, float64 / complex128 results are held to fp32
-tolerances (the kernels compute in fp32 by design) and the fp64 gradchecks
-are skipped on a device. Under `TRNSPARSE_REQUIRE_NKI=1` the BSR paths raise
-`NotImplementedError` for `block_size != 128` by design (#46); those cases
-are skipped in that configuration.
+indices) stays on the host, which is the documented placement. float64 /
+complex128 follow the suite fp64 policy (#84): under `--backend auto` they
+compute in torch at float64 accuracy and are held to the float64
+tolerances, as with the pytorch backend. With `--conformance-device
+neuron` that is host torch: device-resident float64 operands are copied to
+the host for the op and the result comes back to the device (device aten
+computes float64 at fp32 precision), so the fp64 tolerances apply there
+too. `TRNSPARSE_FP64_ON_DEVICE=1` keeps device aten instead; such a run is
+held to fp32 tolerances for float64 (`tol_for`); only under `--backend nki` (an
+explicit fp32 cast with a one-time warning) are they held to fp32
+tolerances. The fp64 gradchecks run on every backend and are skipped on a
+device (host-only placement). Under `TRNSPARSE_REQUIRE_NKI=1` float64 /
+complex128 kernel calls raise `NotImplementedError` by design (#84), and
+the BSR paths raise it for `block_size != 128` (#46); `conftest.py` reports
+the #84 raises as skips, and the #46 cases are skipped in that
+configuration.
 """
 
 from __future__ import annotations
@@ -57,6 +67,7 @@ TOL = {
 }
 FP32_TOL = 2e-4
 REQUIRE_NKI = os.environ.get("TRNSPARSE_REQUIRE_NKI", "").lower() in ("1", "true", "yes")
+FP64_ON_DEVICE = os.environ.get("TRNSPARSE_FP64_ON_DEVICE", "").lower() in ("1", "true", "yes")
 
 _STATE: dict = {"backend": "pytorch", "device": torch.device("cpu")}
 
@@ -79,6 +90,11 @@ def on_device() -> bool:
 
 def nki_backend() -> bool:
     return _STATE["backend"] != "pytorch"
+
+
+def explicit_nki() -> bool:
+    """`--backend nki`: float64 is cast to fp32 for the kernels (#84); `auto` keeps fp64."""
+    return _STATE["backend"] == "nki"
 
 
 def D(t: torch.Tensor) -> torch.Tensor:
@@ -106,7 +122,11 @@ def ref_dtype(dt: torch.dtype) -> torch.dtype:
 
 def tol_for(dt: torch.dtype) -> float:
     t = TOL.get(dt, 0.0)
-    if nki_backend() and dt in (torch.float64, torch.complex128):
+    if dt in (torch.float64, torch.complex128) and (
+        explicit_nki() or (FP64_ON_DEVICE and on_device())
+    ):
+        # Explicit nki casts to fp32; FP64_ON_DEVICE keeps device aten (fp32
+        # precision). Under auto, device-resident float64 runs on the host.
         return FP32_TOL
     if nki_backend() and dt in (torch.float32, torch.complex64):
         return max(t, 1e-4)
@@ -926,7 +946,7 @@ def test_cg_bsr_fused(n, dtype, kw):
     tol = 1e-12 if dtype == torch.float64 else 1e-7
     x, it, rel = ts.cg_bsr_fused(A, D(rhs), tol=tol, max_iter=2000, **kw)
     xs = torch.linalg.solve(Ad, rhs.double())
-    etol = 1e-8 if dtype == torch.float64 and not nki_backend() else 1e-4
+    etol = 1e-8 if dtype == torch.float64 and not explicit_nki() else 1e-4
     if kw.get("recurrence"):
         etol *= 10
     if kw.get("precision"):
@@ -949,11 +969,11 @@ def test_cg_bsr_fused_multi_rhs(R):
     A, Ad = spd_bsr(256, 128)
     Bm = rand_vec((256, R), torch.float64, 127) * torch.logspace(-6, 6, R, dtype=torch.float64)
     X, it, rel = ts.cg_bsr_fused(A, D(Bm), tol=1e-12)
-    assert_close(X, torch.linalg.solve(Ad, Bm), tol=1e-7 if not nki_backend() else 1e-4)
+    assert_close(X, torch.linalg.solve(Ad, Bm), tol=1e-7 if not explicit_nki() else 1e-4)
     assert tuple(H(it).shape) == (R,) and tuple(H(rel).shape) == (R,)
     for j in {0, R // 2, R - 1}:
         xj, _, _ = ts.cg_bsr_fused(A, D(Bm[:, j]), tol=1e-12)
-        assert_close(H(X)[:, j], xj, tol=1e-10 if not nki_backend() else 1e-4)
+        assert_close(H(X)[:, j], xj, tol=1e-10 if not explicit_nki() else 1e-4)
 
 
 def test_cg_bsr_fused_x0_zero_b_strided_and_prepared():
@@ -975,7 +995,7 @@ def test_cg_bsr_fused_x0_zero_b_strided_and_prepared():
         x1, _, _, info = ts.cg_bsr_fused(op, D(rhs), tol=1e-12, return_info=True)
         x2 = ts.cg_bsr_fused(op, D(rhs), tol=1e-12)[0]
         assert torch.equal(H(x1), H(x2))
-        assert_close(x1, xs, tol=1e-8 if not nki_backend() else 1e-4)
+        assert_close(x1, xs, tol=1e-8 if not explicit_nki() else 1e-4)
         assert {"resident_blocks", "n_blocks", "trips", "path"} <= set(info)
 
 
@@ -1131,12 +1151,17 @@ def _grad_vs_dense(fn_ts, fn_dense, inputs, tol=1e-9):
     ins = [t.detach().clone().requires_grad_() for t in inputs]
     out = fn_ts(*ins)
     w = rand_vec(tuple(out.shape), torch.float64, 199).to(out.dtype)
-    (out * D(w)).sum().backward()
+    # Weight the output on the host: on the neuron device this float64 multiply and
+    # sum would run in device aten at fp32 precision, and that rounding (~1e-8) lands
+    # in every gradient, outside the op under test.
+    (out.to("cpu") * w).sum().backward()
     ins2 = [t.detach().clone().requires_grad_() for t in inputs]
     (fn_dense(*ins2) * w).sum().backward()
     for i, (a, b2) in enumerate(zip(ins, ins2, strict=True)):
         assert a.grad is not None, f"input {i} got no gradient"
-        assert_close(a.grad, b2.grad, tol=tol if not nki_backend() else FP32_TOL, what=f"grad[{i}]")
+        assert_close(
+            a.grad, b2.grad, tol=tol if not explicit_nki() else FP32_TOL, what=f"grad[{i}]"
+        )
 
 
 def test_autograd_csr_ops():
