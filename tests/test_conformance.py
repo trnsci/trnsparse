@@ -1157,7 +1157,10 @@ def _grad_vs_dense(fn_ts, fn_dense, inputs, tol=1e-9):
     ins = [t.detach().clone().requires_grad_() for t in inputs]
     out = fn_ts(*ins)
     w = rand_vec(tuple(out.shape), torch.float64, 199).to(out.dtype)
-    (out * D(w)).sum().backward()
+    # Weight the output on the host: on the neuron device this float64 multiply and
+    # sum would run in device aten at fp32 precision, and that rounding (~1e-8) lands
+    # in every gradient, outside the op under test.
+    (out.to("cpu") * w).sum().backward()
     ins2 = [t.detach().clone().requires_grad_() for t in inputs]
     (fn_dense(*ins2) * w).sum().backward()
     for i, (a, b2) in enumerate(zip(ins, ins2, strict=True)):
