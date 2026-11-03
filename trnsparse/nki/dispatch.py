@@ -1857,6 +1857,186 @@ def _kmv_launch(x, y, v, vn, params, kind: int, group: int, sim: bool) -> torch.
     return kernel(*tensors, int(kind), int(group))
 
 
+# ── Row blocks across logical NeuronCores (#102) ─────────────────────────────
+#
+# The row blocks of one product are independent, so on a chip with several
+# visible logical cores (trn2.3xlarge at LNC=2: neuron:0..3 with
+# NEURON_RT_VISIBLE_CORES=0-3) they are spread over the cores. Placement
+# follows `trnsparse.multicore` and trnblas#24: TorchNeuron does not copy
+# between logical cores, and a copy out of a busy core waits behind its
+# queued kernels, so the operands are staged through the host once, before
+# any kernel is queued, and each core gets its own Y, V and params. Launches
+# are asynchronous: all of them are issued from the calling thread,
+# round-robin over the cores, so the cores run together and NKI tracing
+# (not thread-safe, aws-neuron-sdk#1453) stays on one thread. The results
+# come back through the host in row order.
+#
+# TRNSPARSE_KMV_CORES: "auto" (default) uses every visible core when the
+# product is row-blocked anyway (n * m above `_kmv_block_work()`), and one
+# core below that; "all" or an int k always splits over that many cores
+# (at most the visible count). "1" keeps everything on the operands' core.
+# TRNSPARSE_KMV_THREADS=1 issues each core's blocks from its own worker
+# thread instead (a fallback in case launches block the host); the first
+# block of every core is launched on the calling thread first, so the
+# cached `wrap_nki` handle is traced there.
+
+_KMV_CORES_ENV = "TRNSPARSE_KMV_CORES"
+_kmv_pool = None
+
+
+def _kmv_cores_setting() -> int | str:
+    """`TRNSPARSE_KMV_CORES` parsed: "auto", "all" or a positive int."""
+    raw = os.environ.get(_KMV_CORES_ENV, "").strip().lower()
+    if raw in ("", "auto"):
+        return "auto"
+    if raw == "all":
+        return "all"
+    try:
+        k = int(raw)
+    except ValueError:
+        k = 0
+    if k < 1:
+        raise ValueError(f"{_KMV_CORES_ENV} must be a positive int, 'all' or 'auto'; got {raw!r}")
+    return k
+
+
+def _kmv_threads() -> bool:
+    raw = os.environ.get("TRNSPARSE_KMV_THREADS", "").strip().lower()
+    return raw not in ("", "0", "false", "no", "off")
+
+
+def _visible_cores() -> int:
+    """Visible logical NeuronCores (`torch_neuronx.device_count()`), 1 if unknown."""
+    try:
+        import torch_neuronx
+
+        return max(1, int(torch_neuronx.device_count()))
+    except Exception:
+        return 1
+
+
+def _kmv_core_count(n: int, m: int, visible: int, setting: int | str, work: int) -> int:
+    """Logical cores one n x m product is split over (1: the single-core path)."""
+    if visible <= 1 or setting == 1:
+        return 1
+    if setting == "auto":
+        k = visible if n * m > work else 1
+    elif setting == "all":
+        k = visible
+    else:
+        k = min(int(setting), visible)
+    return max(1, k)
+
+
+def _kmv_core_devices(n: int, m: int, tensors) -> list[torch.device]:
+    """The cores for one product, the operands' core first; one entry = single core."""
+    if _get_dispatch_path() != "native":
+        return []
+    k = _kmv_core_count(n, m, _visible_cores(), _kmv_cores_setting(), _kmv_block_work())
+    if k <= 1:
+        return []
+    home = _kernel_device(*tensors)
+    if home.index is None:
+        try:
+            import torch_neuronx
+
+            home = torch.device(_NEURON_DEVICE, int(torch_neuronx.current_device()))
+        except Exception:
+            home = torch.device(_NEURON_DEVICE, 0)
+    visible = _visible_cores()
+    return [torch.device(_NEURON_DEVICE, (home.index + i) % visible) for i in range(k)]
+
+
+def _kmv_place(t: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """A host operand copied to one core (the CPU tests swap in a copy)."""
+    return t.to(device)
+
+
+def _kmv_block(xs, ys, vs, ps, i0: int, rows: int, n: int, kind, group, sim):
+    """Launch the row block of x starting at i0 on the core its operands are on.
+
+    `ys` None is the square operator (Y = X): the block takes its rows of V
+    for the noise term (`_kmv_selfblk_kernel`).
+
+    The ragged last block is zero-padded to `rows` (padding rows are computed
+    and dropped), so every block has one shape and one handle. Returns the
+    (rows, R) block output; rows past n are padding.
+    """
+    nb = min(rows, n - i0)
+    self_op = ys is None
+    xb = xs[i0 : i0 + nb]
+    vb = vs[i0 : i0 + nb] if self_op else None
+    if nb < rows:
+        xb = torch.cat([xb, xb.new_zeros(rows - nb, xs.shape[1])])
+        if self_op:
+            vb = torch.cat([vb, vb.new_zeros(rows - nb, vs.shape[1])])
+    return _kmv_launch(xb, xs if self_op else ys, vs, vb, ps, kind, group, sim)
+
+
+def _kmv_multicore(tensors, self_op: bool, n: int, R: int, rows: int, devices, kind, group):
+    """Row blocks of one product spread over `devices`, gathered on the host.
+
+    Block b runs on core b % k (k = len(devices)), with the operands placed
+    on that core once. `rows` comes from `kmv_block_rows(..., parts=k)`, so
+    with a block count that is a multiple of k every core gets the same
+    number of blocks. Every block is the same kernel at one shape, and a row
+    of the product runs the same instructions whatever block it is in (the
+    #100/#101 bitwise check on Trn2), so the result is bit-identical to
+    single-core.
+    """
+    orig = tensors[0].device
+    # Stage through the host first: a D2H copy queues behind the kernels of
+    # the core it reads from, so nothing is launched until every core has
+    # its operands.
+    host = [t.detach().cpu() for t in tensors]
+    placed = []
+    for p, dev in enumerate(devices):
+        if p == 0:
+            placed.append(
+                [
+                    t if t.device == dev else _kmv_place(h, dev)
+                    for t, h in zip(tensors, host, strict=True)
+                ]
+            )
+        else:
+            placed.append([_kmv_place(h, dev) for h in host])
+    k = len(devices)
+    starts = list(range(0, n, rows))
+    outs: list = [None] * len(starts)
+
+    def launch(b):
+        ops = placed[b % k]
+        xs, ys, vs, ps = (ops[0], None, *ops[1:]) if self_op else ops
+        outs[b] = _kmv_block(xs, ys, vs, ps, starts[b], rows, n, kind, group, False)
+
+    if _kmv_threads() and len(starts) > k:
+        global _kmv_pool
+        # The first block of every core on this thread: traces the one block
+        # shape into the cached handle before any worker launches.
+        for b in range(k):
+            launch(b)
+        if _kmv_pool is None or _kmv_pool._max_workers < k:
+            from concurrent.futures import ThreadPoolExecutor
+
+            _kmv_pool = ThreadPoolExecutor(max_workers=k, thread_name_prefix="trnsparse-kmv")
+
+        def run_core(p):
+            for b in range(k + p, len(starts), k):
+                launch(b)
+
+        for f in [_kmv_pool.submit(run_core, p) for p in range(k)]:
+            f.result()
+    else:
+        for b in range(len(starts)):
+            launch(b)
+
+    out = torch.empty(n, R, dtype=torch.float32)
+    for b, i0 in enumerate(starts):
+        nb = min(rows, n - i0)
+        out[i0 : i0 + nb] = outs[b][:nb].cpu()
+    return out.to(orig)
+
+
 def nki_kernel_matmul(
     x: torch.Tensor,
     y: torch.Tensor | None,
@@ -1880,13 +2060,25 @@ def nki_kernel_matmul(
     launch, so the blocked result is bit-identical. The last, ragged block
     is zero-padded to the block shape (padding rows are computed and
     dropped): every launch has one shape, one compile and one cached handle.
+
+    With several visible logical cores the blocks are spread over them
+    (`TRNSPARSE_KMV_CORES`, #102; see the section comment above): the
+    block count rounds up to a multiple of the core count, each core gets
+    its own copy of Y, V and params, and the result is gathered on the
+    host and returned on the operands' device, bit-identical to one core.
     """
     n, d = x.shape
     m = n if y is None else y.shape[0]
     R = v.shape[1]
-    rows = _kernels.kmv_block_rows(n, m, _kmv_block_work())
     sim = _use_simulator()
     tensors = (x, v, params) if y is None else (x, y, v, params)
+    devices = [] if sim else _kmv_core_devices(n, m, tensors)
+    if len(devices) > 1:
+        rows = _kernels.kmv_block_rows(n, m, _kmv_block_work(), parts=len(devices))
+        if rows < n:
+            k = min(len(devices), -(-n // rows))
+            return _kmv_multicore(tensors, y is None, n, R, rows, devices[:k], kind, group)
+    rows = _kernels.kmv_block_rows(n, m, _kmv_block_work())
     # Placed once: every block launch gets the same device Y, V and params,
     # and its X (and noise) rows as views of the placed X (and V).
     if sim:
@@ -1901,17 +2093,9 @@ def nki_kernel_matmul(
     if rows >= n:
         return _kmv_launch(xs, ys, vs, None, ps, kind, group, sim).to(orig)
 
-    self_op = ys is None
-    yy = xs if self_op else ys
     out = torch.empty(n, R, dtype=torch.float32, device=vs.device)
     for i0 in range(0, n, rows):
         nb = min(rows, n - i0)
-        xb = xs[i0 : i0 + nb]
-        vb = vs[i0 : i0 + nb] if self_op else None
-        if nb < rows:
-            xb = torch.cat([xb, xb.new_zeros(rows - nb, d)])
-            if self_op:
-                vb = torch.cat([vb, vb.new_zeros(rows - nb, R)])
-        ob = _kmv_launch(xb, yy, vs, vb, ps, kind, group, sim)
+        ob = _kmv_block(xs, ys, vs, ps, i0, rows, n, kind, group, sim)
         out[i0 : i0 + nb] = ob[:nb].to(out.device)
     return out.to(orig)
