@@ -43,6 +43,40 @@ from trnsparse.nki import kernels as K  # noqa: E402
 _KINDS = ("rbf", "matern12", "matern32", "matern52")
 
 
+class _ColumnwiseNumpy:
+    """numpy, with `matmul` summed in contraction order, one fp32 add per term.
+
+    The TensorEngine computes every output column of a matmul the same way
+    whatever the moving operand's width. numpy's BLAS (and einsum) do not:
+    their blocking, and the dot/GEMV paths of a one-row or one-column
+    product, follow the shape and the memory layout, so a column can round
+    differently in a wider product. The kernel's @V matmul moves all X
+    points of a block (#103), and that width differs between LNC=1 and
+    LNC=2 in the ragged tail and for small n, so the bitwise checks here
+    run the simulator's matmul as an explicit fp32 sum over the contraction
+    in order, which depends on nothing but the column's own operands.
+    """
+
+    def __getattr__(self, name):
+        return getattr(np, name)
+
+    @staticmethod
+    def matmul(a, b):
+        a = np.asarray(a, np.float32)  # (M, K): the stationary operand, transposed
+        b = np.asarray(b, np.float32)  # (K, N): the moving operand
+        out = np.zeros((a.shape[0], b.shape[1]), np.float32)
+        for k in range(a.shape[1]):
+            out += np.multiply.outer(a[:, k], b[k])
+        return out
+
+
+@pytest.fixture(autouse=True)
+def _columnwise_sim_matmul(monkeypatch):
+    from nki._backends.simulator import matmul as sim_matmul
+
+    monkeypatch.setattr(sim_matmul, "np", _ColumnwiseNumpy())
+
+
 def _inputs(n, m, d, R, kernel, self_op, seed=0):
     rng = np.random.default_rng(seed)
     x = (rng.random((n, d)) - 0.5).astype(np.float32)
@@ -104,11 +138,9 @@ def test_simulate_matches_reference_lnc1_lnc2(case, self_op):
             assert out.shape == (n, R)
             assert np.abs(out - ref).max() / np.abs(ref).max() < tol
             outs.append(out)
-    if d <= 3:
-        # Same Y-tile order on any core count. (The simulator's matmul is a
-        # BLAS call whose summation order can depend on the tile width, so
-        # this is asserted where the contraction is short enough not to.)
-        assert np.array_equal(outs[0], outs[1])
+    # Same Y-tile order on any core count (the simulator's matmul sums in
+    # contraction order, `_ColumnwiseNumpy`).
+    assert np.array_equal(outs[0], outs[1])
 
 
 def test_simulate_deterministic_across_runs():
@@ -120,9 +152,18 @@ def test_simulate_deterministic_across_runs():
 
 def test_group_size_does_not_change_the_answer():
     x, y, v, params, ref = _inputs(1500, 1500, 3, 4, "rbf", True)
-    for g in (1, 2, 7):
+    for g in (1, 2, 7, 16, 32):
         out = _run(x, y, v, params, 0, 1, True, group=g)
         assert np.abs(out - ref).max() / np.abs(ref).max() < 5e-6
+
+
+@pytest.mark.parametrize("R", [1, 130])
+def test_large_bodies_lnc_bitwise_and_accurate(R):
+    """Bodies of 16 tiles, a ragged Y tile, two V column tiles: LNC=1 == LNC=2, accurate."""
+    x, y, v, params, ref = _inputs(700, 2100 + 37, 3, R, "matern32", False, seed=R)
+    outs = [_run(x, y, v, params, 2, lnc, False, group=16) for lnc in (1, 2)]
+    assert np.array_equal(outs[0], outs[1])
+    assert np.abs(outs[0] - ref).max() / np.abs(ref).max() < 5e-6
 
 
 @pytest.mark.skipif(not dispatch._use_simulator(), reason="needs TRNSPARSE_USE_SIMULATOR=1")
@@ -169,21 +210,12 @@ def _run_blocked(x, y, v, params, kind, lnc, self_op, rows, group=4):
 
 
 def _assert_blocked_matches(one, blocked):
-    """Bitwise, except the simulator's ragged last 128-row chunk (n % 128 rows).
+    """Bitwise: every output column is computed the same way at any block width.
 
-    In one launch that chunk is a matmul of n % 128 columns; in a padded
-    block it is part of a full 128-column one. The simulator runs each as a
-    numpy matmul, whose summation order changes with the width (a 1-row
-    product is a GEMV), so those rows may differ in the last bits there. The
-    TensorEngine computes every output column the same way at any width,
-    which the neuron-marked test checks bit for bit on the device.
+    (The simulator's matmul sums in contraction order, `_ColumnwiseNumpy`;
+    the neuron-marked test checks the same bit for bit on the device.)
     """
-    n = one.shape[0]
-    head = n - n % _TILE
-    assert np.array_equal(one[:head], blocked[:head])
-    # fp32 rounding of a different summation order: within the kernel's
-    # own accuracy bound against float64 (5e-6 of the largest entry).
-    assert np.abs(blocked[head:] - one[head:]).max(initial=0.0) <= 5e-6 * np.abs(one).max()
+    assert np.array_equal(one, blocked)
 
 
 _TILE = 128
@@ -235,6 +267,10 @@ def _compile_cases():
         (129, 1, 1, 4),
         (1, 1, 0, 4),
         (131072, 33, 0, 4),
+        (131072, 33, 0, 16),
+        (131072, 128, 3, 16),
+        (8192, 768, 0, 32),
+        (8192, 769, 0, 16),
     ]:
         cases[f"self-n{n}-R{R}-k{kind}-g{g}"] = (
             "_kmv_self_kernel",
@@ -248,6 +284,7 @@ def _compile_cases():
         )
     for n, m, d, R, kind in [
         (700, 513, 3, 7, 0),
+        (512, 8192, 3, 1500, 1),
         (1024, 1000, 3, 33, 2),
         (300, 4097, 126, 2, 0),
         (1000, 1100, 16, 1500, 3),
@@ -260,7 +297,7 @@ def _compile_cases():
                 f((m, R), np.float32),
                 p,
                 kind,
-                4,
+                K.kmv_group(m),
             ),
         )
     # Row blocks of the square operator (#100): 55296 rows of n = 2^20 at R = 33,

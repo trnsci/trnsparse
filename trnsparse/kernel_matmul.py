@@ -46,7 +46,7 @@ import warnings
 import torch
 
 from .nki import dispatch as _dispatch
-from .nki.kernels import _KMV_GROUP, _KMV_KINDS, _KMV_MAX_D
+from .nki.kernels import _KMV_KINDS, _KMV_MAX_D, _KMV_MAX_GROUP, kmv_group
 
 __all__ = [
     "KERNELS",
@@ -177,8 +177,12 @@ def _params(a: float, s: float, noise: float, device) -> torch.Tensor:
     return row.expand(128, 4).contiguous().to(device)
 
 
-def _kmv_group() -> int:
-    return max(1, int(os.environ.get("TRNSPARSE_KMV_GROUP", str(_KMV_GROUP))))
+def _kmv_group(m: int) -> int:
+    """Y tiles per loop body: `kmv_group(m)`, or TRNSPARSE_KMV_GROUP when set (1 to 32)."""
+    env = os.environ.get("TRNSPARSE_KMV_GROUP", "").strip()
+    if env:
+        return max(1, min(_KMV_MAX_GROUP, int(env)))
+    return kmv_group(m)
 
 
 def _route(dtype: torch.dtype, d: int) -> str:
@@ -285,7 +289,8 @@ class KernelOperator:
         if self.route == "nki":
             try:
                 # The cross kernel (Yb given) never reads the noise entry.
-                out = _dispatch.nki_kernel_matmul(Xa, Yb, Vk, self.params, self.kind, _kmv_group())
+                m = Vk.shape[0]
+                out = _dispatch.nki_kernel_matmul(Xa, Yb, Vk, self.params, self.kind, _kmv_group(m))
             except Exception as e:
                 if _dispatch._REQUIRE_NKI:
                     raise
