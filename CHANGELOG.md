@@ -29,6 +29,139 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`kernel_matmul` / `KernelOperator`: fused kernel-matrix product
+  K(X, Y) @ V that never forms K** (#93, for trnsci/trnsci#109). RBF and
+  Matern-1/2, 3/2, 5/2; per-dimension lengthscales; `noise * V` on the
+  square operator. One NKI launch per application: squared distances as a
+  TensorEngine matmul on augmented coordinates into PSUM, the kernel
+  function on ScalarE straight from PSUM, the product with V on the
+  TensorEngine. Coordinates are augmented and transposed on chip
+  (`nl.load` + `nisa.nc_transpose`); tile loops are rolled
+  (`nl.fori_loop`), so trace and compile time do not grow with n; ragged
+  n, m and R are handled in the kernel. Both physical cores at LNC=2 with
+  the same control flow on each, and bit-identical results at LNC=1 and
+  LNC=2. Hyperparameters are a tensor argument (aws-neuron-sdk#1454).
+  Eager launches use a cached `torch_neuronx.wrap_nki` handle (the
+  trnblas#92 pattern). CPU tests: PyTorch path against float64
+  `torch.cdist`; `nki.simulate` at LNC=1/2, MLIR verify and (with
+  neuronx-cc) NEFF compile with NKI allocation at LNC=1/2.
+  `benchmarks/bench_kernel_matmul_trn2.py` measures kernel entries/s
+  against aten on the device and the host CPU at 2 threads and all vCPUs.
+  `tile_mask` is reserved and raises for now.
+- **`kernel_matmul`: row blocks spread across all visible logical
+  NeuronCores** (#102). On trn2.3xlarge at LNC=2 (`neuron:0..3`, with
+  `NEURON_RT_VISIBLE_CORES=0-3`) a row-blocked product issues its blocks
+  round-robin over the cores. The block count rounds up to a multiple of
+  the core count (`kmv_block_rows(..., parts=k)`; 20 blocks of 53248 rows
+  on 4 cores at n = m = 2^20), so each core gets the same number. Y, V and
+  params are staged through the host once and placed on each core before
+  any kernel is queued. Launches are issued asynchronously from the calling
+  thread (NKI tracing stays on one thread, aws-neuron-sdk#1453) and
+  gathered in row order on the operands' device, bit-identical to one
+  core. `TRNSPARSE_KMV_CORES`: `auto` (default: every visible core when
+  `n * m` exceeds the 6e10-entry block budget, else one), `all`, or an
+  int. `TRNSPARSE_KMV_THREADS=1` is a fallback that issues each core's
+  blocks from a worker thread, after the first block per core has been
+  launched on the calling thread. Target: n = 2^20 from about 42 s to about
+  11 s per apply on 4 cores. CPU stand-in tests cover block-to-core
+  assignment, per-core placement and the gather (bitwise against single
+  core). A neuron test compares multi-core with single-core bitwise and
+  skips below 2 visible cores.
+
+### Fixed
+
+- **`kernel_matmul` no longer hits the Neuron runtime's 30 s execution
+  timeout at n >= 1e6** (#100). One launch at n = 2^20, R = 33 takes about
+  40 s at LNC=2 and 80 s at LNC=1 on Trn2 and failed with `NRT status 5`.
+  Products above 6e10 kernel entries (`n * m`; the rate is flat in R, so
+  the budget is not weighted by d + R) now run as host-side row blocks of
+  X: the fewest launches the budget allows, split into equal blocks of a
+  multiple of 1024 rows (19 launches of 55296 rows at n = m = 2^20, about
+  2.2 s each at LNC=2 and 4.5 s at LNC=1), R kept whole. Large blocks keep
+  the fixed per-launch cost (~75 ms, staging Y) near 1% of the run; Y, V
+  and params are placed on the device once for all blocks. The ragged last
+  block is zero-padded (less than 1024 rows per block), so every launch has
+  one shape, one compile and one cached `wrap_nki` handle (now keyed per
+  kernel and shape). Blocks of the square operator use a new
+  `_kmv_selfblk_kernel` (custom op `trnsparse::kmv_selfblk`) that adds
+  `noise * V` for the block's rows in the same fused epilogue, so blocked
+  results are bit-identical to one launch. Below the budget nothing
+  changes. `TRNSPARSE_KMV_BLOCK_WORK` overrides the budget.
+
+- **`cg_bsr` raised `UnboundLocalError` with `max_iter=0` or on a first-step
+  breakdown, and reported `iters=max_iter` on any breakdown** (#71, #86).
+  `r_norm` was only assigned inside the loop, so `max_iter=0`, `A p = 0`
+  (e.g. a zero matrix) or `p . A p = 0` at k=0 (an exact `x0` with `tol=0`)
+  raised. A later breakdown (`|p . A p| < 1e-30`, e.g. after exact
+  convergence with `tol=0`) returned `iters = max_iter` (500 or 1000 for a
+  1-2 step solve). `cg_bsr` now returns the number of steps actually taken
+  and the residual of the returned `x`; `max_iter=0` gives
+  `(x0, 0, ||b - A x0|| / ||b||)`. Solutions are unchanged. Affects 0.3.2
+  through 0.13.0.
+- **`power_iteration_bsr` gave silently wrong gradients** (#96), as
+  `cg_bsr` did (#70). The norms were taken with `.item()`, so autograd
+  differentiated the iterations with frozen normalisation instead of the
+  eigenvector, and `v0` received a spurious gradient. The eigenvector now
+  differentiates as the exact unit eigenvector of `A` (implicit
+  differentiation of `A v = lam v`, `||v|| = 1`): backward solves a dense
+  bordered `(N+1) x (N+1)` system, so it costs O(N^3), and gives
+  `grad_A = -w v^T` on the stored blocks. `v0` gets no gradient, the
+  eigenvalue stays a Python float, and backward raises `NotImplementedError`
+  for complex `A`. Forward values are unchanged. Affects 0.3.2 through 0.13.0.
+- **`from_scipy` downcast float64 and integer matrices to float32** (silent,
+  #69). Every real scipy matrix was stored as float32 (float64 rounded to
+  ~3e-8 relative error; int64 exact only up to 2^24) and complex128 as
+  complex64, which contradicted the "zero-copy" description in
+  docs/migration_scipy.md. The values now keep the scipy dtype, and for CSR
+  input share memory with `sp_matrix.data`. Affects 0.1.1 through 0.13.0.
+  **Behaviour change:** float64 scipy input now gives a float64 matrix, so
+  mixing it with float32 vectors (`spmv(from_scipy(M64), x32)`) raises the
+  usual torch dtype-mismatch error; cast one side (`M.astype(np.float32)`).
+  docs/migration_scipy.md no longer refers to a nonexistent `.to_scipy()`.
+- **`cg_bsr` gave silently wrong gradients** (#70). The CG step sizes were
+  taken with `.item()`, so autograd differentiated a frozen-coefficient
+  polynomial in `A` applied to `b`, not the solve: with `b` along an
+  eigenvector (one-step convergence) `b.grad` was ~20% off `A^{-1} g`, and
+  `A.blocks.grad` had the same problem. `cg_bsr` now differentiates as the
+  exact solve (implicit differentiation, like `torch.linalg.solve`):
+  backward runs a second CG solve `A lam = grad_x` with the same
+  `tol` / `max_iter` / `M`, giving `grad_b = lam` and
+  `grad_A = -lam x^H` on the stored blocks. `x0` and `M` no longer receive
+  gradients. Forward values are unchanged. Affects 0.3.2 through 0.13.0.
+- **`cg_bsr_fused` / `power_iteration_bsr_fused` gave wrong results for
+  complex, integer and bool inputs** (silent, #85). Both pack A and the
+  vectors into real float tiles, so on every backend (including
+  `set_backend("pytorch")`) a complex A or b lost its imaginary part, and an
+  integer or bool b gave a truncated x of b's dtype. They (and
+  `prepare_cg_bsr`) now raise `TypeError` for a non-real-float `A.blocks`,
+  `b`, `x0` or `v0`, before any backend runs. Affects 0.11.0 through 0.13.0.
+
+## [0.13.0] — 2026-11-02
+
+Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
+
+Headline: **correctness fixes — upgrade recommended.** `COOMatrix.to_dense` dropped duplicate entries (#56); `from_scipy` dropped the imaginary part (#58); attention second derivatives were wrong (#65); `spmv`/`spmm` accepted a broadcasting y/C (#67); `chebyshev_coeffs` was not the Chebyshev polynomial for K ≥ 2 (#73); `bsr_diagonal` padded tall matrices (#74); on device, complex `bsr_spmm` dropped the imaginary part (#78), integer `spmv`/`spmm` returned float32 (#79), and an undersized attention mask was accepted (#82). New: bf16 and head_dim > 128 gather attention (#49), and Schwarz-screened tile skipping that beats dense aten for large screened products (#89).
+
+### Added
+
+- **`screened_spmm` skips screened-out tiles (#61).** On the native
+  TorchNeuron path the host classifies each 128 x 128 tile of `A` from the
+  Schwarz bounds alone (skip / full / partial, exact in fp32) and one keyed
+  kernel loads, transposes and multiplies only the kept tiles; partial
+  tiles get the element mask on chip. `A` stays dense on the device and
+  nothing is gathered. The plan (classification, key, device bounds) is
+  cached while the same bound tensor is reused. New keyword
+  `symmetric=True` (for `A == A.T`, as for the pair-index ERI matrix) skips
+  the Tensor Engine transposes. On Trn2 (LNC=2) at n = 8192, N = 512 it is
+  faster than dense aten `A @ B` up to 80% of tiles kept in fp32 (5.9x at
+  5%) and up to ~65% in bf16; at n = 4096 up to ~75% (fp32) / not in bf16;
+  at n <= 2048 the ~0.25 ms launch floor loses to aten. It beats
+  `(A * mask) @ B` and the previous fused kernel at every density for
+  n >= 4096. Results are in
+  docs/benchmarks.md. `TRNSPARSE_SCREEN_SKIP_TILES=0` restores the
+  all-tiles fused kernel. `trnsparse.nki.dispatch.screened_tile_structure`
+  exposes the classification.
+
 - **Guard against the NKI trace-cache closure bug ([aws-neuron/aws-neuron-sdk#1454](https://github.com/aws-neuron/aws-neuron-sdk/issues/1454),
   trnsci/trnsci#35).** `tests/test_trace_cache_safety.py` (CPU) finds every
   `@nki.jit` kernel and fails if its body, or a helper it calls, reads a
@@ -42,6 +175,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - README: known platform issue note for #1454.
 
 ### Fixed
+
+- `screened_spmm` with a 1-D `B` on the NKI backend raised `ValueError`
+  (pre-existing on main; found by the conformance suite on Trn2 during #61).
 
 - **`bsr_spmm` dropped the imaginary part of complex operands on the NKI
   backend** (silent, #78). The static-structure kernel path cast complex

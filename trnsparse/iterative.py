@@ -11,9 +11,11 @@ kept local to avoid a trnsolver runtime dep.
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Callable
 
 import torch
+from torch.autograd.function import once_differentiable
 
 from .formats import BSRMatrix
 from .ops import bsr_spmm
@@ -91,11 +93,22 @@ def cg_bsr(
 
     Returns:
         `(x, iters, rel_residual)` — solution, iteration count, final
-        relative residual.
-    """
-    n = b.shape[0]
-    matvec = _bsr_matvec(A)
+        relative residual. `iters` is the number of CG steps taken: it is
+        below `max_iter` both on convergence (`rel_residual < tol`) and on
+        breakdown (`|p . A p|` vanishes, e.g. after exact convergence with
+        `tol=0`), so check `rel_residual` to tell them apart. With
+        `max_iter=0` the result is `(x0, 0, ||b - A x0|| / ||b||)`.
 
+    Autograd: when `b` or `A.blocks` requires grad, `x` is differentiated
+    as the exact solve `A^{-1} b` (implicit differentiation, as
+    `torch.linalg.solve` does). Backward runs a second CG solve,
+    `A lam = grad_x`, with the same `tol`, `max_iter` and `M`, so the
+    gradient is accurate to the solve tolerance; `grad_b = lam` and
+    `grad_A = -lam x^H` on the stored blocks. `x0` and `M` get no
+    gradient (the exact solution does not depend on them). Through 0.13.0
+    the gradient went through the CG iterations with frozen step sizes and
+    was silently wrong (#70).
+    """
     if M is None:
         precond: Callable[[torch.Tensor], torch.Tensor] | None = None
     elif callable(M):
@@ -106,6 +119,32 @@ def cg_bsr(
         def precond(r: torch.Tensor) -> torch.Tensor:
             return torch.mv(M_tensor, r)
 
+    needs_grad = torch.is_grad_enabled() and (
+        b.requires_grad
+        or A.blocks.requires_grad
+        or (x0 is not None and x0.requires_grad)
+        or (isinstance(M, torch.Tensor) and M.requires_grad)
+    )
+    if not needs_grad:
+        return _cg_bsr_loop(A, b, x0, tol, max_iter, precond)
+    info: list = []
+    A_const = dataclasses.replace(A, blocks=A.blocks.detach())
+    x0_const = x0.detach() if x0 is not None else None
+    x = _CGBSRSolve.apply(A.blocks, b, A_const, x0_const, tol, max_iter, precond, info)
+    return x, info[0], info[1]
+
+
+def _cg_bsr_loop(
+    A: BSRMatrix,
+    b: torch.Tensor,
+    x0: torch.Tensor | None,
+    tol: float,
+    max_iter: int,
+    precond: Callable[[torch.Tensor], torch.Tensor] | None,
+) -> tuple[torch.Tensor, int, float]:
+    n = b.shape[0]
+    matvec = _bsr_matvec(A)
+
     x = x0.clone() if x0 is not None else torch.zeros(n, dtype=b.dtype, device=b.device)
     r = b - matvec(x)
     b_norm = torch.linalg.norm(b).item()
@@ -115,12 +154,14 @@ def cg_bsr(
     z = precond(r) if precond is not None else r.clone()
     p = z.clone()
     rz = torch.dot(r, z).item()
+    r_norm = torch.linalg.norm(r).item()
 
     for k in range(max_iter):
         Ap = matvec(p)
         pAp = torch.dot(p, Ap).item()
         if abs(pAp) < 1e-30:
-            break
+            # Breakdown: no step can be taken, x is the iterate after k steps.
+            return x, k, r_norm / b_norm
 
         alpha = rz / pAp
         x = x + alpha * p
@@ -138,6 +179,45 @@ def cg_bsr(
         rz = rz_new
 
     return x, max_iter, r_norm / b_norm
+
+
+class _CGBSRSolve(torch.autograd.Function):
+    """`x = A^{-1} b` with the gradient of the exact solve (implicit differentiation).
+
+    Backward solves the adjoint system `A^H lam = g` with the same CG
+    settings (A is SPD / Hermitian, so `A^H = A`), then
+    `grad_b = lam` and `grad_A = -lam x^H`, restricted to the stored blocks.
+    """
+
+    @staticmethod
+    def forward(ctx, blocks, b, A, x0, tol, max_iter, precond, info):
+        x, iters, rel = _cg_bsr_loop(A, b.detach(), x0, tol, max_iter, precond)
+        info.extend([iters, rel])
+        ctx.A, ctx.tol, ctx.max_iter, ctx.precond = A, tol, max_iter, precond
+        ctx.save_for_backward(x)
+        return x
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx, g):
+        (x,) = ctx.saved_tensors
+        A = ctx.A
+        lam, _, _ = _cg_bsr_loop(A, g, None, ctx.tol, ctx.max_iter, ctx.precond)
+        grad_blocks = grad_b = None
+        if ctx.needs_input_grad[1]:
+            grad_b = lam
+        if ctx.needs_input_grad[0]:
+            bs = A.block_size
+            m, n = A.shape
+            Mt, Nt = -(-m // bs), -(-n // bs)
+            lam_t = torch.nn.functional.pad(lam, (0, Mt * bs - lam.shape[0])).reshape(Mt, bs)
+            x_t = torch.nn.functional.pad(x, (0, Nt * bs - x.shape[0])).reshape(Nt, bs)
+            ptrs = A.block_row_ptrs.to(device=lam.device, dtype=torch.long)
+            rows = torch.repeat_interleave(torch.arange(Mt, device=lam.device), ptrs.diff())
+            cols = A.block_col_indices.to(device=lam.device, dtype=torch.long)
+            grad_blocks = -(lam_t[rows].unsqueeze(2) * x_t[cols].conj().unsqueeze(1))
+            grad_blocks = grad_blocks.to(dtype=A.blocks.dtype, device=A.blocks.device)
+        return grad_blocks, grad_b, None, None, None, None, None, None
 
 
 def jacobi_preconditioner_bsr(
@@ -347,7 +427,37 @@ def power_iteration_bsr(
 
     Returns:
         `(eigenvalue, eigenvector, iters)`.
+
+    Autograd: when `A.blocks` or `v0` requires grad, the eigenvector is
+    differentiated as the exact unit eigenvector of `A` for the returned
+    eigenvalue (implicit differentiation of `A v = lam v`, `||v|| = 1`).
+    Backward solves the bordered system
+    `[[A^T - lam I, v], [v^T, 0]] [w; nu] = [grad_v; 0]` densely, which
+    costs O(N^3), and gives `grad_A = -w v^T` on the stored blocks. `v0`
+    gets no gradient, because the eigenvector does not depend on it. The
+    eigenvalue is a Python float and carries no gradient. Backward raises
+    `NotImplementedError` for complex `A`, where the phase of the iterate
+    is not a smooth function of `A`. Through 0.13.0 the gradient went
+    through the iterations with frozen norms and was silently wrong (#96).
     """
+    needs_grad = torch.is_grad_enabled() and (
+        A.blocks.requires_grad or (v0 is not None and v0.requires_grad)
+    )
+    if not needs_grad:
+        return _power_iteration_loop(A, v0, max_iter, tol)
+    info: list = []
+    A_const = dataclasses.replace(A, blocks=A.blocks.detach())
+    v0_const = v0.detach() if v0 is not None else None
+    v = _PowerIterationEigvec.apply(A.blocks, v0, A_const, v0_const, max_iter, tol, info)
+    return info[0], v, info[1]
+
+
+def _power_iteration_loop(
+    A: BSRMatrix,
+    v0: torch.Tensor | None,
+    max_iter: int,
+    tol: float,
+) -> tuple[float, torch.Tensor, int]:
     n = A.shape[0]
     matvec = _bsr_matvec(A)
 
@@ -368,6 +478,61 @@ def power_iteration_bsr(
         lam_prev = lam
 
     return lam, v, max_iter
+
+
+class _PowerIterationEigvec(torch.autograd.Function):
+    """Unit eigenvector `v` of `A` with the gradient of the exact eigenvector.
+
+    Differentiating `A v = lam v`, `v^T v = 1` gives the bordered system
+    `K [dv; dlam] = [-dA v; 0]` with `K = [[A - lam I, -v], [v^T, 0]]`,
+    so the vector-Jacobian product is `grad_A = -w v^T`, where
+    `[[A^T - lam I, v], [v^T, 0]] [w; nu] = [g; 0]`. The `v^T w = 0` row
+    makes the `dlam` term drop out. The system is nonsingular when `lam`
+    is a simple eigenvalue.
+    """
+
+    @staticmethod
+    def forward(ctx, blocks, v0, A, v0_const, max_iter, tol, info):
+        lam, v, iters = _power_iteration_loop(A, v0_const, max_iter, tol)
+        info.extend([lam, iters])
+        ctx.A = A
+        ctx.save_for_backward(v)
+        return v
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx, g):
+        (v,) = ctx.saved_tensors
+        A = ctx.A
+        if not ctx.needs_input_grad[0]:
+            return None, None, None, None, None, None, None
+        if v.is_complex() or A.blocks.is_complex():
+            raise NotImplementedError(
+                "power_iteration_bsr: gradients for complex A are not supported "
+                "(the phase of the iterate is not a smooth function of A)"
+            )
+        n = v.shape[0]
+        Ad = A.to_dense().to(dtype=v.dtype, device=v.device)
+        Av = Ad @ v
+        lam = torch.dot(v, Av)
+        K = torch.zeros(n + 1, n + 1, dtype=v.dtype, device=v.device)
+        K[:n, :n] = Ad.T - lam * torch.eye(n, dtype=v.dtype, device=v.device)
+        K[:n, n] = v
+        K[n, :n] = v
+        rhs = torch.cat([g.to(v.dtype), g.new_zeros(1, dtype=v.dtype)])
+        w = torch.linalg.solve(K, rhs)[:n]
+
+        bs = A.block_size
+        m, nc = A.shape
+        Mt, Nt = -(-m // bs), -(-nc // bs)
+        w_t = torch.nn.functional.pad(w, (0, Mt * bs - n)).reshape(Mt, bs)
+        v_t = torch.nn.functional.pad(v, (0, Nt * bs - n)).reshape(Nt, bs)
+        ptrs = A.block_row_ptrs.to(device=w.device, dtype=torch.long)
+        rows = torch.repeat_interleave(torch.arange(Mt, device=w.device), ptrs.diff())
+        cols = A.block_col_indices.to(device=w.device, dtype=torch.long)
+        grad_blocks = -(w_t[rows].unsqueeze(2) * v_t[cols].unsqueeze(1))
+        grad_blocks = grad_blocks.to(dtype=A.blocks.dtype, device=A.blocks.device)
+        return grad_blocks, None, None, None, None, None, None
 
 
 # ── Fused, SBUF-resident CG (#22) ───────────────────────────────────────────
@@ -401,6 +566,19 @@ def _bf16_split_vec(v: torch.Tensor) -> torch.Tensor:
     return hi + (v - hi).to(torch.bfloat16).to(v.dtype)
 
 
+def _require_real_float(fn: str, name: str, t: torch.Tensor | None) -> None:
+    """The fused solvers compute in real floating point; refuse anything else.
+
+    Through 0.13.0 complex inputs lost their imaginary part and integer / bool
+    results were truncated, silently, on every backend (#85).
+    """
+    if t is not None and not t.dtype.is_floating_point:
+        raise TypeError(
+            f"{fn}: {name} must be a real floating-point tensor "
+            f"(float16, bfloat16, float32 or float64), got {t.dtype}"
+        )
+
+
 class FusedCGOperator:
     """An SPD BSR matrix prepared for `cg_bsr_fused`.
 
@@ -419,6 +597,7 @@ class FusedCGOperator:
     """
 
     def __init__(self, A: BSRMatrix, preconditioner: str | None, device):
+        _require_real_float("cg_bsr_fused / prepare_cg_bsr", "A.blocks", A.blocks)
         if A.block_size != _P:
             raise ValueError(f"cg_bsr_fused needs block_size=128, got {A.block_size}")
         m, n = A.shape
@@ -642,7 +821,12 @@ def cg_bsr_fused(
         `(x, iters, rel_residual)` like `cg_bsr`, plus the info dict when
         `return_info`. rel_residual is the recursive ||r|| / ||b||. For a
         2-D b, iters and rel_residual are per-column tensors.
+
+    Raises:
+        TypeError: A, b or x0 is complex, integer or bool (on every backend).
     """
+    _require_real_float("cg_bsr_fused", "b", b)
+    _require_real_float("cg_bsr_fused", "x0", x0)
     op = (
         A
         if isinstance(A, FusedCGOperator)
@@ -831,7 +1015,11 @@ def power_iteration_bsr_fused(
     Returns:
         `(eigenvalue, eigenvector, iters)` like `power_iteration_bsr`, plus
         the info dict when `return_info`.
+
+    Raises:
+        TypeError: A or v0 is complex, integer or bool (on every backend).
     """
+    _require_real_float("power_iteration_bsr_fused", "v0", v0)
     op = A if isinstance(A, FusedCGOperator) else prepare_cg_bsr(A, device=_accel_device(v0))
     n, T = op.n, op.n_tiles
     if matvec == "auto":

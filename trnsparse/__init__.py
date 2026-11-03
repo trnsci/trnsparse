@@ -5,7 +5,7 @@ CSR/COO formats, SpMV, SpMM, and integral screening for
 sparse scientific computing. Part of the trnsci scientific computing suite.
 """
 
-__version__ = "0.12.1"
+__version__ = "0.13.0"
 
 from .formats import BSRMatrix, COOMatrix, CSRMatrix, eye_sparse, from_dense, from_scipy
 from .iterative import (
@@ -21,6 +21,7 @@ from .iterative import (
     prepare_cg_bsr,
     richardson_bsr,
 )
+from .kernel_matmul import KERNELS, KernelOperator, kernel_matmul, kernel_matmul_reference
 from .nki import HAS_NKI, get_backend, set_backend
 from .ops import (
     block_sparse_attention_tiled,
@@ -68,6 +69,10 @@ __all__ = [
     "power_iteration_bsr_fused",
     "jacobi_preconditioner_bsr",
     "bsr_diagonal",
+    "kernel_matmul",
+    "kernel_matmul_reference",
+    "KernelOperator",
+    "KERNELS",
     "HAS_NKI",
     "set_backend",
     "get_backend",
