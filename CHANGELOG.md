@@ -97,11 +97,12 @@ Headline: `kernel_matmul` / `KernelOperator`, a fused kernel-matrix product for 
     16; 6.2M with the old body of 4. That is 44 against 13 instructions per
     128 x 512 tile per core.
   - **Summation order:** with a body of 4 Y tiles (m < 3200 by default,
-    or `TRNSPARSE_KMV_GROUP=4`) the result is bit-identical to 0.13.0.
-    That is checked in the simulator, with its matmul summed in
-    contraction order like the TensorEngine; the device check is on the
-    PR. Larger bodies change where the PSUM partial sums are split, so the
-    bits change.
+    or `TRNSPARSE_KMV_GROUP=4`) the summation order matches 0.13.0.
+    That holds in the simulator, with its matmul summed in contraction
+    order like the TensorEngine. On Trn2 hardware it does not: group 4
+    differs from 0.13.0 by up to about 1.5e-5, with unchanged error against
+    float64 (#107). Larger bodies change where the PSUM partial sums are
+    split, so the bits change.
   - **Error against float64** goes from about g + m/(128 g) fp32 roundings
     to its minimum: at m = 131072 the max relative error drops from
     9.0e-7 to 5.2e-7 (simulator, rbf and Matern-5/2, R = 1 and 33).
