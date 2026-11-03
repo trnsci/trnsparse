@@ -171,6 +171,10 @@ def _install_stubs(monkeypatch, path, backend, require):
     log = _Log()
     monkeypatch.setitem(sys.modules, "torch_neuronx", _stub_torch_neuronx(log))
     # A fresh `_native` under the stub; removed again afterwards (monkeypatch).
+    # Record the real state first, so teardown removes the stub-backed `_native`
+    # imported below (a later test in the session would otherwise get stub ops).
+    monkeypatch.setitem(sys.modules, "trnsparse.nki._native", None)
+    monkeypatch.setattr(trnsparse.nki, "_native", None, raising=False)
     monkeypatch.delitem(sys.modules, "trnsparse.nki._native", raising=False)
     monkeypatch.delattr(trnsparse.nki, "_native", raising=False)
     monkeypatch.setattr(dispatch, "_native_ops", None)
