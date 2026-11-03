@@ -230,3 +230,49 @@ class TestIntegerDtypeOnDensePath:
         torch.testing.assert_close(
             trnsparse.spmv(A, x, alpha=0.5, y=y, beta=-2.0), 0.5 * (Ad @ x) - 2.0 * y
         )
+
+
+class TestSpmmVectorOnNkiPath:
+    """spmm with a 1-D B on the NKI path (#105): the GEMM takes a 2-D operand,
+    so a vector raised ValueError there while the pytorch backend returns A @ b."""
+
+    @pytest.fixture
+    def nki_on(self, monkeypatch):
+        import trnsparse.nki.dispatch as d
+
+        seen = []
+
+        def gemm_2d_only(A, B):
+            seen.append(tuple(B.shape))
+            _, N = B.shape  # what _nki_spmm_impl does; raised on a 1-D B
+            return A.to_dense().to(B.dtype) @ B
+
+        monkeypatch.setattr(d, "_use_nki", lambda: True)
+        monkeypatch.setattr(d, "nki_spmm", gemm_2d_only)
+        return seen
+
+    def test_vector_b(self, nki_on):
+        g = torch.Generator().manual_seed(0)
+        Ad = torch.randn(12, 10, generator=g) * (torch.rand(12, 10, generator=g) < 0.4)
+        A = trnsparse.from_dense(Ad)
+        b = torch.randn(10, generator=g)
+        y = trnsparse.spmm(A, b)
+        assert nki_on == [(10, 1)]
+        assert y.shape == (12,)
+        torch.testing.assert_close(y, Ad @ b)
+
+    def test_vector_b_alpha_beta(self, nki_on):
+        g = torch.Generator().manual_seed(1)
+        Ad = torch.randn(6, 6, generator=g)
+        A = trnsparse.from_dense(Ad)
+        b, c = torch.randn(6, generator=g), torch.randn(6, generator=g)
+        y = trnsparse.spmm(A, b, alpha=2.0, C=c, beta=0.5)
+        torch.testing.assert_close(y, 2.0 * (Ad @ b) + 0.5 * c)
+
+    def test_matrix_b_unchanged(self, nki_on):
+        g = torch.Generator().manual_seed(2)
+        Ad = torch.randn(5, 4, generator=g)
+        B = torch.randn(4, 3, generator=g)
+        y = trnsparse.spmm(trnsparse.from_dense(Ad), B)
+        assert nki_on == [(4, 3)]
+        torch.testing.assert_close(y, Ad @ B)

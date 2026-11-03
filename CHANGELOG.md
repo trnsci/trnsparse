@@ -73,6 +73,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`spmm` with a 1-D `B` raised on the NKI path (#105).** Affected
+  0.2.0–0.13.0: under `set_backend("nki")` / `"auto"` on a Neuron host,
+  `spmm(A, b)` with a vector `b` failed in the NKI GEMM wrapper with
+  `ValueError: not enough values to unpack (expected 2, got 1)`, while the
+  pytorch backend returns `A @ b` of shape `(m,)`. The vector now goes to the
+  kernel as one column and the result is squeezed back. Matrix `B` is
+  unchanged.
+
 - **`kernel_matmul` no longer hits the Neuron runtime's 30 s execution
   timeout at n >= 1e6** (#100). One launch at n = 2^20, R = 33 takes about
   40 s at LNC=2 and 80 s at LNC=1 on Trn2 and failed with `NRT status 5`.
