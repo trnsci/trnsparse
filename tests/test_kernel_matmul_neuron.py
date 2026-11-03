@@ -110,7 +110,7 @@ def test_handle_and_custom_op_agree(monkeypatch):
     op = trnsparse.KernelOperator(X, "rbf", 0.2, 1.0, noise=1e-3, device=DEV)
     Vd = V.to(DEV)
     a = op(Vd).cpu()
-    monkeypatch.setattr(_d, "_EAGER_HANDLE", False)
+    monkeypatch.setattr(_d, "_EAGER_HANDLE_ENABLED", False)
     b = op(Vd).cpu()
     assert torch.equal(a, b)
 

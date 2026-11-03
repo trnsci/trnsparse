@@ -53,6 +53,17 @@ variable is shared by every trnsci library:
 `TRNSCI_XLA_DEPRECATION=1` makes the XLA path emit a one-time
 `DeprecationWarning`. It is off by default.
 
+`TRNSPARSE_NKI_EAGER_HANDLE=0` turns off the eager kernel handle. By default
+(`1`), eager NKI kernel calls on plain `neuron` tensors go through a
+`torch_neuronx.wrap_nki` handle built once per kernel instead of the
+`trnsparse::` custom op, which cuts host time per call from about 0.1 ms to
+0.02-0.03 ms on trn2 (trnblas#92). Static arguments (keyed-structure ids,
+fused-solver settings, structure lists, the attention scale) get the same
+`int()` / `tuple()` / `float()` conversions as in the op body. Under
+`torch.compile`, and for tensors that require grad, int64 tensors and tensor
+subclasses, the custom op runs as before. `bsr_attn` / `bsr_attn_bwd` (whole
+drivers) keep the op; their kernel launches take the handle.
+
 ## Placement: sparse structure on the host
 
 The TorchNeuron `neuron` device has no sparse CSR tensors
