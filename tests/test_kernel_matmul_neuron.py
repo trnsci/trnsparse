@@ -94,7 +94,7 @@ def test_square_operator_on_device(kernel, n):
 @pytest.mark.parametrize("R", [1, 33, 130])
 @pytest.mark.parametrize("group", [4, 8, 16, 32])
 def test_group_sizes_on_device(monkeypatch, group, R):
-    """Every loop-body size (#103: default `kmv_group(m)`, 16 here) is accurate on the device."""
+    """Every loop-body size (#103: default `kmv_group(m)`, 8 here) is accurate on the device."""
     monkeypatch.setenv("TRNSPARSE_KMV_GROUP", str(group))
     g = torch.Generator().manual_seed(R)
     n = 8192 + 77  # a ragged Y tile and ragged rows
@@ -102,6 +102,26 @@ def test_group_sizes_on_device(monkeypatch, group, R):
     op = trnsparse.KernelOperator(X, "matern32", 0.1, 1.0, noise=1e-4, device=DEV)
     ref = trnsparse.kernel_matmul_reference(X, None, V, "matern32", 0.1, 1.0, noise=1e-4)
     assert _rel(op(V.to(DEV)), ref) < 2e-5
+
+
+@pytest.mark.parametrize("R", [1, 128, 1500])
+@pytest.mark.parametrize("kernel", ["rbf", "matern12", "matern32", "matern52"])
+def test_auto_group_32_on_device(monkeypatch, kernel, R):
+    """m >= 131072 picks the 32-tile body (#108): accurate for every kernel and V width."""
+    from trnsparse.nki.kernels import kmv_group
+
+    monkeypatch.delenv("TRNSPARSE_KMV_GROUP", raising=False)
+    g = torch.Generator().manual_seed(R)
+    m, q = 131072 + 77, 600
+    assert kmv_group(m) == 32
+    X, Y = torch.rand(m, 3, generator=g), torch.rand(q, 3, generator=g)
+    W = torch.randn(m, R, generator=g)
+    op = trnsparse.KernelOperator(X, kernel, 0.05, 1.0, device=DEV)
+    ref = trnsparse.kernel_matmul_reference(Y, X, W, kernel, 0.05, 1.0)
+    # Matern-1/2's cusp at 0 errs like sqrt(u |x|^2) / l whatever the group
+    # (about 5e-5 here at group 16 or 32); the smooth kernels stay near 1e-5.
+    tol = 2e-4 if kernel == "matern12" else 3e-5
+    assert _rel(op.cross(Y, W.to(DEV)), ref) < tol
 
 
 def test_handle_and_custom_op_agree(monkeypatch):
