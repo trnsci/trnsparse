@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0] — 2026-11-04
+
+Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
+
+Headline: `kernel_matmul` auto loop body up to 32 Y tiles at m >= 131072 (#108, #111): rbf R = 128 runs 18% faster, and fp32 error drops from 7.0e-7 to 5.3e-7 at m = 524288. A 2-slot SBUF scratch ring keeps the Matern kernels on NKI allocation at 32 tiles.
+
 ### Performance
 
 - **`kernel_matmul`: the default loop body grows to 32 Y tiles at
