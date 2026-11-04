@@ -264,13 +264,17 @@ def test_kmv_group_rule(monkeypatch):
     # Small m: the fixed 4-tile body of earlier releases (same summation, same bits).
     for m in (1, 128, 1000, 3199):
         assert K.kmv_group(m) == 4
-    # About sqrt(m / 128) Y tiles in between, capped at 16.
+    # About sqrt(m / 128) Y tiles in between, capped at 32 (#108).
     assert K.kmv_group(3200) == 5
     assert K.kmv_group(8192) == 8
-    assert [K.kmv_group(m) for m in (32768, 131072, 1 << 20)] == [16, 16, 16]
-    assert all(K.kmv_group(m) <= K.kmv_group(m + 128) for m in range(0, 40000, 128))
+    assert K.kmv_group(32768) == 16
+    assert K.kmv_group(131072 - 128) == 31
+    assert [K.kmv_group(m) for m in (131072, 524288, 1 << 20)] == [32, 32, 32]
+    assert K._KMV_AUTO_GROUP_MAX == K._KMV_MAX_GROUP == 32
+    assert all(K.kmv_group(m) <= K.kmv_group(m + 128) for m in range(0, 140000, 128))
     monkeypatch.delenv("TRNSPARSE_KMV_GROUP", raising=False)
-    assert _kmv_group(131072) == 16
+    assert _kmv_group(131072) == 32
+    assert _kmv_group(32768) == 16
     monkeypatch.setenv("TRNSPARSE_KMV_GROUP", "7")
     assert _kmv_group(131072) == 7
     monkeypatch.setenv("TRNSPARSE_KMV_GROUP", "100")

@@ -2622,9 +2622,11 @@ _KMV_RT = 128  # V columns per accumulator (the stationary operand's free size)
 _KMV_PASS_RT = 6  # accumulators (V column tiles) per pass over Y; leaves >= 2 PSUM banks
 _KMV_GROUP = 4  # Y tiles per rolled-loop body (one SBUF partial-sum add per body)
 _KMV_MAX_GROUP = 32  # cap on the body size (SBUF for the body's K^T and V tiles)
-_KMV_AUTO_GROUP_MAX = 16  # largest body `kmv_group` picks
+_KMV_AUTO_GROUP_MAX = 32  # largest body `kmv_group` picks (#108)
 _KMV_V_BATCH_BYTES = 64 * 1024  # SBUF per partition for one body's V rows in one DMA
 _KMV_PSUM_BANKS = 8  # 16 KiB of PSUM per partition in 2 KiB banks
+_KMV_SCRATCH = (0, 1, 2, 3)  # SBUF intermediates per kernel tile, by kind (rbf, matern12/32/52)
+_KMV_SCRATCH_RING = 2  # slots of them per loop body, shared round-robin by its Y tiles
 
 
 def kmv_plan(n: int, R: int, n_prog: int = 1):
@@ -2645,17 +2647,19 @@ def kmv_plan(n: int, R: int, n_prog: int = 1):
 
 
 def kmv_group(m: int) -> int:
-    """Y tiles per rolled-loop body for m points of Y (#103): about sqrt(m / 128), in [4, 16].
+    """Y tiles per rolled-loop body for m points of Y (#103): about sqrt(m / 128), in [4, 32].
 
     Each body sums its tiles in PSUM and adds that partial to a running sum
     in SBUF, so an output entry is a sum of `g` terms then of `nt / g`
     partials (nt = m / 128 Y tiles): its fp32 rounding error grows like
     g + nt / g, smallest at g = sqrt(nt). Bigger bodies also pay the loop's
-    per-trip overhead less often. At most 16 (SBUF for the body's K^T and V
-    tiles); at least 4, so a small problem (m < 3200) runs exactly the
-    summation, and gives exactly the bits, of the fixed 4-tile body before.
-    The group depends on m only, so row blocks, cores and LNC=1/2 all get
-    the same summation order.
+    per-trip overhead less often. At most 32 (m >= 131072), the largest
+    body whose K^T tiles, V rows and Matern scratch ring fit SBUF with
+    NKI's own allocation for every kernel and R (#108; on Trn2 group 32
+    gave +18% over 16 at R = 128); at least 4, so a small problem
+    (m < 3200) runs exactly the summation, and gives exactly the bits, of
+    the fixed 4-tile body before. The group depends on m only, so row
+    blocks, cores and LNC=1/2 all get the same summation order.
     """
     nt = max(1, m // _TILE_M)
     return max(_KMV_GROUP, min(_KMV_AUTO_GROUP_MAX, math.isqrt(nt)))
@@ -2780,31 +2784,41 @@ if HAS_NKI:
         if rem:
             tile(r_lo + n_full * _TILE_M, rem)
 
-    def _kmv_entries(d_ps, prm, kind, jr, ni):
-        """Kernel tile (jr, ni) in SBUF from the squared-distance tile in PSUM."""
-        k = nl.ndarray((jr, ni), dtype=nl.float32, buffer=nl.sbuf)
+    def _kmv_entries(d_ps, prm, kind, jr, ni, scratch):
+        """Kernel tile (jr, ni) in SBUF from the squared-distance tile in PSUM.
+
+        `scratch`: `_KMV_SCRATCH[kind]` full-size SBUF tiles for the Matern
+        intermediates, a slot of the body's ring (#108). Only the returned
+        tile is allocated here: allocations live for their enclosing region
+        (the loop body), so fresh intermediates per Y tile would grow the
+        body's SBUF with its size, past 192 KiB at 24 Matern-5/2 tiles.
+        """
         a = prm[0:jr, 0:1]
         log_s = prm[0:jr, 1:2]
         if kind == 0:
+            k = nl.ndarray((jr, ni), dtype=nl.float32, buffer=nl.sbuf)
             # Cancellation can leave D slightly negative for close points;
             # exp of it errs by the same relative amount as D itself, so no
             # clamp (it would cost a VectorE pass over every tile).
             nisa.activation(k, nl.exp, d_ps, bias=log_s, scale=a)
             return k
-        t = nl.ndarray((jr, ni), dtype=nl.float32, buffer=nl.sbuf)
+        t = scratch[0][0:jr, 0:ni]
         # max(a * D, 2^-110) on VectorE straight from PSUM: sqrt needs a
         # non-negative input, and ScalarE sqrt is accurate only above 2^-116
         # (sqrt(2^-110) = 2^-55 stands in for an exact zero distance).
         nisa.tensor_scalar(t, d_ps, op0=nl.multiply, operand0=a, op1=nl.maximum, operand1=2.0**-110)
         nisa.activation(t, nl.sqrt, t)
-        e = nl.ndarray((jr, ni), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.activation(e, nl.exp, t, bias=log_s, scale=-1.0)
         if kind == 1:
+            e = nl.ndarray((jr, ni), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.activation(e, nl.exp, t, bias=log_s, scale=-1.0)
             return e
+        e = scratch[1][0:jr, 0:ni]
+        nisa.activation(e, nl.exp, t, bias=log_s, scale=-1.0)
+        k = nl.ndarray((jr, ni), dtype=nl.float32, buffer=nl.sbuf)
         if kind == 2:
             nisa.scalar_tensor_tensor(k, t, nl.add, 1.0, nl.multiply, e)
             return k
-        q = nl.ndarray((jr, ni), dtype=nl.float32, buffer=nl.sbuf)
+        q = scratch[2][0:jr, 0:ni]
         nisa.tensor_scalar(q, t, op0=nl.multiply, operand0=1.0 / 3.0, op1=nl.add, operand1=1.0)
         nisa.tensor_tensor(q, q, t, op=nl.multiply)
         nisa.scalar_tensor_tensor(k, q, nl.add, 1.0, nl.multiply, e)
@@ -2881,6 +2895,16 @@ if HAS_NKI:
                     nl.ndarray((_TILE_M, NI), dtype=nl.float32, buffer=nl.psum)
                     for _ in range(min(n_dist, len(sizes)))
                 ]
+                # Matern intermediates: a ring of `_KMV_SCRATCH_RING` slots
+                # shared by the body's Y tiles (#108), so the body's SBUF
+                # does not grow with its size.
+                scr = [
+                    [
+                        nl.ndarray((_TILE_M, NI), dtype=nl.float32, buffer=nl.sbuf)
+                        for _ in range(_KMV_SCRATCH[kind])
+                    ]
+                    for _ in range(min(_KMV_SCRATCH_RING, len(sizes)) if _KMV_SCRATCH[kind] else 0)
+                ]
                 # The body's Y coordinates in one DMA: (d + 2, sum(sizes)).
                 y_all = nl.load(yt[:, nl.ds(j0, sum(sizes))])
                 # One DMA when every tile is full and the rows fit the budget.
@@ -2897,7 +2921,7 @@ if HAS_NKI:
                     yb = y_all[:, off : off + jr]  # (d + 2, jr): stationary
                     d_ps = ring[k % len(ring)][0:jr, 0:ni]
                     nisa.nc_matmul(d_ps, yb, xb, accumulate=False)  # D^T, Y on partitions
-                    kt = _kmv_entries(d_ps, prm, kind, jr, ni)
+                    kt = _kmv_entries(d_ps, prm, kind, jr, ni, scr[k % len(scr)] if scr else None)
                     vk = v_all[:, k, :] if full else nl.load(v[nl.ds(j, jr), p0 : p0 + pr])
                     for ri, (r0, rr) in enumerate(rg):
                         # out^T += V_j^T K^T; the body's first Y tile opens

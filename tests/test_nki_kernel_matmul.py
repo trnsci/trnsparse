@@ -271,6 +271,18 @@ def _compile_cases():
         (131072, 128, 3, 16),
         (8192, 768, 0, 32),
         (8192, 769, 0, 16),
+        # The auto group reaches 32 at m >= 131072 (#108): every V pass width
+        # (one tile, the 64 KiB batched-V limit at 512 columns, a full
+        # 6-tile pass, two passes) with the most SBUF temporaries (Matern-5/2).
+        # Without the scratch ring, Matern-5/2 fell back to neuronx-cc
+        # allocation from 24 tiles (20 at R >= 384).
+        (131072, 1, 3, 32),
+        (131072, 128, 3, 32),
+        (131072, 512, 3, 32),
+        (131072, 513, 3, 32),
+        (131072, 768, 3, 32),
+        (131072, 1500, 3, 32),
+        (131072, 1500, 0, 32),
     ]:
         cases[f"self-n{n}-R{R}-k{kind}-g{g}"] = (
             "_kmv_self_kernel",

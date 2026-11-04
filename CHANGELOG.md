@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+
+- **`kernel_matmul`: the default loop body grows to 32 Y tiles at
+  m >= 131072** (`_KMV_AUTO_GROUP_MAX` 16 -> 32, #108). Trn2, one logical
+  core, n = m = 131072 and 524288, `rbf`: R = 128 goes from 4.3e10 to
+  5.1e10 kernel entries/s (+18%, also at LNC=1), R = 768 +19%, R = 33
+  +15% to +55% (it varies between runs), R = 1 +2%. Matern-5/2 gains
+  12%, Matern-3/2 4-6%; Matern-1/2 loses 3% at R = 1 and gains 4% at
+  R = 128 (both groups with the scratch ring below). The fp32 error falls
+  with it, as the g + m/(128 g) model predicts: 7.0e-7 -> 5.3e-7 against
+  float64 at m = 524288 (summation-bound case, positive V, lengthscale
+  0.5). `kmv_group(m)` is still about sqrt(m / 128); smaller m and
+  `TRNSPARSE_KMV_GROUP` are unchanged.
+- **`kernel_matmul`: Matern intermediates share a 2-slot SBUF ring per
+  loop body** (#108). NKI allocations live for their enclosing region, so
+  the per-Y-tile temporaries of the Matern kernels (one to three 2 KiB
+  tiles each) piled up across a body. Bodies of 24 Matern-5/2 tiles (20 at
+  R >= 384), 32 Matern-3/2 tiles (24 at R >= 512) and 32 Matern-1/2 tiles
+  at R >= 512 overflowed SBUF and silently fell back to neuronx-cc
+  allocation (correct, but without NKI scheduling). Now every kernel keeps
+  NKI's allocation at 32 tiles for every R checked (1 to 1500, rbf to
+  3000) at LNC=1 and LNC=2. The
+  instructions are the same, so the results are bit-identical at a given
+  group, and at group 16 Matern-1/2 and Matern-3/2 run 23% and 14% faster
+  (2.83e10 -> 3.49e10 and 2.78e10 -> 3.16e10 entries/s at n = 131072).
+
 ## [0.14.0] — 2026-11-04
 
 Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
