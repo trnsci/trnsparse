@@ -81,7 +81,7 @@ before importing `torch_neuronx`.
 
 ## Known issues in earlier releases
 
-Silent wrong results fixed in the 2026-10-31 to 2026-11-02 releases. If you
+Silent wrong results fixed in the 2026-10-31 to 2026-11-04 releases. If you
 use an affected version, upgrade. Details are in the [CHANGELOG](CHANGELOG.md).
 
 | Bug | Affected | Fixed in |
@@ -98,6 +98,12 @@ use an affected version, upgrade. Details are in the [CHANGELOG](CHANGELOG.md).
 | `bsr_spmm` dropped the imaginary part of complex operands on the NKI backend (#78) | 0.8.0–0.12.1 | 0.13.0 |
 | `spmv` / `spmm` returned float32 for integer operands on the device (#79) | through 0.12.1 (device CSR path) | 0.13.0 |
 | `block_sparse_attention_tiled` accepted a mask smaller than `seq_len` on the NKI path (#82) | 0.10.0–0.12.1 | 0.13.0 |
+| Integer, bool and complex operands reached the fp32/bf16 NKI kernels: the static attention kernels dropped the imaginary part of complex Q/K/V, and the static `bsr_spmm` and attention kernels cast integers to fp32 and back (trnsci/trnsci#35) | every release with NKI kernels through 0.13.0, NKI / `auto` backends | 0.14.0 |
+| `from_scipy` downcast float64 to float32 (~3e-8 rel. err), int64 to float32 (exact only up to 2^24) and complex128 to complex64 (#69) | 0.1.1–0.13.0 | 0.14.0 |
+| `cg_bsr` gave wrong gradients: autograd differentiated a frozen-coefficient polynomial, not the solve (`b.grad` ~20% off) (#70) | 0.3.2–0.13.0 | 0.14.0 |
+| `power_iteration_bsr` gave wrong gradients (frozen normalisation; `v0` got a spurious gradient) (#96) | 0.3.2–0.13.0 | 0.14.0 |
+| `cg_bsr` reported `iters = max_iter` after a breakdown, e.g. 500 for a one-step solve (#71) | 0.3.2–0.13.0 | 0.14.0 |
+| `cg_bsr_fused` / `power_iteration_bsr_fused` dropped the imaginary part of complex input and truncated integer / bool `b`, on every backend (#85) | 0.11.0–0.13.0 | 0.14.0 |
 
 ## Usage
 
