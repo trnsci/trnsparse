@@ -19,7 +19,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   >= 2**32). Such reads are now DMAs of row blocks of at most 64 partitions
   (views of the same operand, no copies), each spanning at most 2 GiB + 1 MiB
   (`nki.kernels.dma_row_block`). Below the rule every read is the one
-  full-partition DMA it was.
+  full-partition DMA it was. On Trn2 at T = 256 dense (65,536 blocks), 0.11.0
+  through 0.15.0 ran CG to its iteration cap with no error and returned x
+  with true residual 3.9e6 (column matvec) / 1.7e7 (row); now 9 iterations,
+  5e-7. A probe DMA of such an operand read partitions 64-127 wrong (max abs
+  error 11); 64-row reads were bit-exact.
 
 ## [0.15.0] — 2026-11-04
 
