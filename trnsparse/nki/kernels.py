@@ -1383,8 +1383,10 @@ if HAS_NKI:
 # matvec, R moving columns in the row matvec; see `block_matvec_col`).
 
 # SBUF bytes per partition the CG kernel may use for resident A blocks,
-# block-Jacobi inverses and (for R > 1) its vectors. Trn2 SBUF is 192 KiB
-# per partition; the rest holds stream buffers and compiler temporaries.
+# block-Jacobi inverses and (for R > 1) its vectors. SBUF is 192 KiB per
+# partition on Trn1 and 224 KiB on Trn2 (212,472 bytes, about 207 KiB,
+# allocatable by NKI, #111); the rest holds stream buffers and compiler
+# temporaries.
 _CG_SBUF_ENV = "TRNSPARSE_CG_SBUF_KIB"
 # Stored blocks per streaming DMA when A does not fit (8 KiB / partition).
 _CG_STREAM_BLOCKS = 16
@@ -2835,7 +2837,8 @@ if HAS_NKI:
         intermediates, a slot of the body's ring (#108). Only the returned
         tile is allocated here: allocations live for their enclosing region
         (the loop body), so fresh intermediates per Y tile would grow the
-        body's SBUF with its size, past 192 KiB at 24 Matern-5/2 tiles.
+        body's SBUF with its size, past the 212,472 bytes (about 207 KiB)
+        per partition NKI's allocator has on Trn2 at 24 Matern-5/2 tiles.
         """
         a = prm[0:jr, 0:1]
         log_s = prm[0:jr, 1:2]
