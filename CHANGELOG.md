@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`kernel_matmul` / `KernelOperator` with a complex V dropped its imaginary
+  part** (silent, #120). 0.14.0 through 0.15.0 cast V to the real working
+  dtype and returned `K @ Re(V)` as a real tensor, with no error (relative
+  error 0.90 at n = 40). The kernel is real, so a complex V now runs as one
+  real product on `[Re V, Im V]` (one launch on the NKI route, as `bsr_spmm`
+  does, #78) and returns V's complex dtype. complex128 V follows the float64
+  policy. Complex points `X` / `Y` (which lost their imaginary part the same
+  way) raise `TypeError`, also in `kernel_matmul_reference`, whose complex V
+  is now split the same way.
 - **`cg_bsr_fused` / `power_iteration_bsr_fused` read A's blocks over 128
   partitions at a 32 MiB partition step once fp32 A stores 65,536 blocks or
   more** (#121, aws-neuron-sdk#1457). The kernels keep A's blocks side by side
