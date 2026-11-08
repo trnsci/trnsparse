@@ -104,7 +104,34 @@ def _lengthscale(lengthscale, d: int, dtype, device) -> tuple[torch.Tensor | Non
     return None, ell
 
 
+def _real_points(name: str, P: torch.Tensor | None) -> None:
+    """Points must be real: a stationary kernel of complex coordinates is not defined here.
+
+    Through 0.15.0 complex points lost their imaginary part with no error (#120).
+    """
+    if P is not None and P.is_complex():
+        raise TypeError(f"trnsparse kernel_matmul: {name} must be real points, got {P.dtype}")
+
+
+def _split_complex(V: torch.Tensor) -> tuple[torch.Tensor, int]:
+    """(V, 0) for real V; ([Re V, Im V], R) for complex (m, R) V.
+
+    The kernel is real, so K @ V = K @ Re V + 1j K @ Im V: one real product on
+    2R columns (one launch on the NKI route), as `bsr_spmm` does (#78).
+    Through 0.15.0 the cast to the working dtype dropped Im V (#120).
+    """
+    if not V.is_complex():
+        return V, 0
+    return torch.cat([V.real, V.imag], dim=1), V.shape[1]
+
+
+def _join_complex(out: torch.Tensor, R: int) -> torch.Tensor:
+    return torch.complex(out[:, :R].contiguous(), out[:, R:].contiguous())
+
+
 def _check(X, Y, V, noise):
+    _real_points("X", X)
+    _real_points("Y", Y)
     if X.dim() != 2:
         raise ValueError(f"X must be (n, d), got shape {tuple(X.shape)}")
     if Y is not None and (Y.dim() != 2 or Y.shape[1] != X.shape[1]):
@@ -132,11 +159,14 @@ def kernel_matmul_reference(
     Blocked over rows of X so memory stays O(block_rows * m). Y=None means
     Y = X and adds noise * V. Returns float64 (n, R) (or (n,) for 1-D V).
     """
+    _real_points("X", X)
+    _real_points("Y", Y)
     vec = V.dim() == 1
     X = X.detach().to("cpu", torch.float64)
     Y = X if Y is None else Y.detach().to("cpu", torch.float64)
-    V64 = V.detach().to("cpu", torch.float64)
-    V64 = V64[:, None] if vec else V64
+    V = V.detach().to("cpu")
+    V, R = _split_complex(V[:, None] if vec else V)
+    V64 = V.to(torch.float64)
     ls, ell = _lengthscale(lengthscale, X.shape[1], torch.float64, "cpu")
     if ls is not None:
         X, Y = X / ls, Y / ls
@@ -148,6 +178,8 @@ def kernel_matmul_reference(
         out[i0 : i0 + block_rows] = _kernel_of_sqdist(kind, D, a, float(outputscale)) @ V64
     if noise:
         out += float(noise) * V64
+    if R:
+        out = _join_complex(out, R)
     return out[:, 0] if vec else out
 
 
@@ -244,6 +276,7 @@ class KernelOperator:
         device=None,
         dtype: torch.dtype | None = None,
     ):
+        _real_points("X", X)
         if X.dim() != 2:
             raise ValueError(f"X must be (n, d), got shape {tuple(X.shape)}")
         if not outputscale > 0:
@@ -291,6 +324,7 @@ class KernelOperator:
         self.shape = (n, n)
 
     def _prep_points(self, Y: torch.Tensor) -> torch.Tensor:
+        _real_points("Y", Y)
         Y64 = Y.detach().to("cpu", torch.float64)
         if self._ard is not None:
             Y64 = Y64 / self._ard
@@ -299,7 +333,8 @@ class KernelOperator:
     def _apply(self, Xa: torch.Tensor, Yb: torch.Tensor | None, V: torch.Tensor, noise: float):
         vec = V.dim() == 1
         out_dtype = V.dtype
-        Vk = (V[:, None] if vec else V).to(device=self.device, dtype=self.dtype).contiguous()
+        Vk, R = _split_complex(V[:, None] if vec else V)
+        Vk = Vk.to(device=self.device, dtype=self.dtype).contiguous()
         out = None
         if self.route == "nki":
             try:
@@ -317,7 +352,10 @@ class KernelOperator:
                 self.route = "torch"
         if out is None:
             out = _torch_kernel_matmul(Xa, Yb, Vk, self.kind, self._a, self.outputscale, noise)
-        out = out.to(dtype=out_dtype) if out_dtype.is_floating_point else out
+        if R:
+            out = _join_complex(out, R).to(dtype=out_dtype)
+        elif out_dtype.is_floating_point:
+            out = out.to(dtype=out_dtype)
         if self._home is not None:
             out = out.to(V.device)
         return out[:, 0] if vec else out
@@ -366,9 +404,10 @@ def kernel_matmul(
     """K(X, Y) @ V without forming K; Y=None gives (K(X, X) + noise I) @ V.
 
     Args:
-        X: (n, d) points.
-        Y: (m, d) points, or None for Y = X.
-        V: (m, R) or (m,).
+        X: (n, d) real points (complex points raise TypeError).
+        Y: (m, d) real points, or None for Y = X.
+        V: (m, R) or (m,), real or complex. A complex V is applied as one real
+            product on [Re V, Im V] (the kernel is real).
         kernel: "rbf", "matern12", "matern32" or "matern52".
         lengthscale: float, or a (d,) tensor of per-dimension lengthscales.
         outputscale: s, the kernel's value at distance 0.
@@ -384,6 +423,8 @@ def kernel_matmul(
         raise NotImplementedError("kernel_matmul: tile_mask is not implemented yet (#93)")
     _check(X, Y, V[:, None] if V.dim() == 1 else V, noise)
     dtype = torch.promote_types(X.dtype, V.dtype)
+    if dtype.is_complex:  # complex V: two real products (complex points raised in _check)
+        dtype = dtype.to_real()
     op = KernelOperator(
         X,
         kernel,

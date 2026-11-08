@@ -602,3 +602,115 @@ def test_multicore_under_budget_auto_stays_single(monkeypatch):
     x, v = torch.rand(500, 3), torch.randn(500, 2)
     D.nki_kernel_matmul(x, None, v, _params(-1.0, 1.0, 1e-2, "cpu"), 0, 4)
     assert len(calls) == 1 and calls[0][0] == (500, 3)
+
+
+# ── complex V (#120) ──────────────────────────────────────────────────────────
+# The kernel is real, so K @ V = K @ Re(V) + 1j K @ Im(V). Through 0.15.0
+# complex V lost its imaginary part (relative error 0.90 at n = 40), and
+# complex points lost theirs.
+
+
+def _dense_rbf(X, Y, ell, s):
+    X, Y = X.double(), (X if Y is None else Y).double()
+    return s * torch.exp(-torch.cdist(X, Y).square() / (2 * ell**2))
+
+
+def _crel(out, ref):
+    out, ref = out.to(torch.complex128), ref.to(torch.complex128)
+    return float((out - ref).abs().max() / ref.abs().max())
+
+
+@pytest.mark.parametrize("backend", ["pytorch", "auto"])
+@pytest.mark.parametrize(
+    "xdt,vdt,tol",
+    [
+        (torch.float64, torch.complex128, 1e-12),
+        (torch.float32, torch.complex64, 2e-5),
+        (torch.float32, torch.complex128, 1e-12),
+    ],
+)
+def test_complex_v_keeps_imaginary_part(backend, xdt, vdt, tol):
+    trnsparse.set_backend(backend)
+    g = torch.Generator().manual_seed(120)
+    X = torch.randn(40, 3, generator=g, dtype=torch.float64)
+    Y = torch.randn(23, 3, generator=g, dtype=torch.float64)
+    V = torch.randn(40, 2, generator=g, dtype=torch.complex128)
+    W = torch.randn(23, 3, generator=g, dtype=torch.complex128)
+    X, Y = X.to(xdt).double(), Y.to(xdt).double()  # the references see the rounded points
+    Kxx, Kxy = _dense_rbf(X, None, 0.8, 1.3), _dense_rbf(X, Y, 0.8, 1.3)
+    ref_sq = Kxx.to(torch.complex128) @ V + 0.1 * V
+    ref_x = Kxy.to(torch.complex128) @ W
+    Xd, Yd, Vd, Wd = X.to(xdt), Y.to(xdt), V.to(vdt), W.to(vdt)
+    out = kernel_matmul(Xd, None, Vd, "rbf", 0.8, 1.3, noise=0.1)
+    assert out.dtype == vdt and out.shape == (40, 2)
+    assert _crel(out, ref_sq) < tol
+    out_v = kernel_matmul(Xd, None, Vd[:, 1], "rbf", 0.8, 1.3, noise=0.1)
+    assert out_v.dtype == vdt and out_v.shape == (40,)
+    assert _crel(out_v, ref_sq[:, 1]) < tol
+    out_x = kernel_matmul(Xd, Yd, Wd, "rbf", 0.8, 1.3)
+    assert out_x.dtype == vdt and _crel(out_x, ref_x) < tol
+    # A KernelOperator computes in X's dtype (float32 X: fp32 for any V).
+    op_tol = 2e-5 if xdt == torch.float32 else tol
+    op = KernelOperator(Xd, "rbf", 0.8, 1.3, noise=0.1)
+    assert op(Vd).dtype == vdt and _crel(op(Vd), ref_sq) < op_tol
+    ref_c = _dense_rbf(Y, X, 0.8, 1.3).to(torch.complex128) @ V
+    assert _crel(op.cross(Yd, Vd), ref_c) < op_tol
+
+
+def test_reference_complex_v():
+    g = torch.Generator().manual_seed(121)
+    X = torch.randn(30, 2, generator=g, dtype=torch.float64)
+    V = torch.randn(30, 2, generator=g, dtype=torch.complex128)
+    ref = kernel_matmul_reference(X, None, V, "rbf", 0.6, 1.0, noise=0.2)
+    assert ref.dtype == torch.complex128
+    want = _dense_rbf(X, None, 0.6, 1.0).to(torch.complex128) @ V + 0.2 * V
+    assert _crel(ref, want) < 1e-12
+
+
+def test_complex_v_reaches_the_kernel_as_real_columns(monkeypatch):
+    """On the NKI route a complex V is one launch on [Re V, Im V] (real fp32)."""
+    import importlib
+    import math
+
+    from trnsparse.nki import dispatch
+
+    KM = importlib.import_module("trnsparse.kernel_matmul")
+
+    monkeypatch.setattr(dispatch, "_use_nki", lambda: True)
+    monkeypatch.setattr(dispatch, "_REQUIRE_NKI", False)
+    seen = []
+
+    def fake(x, y, v, params, kind, group):
+        seen.append(v.dtype)
+        assert not v.is_complex()
+        a = float(params[0, 0])
+        s = math.exp(float(params[0, 1]))
+        return KM._torch_kernel_matmul(x, y, v, kind, a, s, float(params[0, 2]))
+
+    monkeypatch.setattr(dispatch, "nki_kernel_matmul", fake)
+    g = torch.Generator().manual_seed(122)
+    X = torch.randn(40, 3, generator=g)
+    V = torch.randn(40, 2, generator=g, dtype=torch.complex64)
+    out = kernel_matmul(X, None, V, "rbf", 0.8, 1.3, noise=0.1)
+    assert seen == [torch.float32]
+    ref = _dense_rbf(X, None, 0.8, 1.3).to(torch.complex128) @ V.to(torch.complex128)
+    ref += 0.1 * V.to(torch.complex128)
+    assert out.dtype == torch.complex64 and _crel(out, ref) < 2e-5
+
+
+def test_complex_points_raise():
+    X = torch.randn(10, 3)
+    Xc = torch.randn(10, 3, dtype=torch.complex64)
+    V = torch.randn(10, 1)
+    with pytest.raises(TypeError, match="complex"):
+        kernel_matmul(Xc, None, V)
+    with pytest.raises(TypeError, match="complex"):
+        kernel_matmul(X, Xc, V)
+    with pytest.raises(TypeError, match="complex"):
+        KernelOperator(Xc)
+    with pytest.raises(TypeError, match="complex"):
+        KernelOperator(X).cross(Xc[:4], V)
+    with pytest.raises(TypeError, match="complex"):
+        kernel_matmul_reference(Xc, None, V)
+    with pytest.raises(TypeError, match="complex"):
+        kernel_matmul_reference(X, Xc, V)

@@ -305,11 +305,14 @@ def _case(api, dtype):
         A = trnsparse.BSRMatrix.from_dense(Ad, block_size=P)
         return lambda: trnsparse.power_iteration_bsr_fused(A, max_iter=3)[1]
     if api in ("kernel_matmul", "kernel_matmul_cross"):
-        X = _rnd((40, 3), dtype, g)
+        # Points are real (complex points raise TypeError, #120); a complex
+        # dtype is a complex V on real points of the matching real dtype.
+        pdt = dtype.to_real() if dtype.is_complex else dtype
+        X = _rnd((40, 3), pdt, g)
         V = _rnd((40, 2), dtype, g)
         if api == "kernel_matmul":
             return lambda: trnsparse.kernel_matmul(X, None, V, noise=0.1)
-        Y = _rnd((30, 3), dtype, g)
+        Y = _rnd((30, 3), pdt, g)
         return lambda: trnsparse.kernel_matmul(Y, X, V)
     raise AssertionError(api)
 
@@ -335,6 +338,8 @@ def _outcome(fn):
 # float64 only (complex is #85).
 FP64_APIS = {api: {torch.float64} for api in APIS}
 FP64_APIS["bsr_spmm"] = FP64_APIS["cg_bsr"] = {torch.float64, torch.complex128}
+# complex128 V is two float64 products (#120), so the float64 policy decides it.
+FP64_APIS["kernel_matmul"] = FP64_APIS["kernel_matmul_cross"] = {torch.float64, torch.complex128}
 FUSED = {"cg_bsr_fused", "power_fused"}
 
 
@@ -367,6 +372,8 @@ def test_no_unsupported_dtype_reaches_a_kernel(stubs, monkeypatch, api, dtype, r
     routed = api in ROUTED_APIS and dtype in NO_KERNEL
     if api == "bsr_spmm" and dtype.is_complex and hasattr(dispatch, "_nki_bsr_spmm_complex"):
         routed = False  # #80: complex BSR SpMM as real kernel launches
+    if api.startswith("kernel_matmul") and dtype.is_complex:
+        routed = False  # #120: complex V as one real launch on [Re V, Im V]
     if require and (routed or _fp64_policy(api, dtype, path)):
         assert isinstance(err, NotImplementedError), (err, got)
         return
