@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`cg_bsr_fused` / `power_iteration_bsr_fused` read A's blocks over 128
+  partitions at a 32 MiB partition step once fp32 A stores 65,536 blocks or
+  more** (#121, aws-neuron-sdk#1457). The kernels keep A's blocks side by side
+  in one `(128, n_blocks * 128)` operand; with 65,536 or more fp32 (or
+  bf16x2) blocks, or 131,072 or more bf16 ones, its memory rows are 32 MiB or
+  more, the layout whose device reads are misdirected on Trn2 (the
+  trnsci/trnblas#112 / trnsci/trntensor#123 rule, min(rows, 128) * row_bytes
+  >= 2**32). Such reads are now DMAs of row blocks of at most 64 partitions
+  (views of the same operand, no copies), each spanning at most 2 GiB + 1 MiB
+  (`nki.kernels.dma_row_block`). Below the rule every read is the one
+  full-partition DMA it was. DEVICE_RESULT_PLACEHOLDER
+
 ## [0.15.0] — 2026-11-04
 
 Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
