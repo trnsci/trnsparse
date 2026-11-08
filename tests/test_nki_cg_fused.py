@@ -280,3 +280,90 @@ def test_host_bsr_with_device_rhs(R):
     for c in cols:
         bc, xc = (b, x) if c is None else (b[:, c], x[:, c])
         assert _true_res(A, bc, xc.cpu()) < 3e-5
+
+
+# ── Row-block reads of A's blocks at the 4 GiB rule (#121) ───────────────────
+
+
+@pytest.mark.parametrize("matvec", MATVECS)
+@pytest.mark.parametrize("rows,budget", [(64, None), (16, None), (32, "2")])
+def test_row_block_reads_forced(monkeypatch, rows, budget, matvec):
+    """The split reads, forced at a small size by lowering the rule: the same
+    solve as the host path, resident and streamed. Distinct structures per
+    case (T = 6 + rows // 16, band 2) keep the patched rule out of NEFFs
+    traced at the default one."""
+    from trnsparse.nki import kernels as K
+
+    T = 6 + rows // 16
+    if budget:
+        monkeypatch.setenv("TRNSPARSE_CG_SBUF_KIB", budget)
+    A = _spd(T, band=2, seed=40 + rows)
+    b = _rhs(A.shape[0], seed=41 + rows)
+    bsr = trnsparse.BSRMatrix.from_dense(A.float(), block_size=128)
+    op = trnsparse.prepare_cg_bsr(bsr, device=DEV)
+    row_bytes = op.n_blocks * 128 * 4
+    monkeypatch.setattr(K, "_DMA_SPAN_BYTES", 1)
+    monkeypatch.setattr(K, "_DMA_BLOCK_BYTES", rows * row_bytes)
+    assert K.dma_row_block(128, row_bytes) == rows
+    if budget:
+        assert op.resident_blocks < op.n_blocks
+    x, _, rel, info = trnsparse.cg_bsr_fused(op, b, tol=1e-5, matvec=matvec, return_info=True)
+    assert info["path"] == "nki"
+    assert rel <= 1e-5 and _true_res(A, b, x) < 3e-5
+    lam, _, _ = trnsparse.power_iteration_bsr_fused(op, v0=b, tol=1e-6, max_iter=3000)
+    lam_ref = float(torch.linalg.eigvalsh(A)[-1])
+    assert abs(lam - lam_ref) < 1e-4 * lam_ref
+
+
+def _dense_block_spd(T: int, seed: int = 0):
+    """BSR (block_size 128) with every block of a T x T block grid stored,
+    SPD and well conditioned (kappa ~ 3), built block by block in fp32."""
+    g = torch.Generator().manual_seed(seed)
+    N = T * 128
+    s = 1.0 / N**0.5
+    G = torch.randn(T, T, 128, 128, generator=g) * s
+    blocks = (G + G.transpose(0, 1).transpose(2, 3)) * 0.5  # A_ij = A_ji^T
+    del G
+    idx = torch.arange(T)
+    blocks[idx, idx] += 4.0 * torch.eye(128)
+    row_ptrs = torch.arange(0, T * T + 1, T)
+    cols = idx.repeat(T)
+    return trnsparse.BSRMatrix(
+        blocks=blocks.reshape(T * T, 128, 128),
+        block_col_indices=cols,
+        block_row_ptrs=row_ptrs,
+        shape=(N, N),
+    )
+
+
+@pytest.mark.skipif(
+    not __import__("os").environ.get("TRNSPARSE_TEST_4GIB"),
+    reason="4 GiB operand, ~25 GB host RAM: set TRNSPARSE_TEST_4GIB=1",
+)
+@pytest.mark.parametrize("T", [255, 256])
+def test_blocks_at_the_4gib_rule(T):
+    """T = 256 dense: 65,536 stored fp32 blocks, blocks_t rows of 32 MiB
+    (min(128 rows) * row = 2**32, the rule); T = 255 (65,025 blocks) is the
+    control below it. blocks_t is uploaded above a 4 GiB decoy so a
+    misdirected read sees other data. Checked against the fp64 true residual
+    on the host."""
+    from trnsparse.nki import kernels as K
+
+    A = _dense_block_spd(T, seed=T)
+    op = trnsparse.prepare_cg_bsr(A, device=DEV)
+    row_bytes = op.n_blocks * 128 * 4
+    assert K.dma_row_block(128, row_bytes) == (64 if T == 256 else 128)
+    decoy = torch.full((1 << 30,), 7.0).to(DEV)  # 4 GiB below blocks_t
+    op._device_operands()
+    b = _rhs(op.n, seed=T)
+    x, k, rel, info = trnsparse.cg_bsr_fused(
+        op, b.float(), tol=1e-6, max_iter=100, check_every=1, return_info=True
+    )
+    del decoy
+    assert info["path"] == "nki"
+    T_ = op.n_tiles
+    xt = torch.zeros(T_ * 128, 1, dtype=torch.float64)
+    xt[: op.n, 0] = x.double()
+    Ax = op._matvec(xt.reshape(T_, 128, 1)).reshape(-1)[: op.n]  # fp64 on the host
+    true_rel = float(torch.linalg.norm(b - Ax) / torch.linalg.norm(b))
+    assert rel <= 1e-6 and true_rel < 1e-5, (k, rel, true_rel)

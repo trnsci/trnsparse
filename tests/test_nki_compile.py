@@ -584,6 +584,35 @@ def test_cg_kernel_lnc_mlir_verifies(case, lnc):
     result.verify()
 
 
+# Row-block reads of blocks_t (#121), forced at small T by lowering the rule:
+# (case, partitions per read).
+_CG_ROW_BLOCK_CASES = [
+    ("plain", 64),
+    ("stream", 64),
+    ("col-stream", 16),
+    ("col-bjacobi", 32),
+    ("bf16x2-bjacobi", 64),
+    ("nosplit", 16),
+]
+
+
+@pytest.mark.parametrize("lnc", [1, 2])
+@pytest.mark.parametrize("case,rows", _CG_ROW_BLOCK_CASES)
+def test_cg_kernel_row_block_reads_mlir_verifies(monkeypatch, case, rows, lnc):
+    from trnsparse.nki import kernels
+
+    (kw,) = _CG_CASES[case]
+    inputs = _cg_inputs(**kw)
+    row_bytes = inputs[0].shape[1] * inputs[0].itemsize
+    monkeypatch.setattr(kernels, "_DMA_SPAN_BYTES", 1)
+    monkeypatch.setattr(kernels, "_DMA_BLOCK_BYTES", rows * row_bytes)
+    assert kernels.dma_row_block(_P, row_bytes) == rows
+    result = source_to_mlir(
+        kernels._cg_bsr_keyed_kernel, *inputs, target="trn2", lnc=lnc, frontend=FrontendKind.TRACER
+    )
+    result.verify()
+
+
 _POWER_CASES = {
     "row": dict(T=3, check_every=2, matvec=0),
     "column": dict(T=3, check_every=2, matvec=1),

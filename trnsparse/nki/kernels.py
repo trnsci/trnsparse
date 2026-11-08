@@ -1406,6 +1406,39 @@ def _cg_sbuf_budget_bytes() -> int:
     return int(float(os.environ.get(_CG_SBUF_ENV, "160")) * 1024)
 
 
+# Device reads of A's side-by-side blocks (#121, aws-neuron-sdk#1457). The
+# CG / power kernels read `blocks_t` (128, n_blocks * 128 * parts) with DMAs
+# over all 128 partitions, whose partition step is one memory row of
+# blocks_t. On Trn2 (SDK 2.33) device reads with a step of 32 MiB or more over
+# 128 partitions are misdirected, silently: partitions 64-127 come from 4 GiB
+# below the right address (trnsci/trnblas#112, trnsci/trntensor#123,
+# trnsci/trnsci#140, #145). The rule, as in trnblas / trntensor, is
+# min(rows, 128) * row_bytes >= 2**32: fp32 (or bf16x2) A with 65,536 stored
+# blocks or more, bf16 A with 131,072 or more. Such reads are issued as DMAs
+# of row blocks of at most 64 partitions (views of blocks_t, no copies), each
+# spanning at most 2 GiB + 1 MiB, the measured-correct regime of
+# `trnblas.nki.dispatch._NEURON_BLOCK_BYTES`. Below the rule every read is the
+# one full-partition DMA it was, so those kernels are unchanged.
+_DMA_SPAN_BYTES = 1 << 32
+_DMA_BLOCK_BYTES = (1 << 31) + (1 << 20)
+
+
+def dma_row_block(rows: int, row_bytes: int) -> int:
+    """Partitions per DMA when reading `rows` memory rows of `row_bytes` each.
+
+    `rows` (one DMA) when min(rows, 128) * row_bytes < 2**32; otherwise the
+    largest power of two <= 64 whose block spans at most 2 GiB + 1 MiB (at
+    least 1). A power of two, so the blocks tile 128 partitions evenly and
+    start at multiples of their size.
+    """
+    if min(rows, 128) * row_bytes < _DMA_SPAN_BYTES:
+        return rows
+    r = 64
+    while r > 1 and r * row_bytes > _DMA_BLOCK_BYTES:
+        r //= 2
+    return r
+
+
 def cg_resident_blocks(
     n_blocks: int,
     n_tiles: int,
@@ -1573,6 +1606,20 @@ if HAS_NKI:
         parts = 2 if int(precision) == 2 else 1  # stored parts per block of A
         adt = nl.bfloat16 if lowp else f32
         BW = parts * P  # columns per stored block in blocks_t
+        # Partitions per read of blocks_t (#121): P below the 4 GiB rule.
+        a_rows = dma_row_block(P, blocks_t.shape[1] * (2 if lowp else 4))
+
+        def load_blocks(dst, d0, j0, j1):
+            """Stored blocks j0 .. j1 - 1 of blocks_t into dst[:, d0 : d0 + (j1 - j0) BW]."""
+            d1 = d0 + (j1 - j0) * BW
+            if a_rows >= P:
+                nisa.dma_copy(dst=dst[:, d0:d1], src=blocks_t[:, j0 * BW : j1 * BW])
+                return
+            for p0 in range(0, P, a_rows):
+                nisa.dma_copy(
+                    dst=dst[p0 : p0 + a_rows, d0:d1],
+                    src=blocks_t[p0 : p0 + a_rows, j0 * BW : j1 * BW],
+                )
 
         def resident(a0, a1):
             return cg_resident_blocks(
@@ -1600,10 +1647,7 @@ if HAS_NKI:
             a_res = nl.ndarray((P, n_res * BW), dtype=adt, buffer=nl.sbuf)
             for c0 in range(0, n_res, _CG_STREAM_BLOCKS):
                 c1 = min(n_res, c0 + _CG_STREAM_BLOCKS)
-                nisa.dma_copy(
-                    dst=a_res[:, c0 * BW : c1 * BW],
-                    src=blocks_t[:, (b_lo + c0) * BW : (b_lo + c1) * BW],
-                )
+                load_blocks(a_res, c0 * BW, b_lo + c0, b_lo + c1)
         m_res = None
         if precond:
             m_res = nl.ndarray((P, (o1 - o0) * P), dtype=f32, buffer=nl.sbuf)
@@ -2046,7 +2090,7 @@ if HAS_NKI:
                 if chunk.get("c0") != c0:
                     c1 = min(b_hi - b_lo, c0 + _CG_STREAM_BLOCKS)
                     t = nl.ndarray((P, (c1 - c0) * BW), dtype=adt, buffer=nl.sbuf)
-                    nisa.dma_copy(dst=t, src=blocks_t[:, (b_lo + c0) * BW : (b_lo + c1) * BW])
+                    load_blocks(t, 0, b_lo + c0, b_lo + c1)
                     chunk["c0"] = c0
                     chunk["t"] = t
                 i0 = (i - c0) * BW
