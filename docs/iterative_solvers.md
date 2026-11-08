@@ -62,10 +62,11 @@ What the kernel does on the NeuronCore:
 
 - **A's stored blocks are DMA'd into SBUF once** and every iteration
   reads them from there. The budget is `TRNSPARSE_CG_SBUF_KIB` (default
-  160 of the 192 KiB per partition on Trn2, i.e. 20 MiB of the 24 MiB
-  SBUF), so about 320 fp32 128x128 blocks per physical core. Blocks
-  beyond the budget stream from HBM in 16-block DMAs on every iteration,
-  still inside the launch.
+  160 KiB per partition, i.e. 20 MiB of SBUF), so about 320 fp32 128x128
+  blocks per physical core. Trn2 SBUF is 224 KiB per partition (28 MiB),
+  of which NKI's allocator gets about 207 KiB; 192 KiB (24 MiB) is the
+  Trn1 figure. Blocks beyond the budget stream from HBM in 16-block DMAs
+  on every iteration, still inside the launch.
 - x, r, p (and z) stay in SBUF in a column layout (element `t*128 + p`
   at `[p, t]`). The matvec is one `nc_matmul` per stored block; see
   "Matvec orientation" below.
