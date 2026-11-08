@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`kernel_matmul` / `KernelOperator` with a complex V dropped its imaginary
+  part** (silent, #120). 0.14.0 through 0.15.0 cast V to the real working
+  dtype and returned `K @ Re(V)` as a real tensor, with no error (relative
+  error 0.90 at n = 40). The kernel is real, so a complex V now runs as one
+  real product on `[Re V, Im V]` (one launch on the NKI route, as `bsr_spmm`
+  does, #78) and returns V's complex dtype. complex128 V follows the float64
+  policy. Complex points `X` / `Y` (which lost their imaginary part the same
+  way) raise `TypeError`, also in `kernel_matmul_reference`, whose complex V
+  is now split the same way.
+
 ## [0.15.0] — 2026-11-04
 
 Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
