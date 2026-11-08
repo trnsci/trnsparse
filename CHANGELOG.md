@@ -19,7 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   >= 2**32). Such reads are now DMAs of row blocks of at most 64 partitions
   (views of the same operand, no copies), each spanning at most 2 GiB + 1 MiB
   (`nki.kernels.dma_row_block`). Below the rule every read is the one
-  full-partition DMA it was. DEVICE_RESULT_PLACEHOLDER
+  full-partition DMA it was.
 
 ## [0.15.0] — 2026-11-04
 
