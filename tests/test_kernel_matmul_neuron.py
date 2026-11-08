@@ -280,3 +280,36 @@ def test_multicore_is_bitwise_single_core(monkeypatch, kernel, self_op, threads)
         X, None if self_op else Y, V, kernel, 0.1, 1.0, noise=1e-4 if self_op else 0.0
     )
     assert _rel(multi, ref) < 2e-5
+
+
+@pytest.mark.parametrize("self_op", [True, False], ids=["square", "cross"])
+@pytest.mark.parametrize("on_device", [True, False], ids=["device_v", "host_v"])
+def test_complex_v_on_device(self_op, on_device):
+    """complex64 V (#120): one real launch on [Re V, Im V], complex64 result,
+    against a dense complex128 reference (through 0.15.0: K @ Re(V), real)."""
+    g = torch.Generator().manual_seed(120)
+    n, m, d, R = 300, 257, 3, 5
+    X = torch.rand(n, d, generator=g)
+    Y = None if self_op else torch.rand(m, d, generator=g)
+    rows = n if self_op else m
+    V = torch.complex(torch.randn(rows, R, generator=g), torch.randn(rows, R, generator=g))
+    Xd = X.double()
+    Kd = torch.exp(-torch.cdist(Xd, Xd if self_op else Y.double()).square() / (2 * 0.6**2))
+    ref = 1.5 * Kd.to(torch.complex128) @ V.to(torch.complex128)
+    if self_op:
+        ref += 0.1 * V.to(torch.complex128)
+    Vin = V.to(DEV) if on_device else V
+    out = trnsparse.kernel_matmul(
+        X.to(DEV),
+        None if self_op else Y.to(DEV),
+        Vin,
+        "rbf",
+        0.6,
+        1.5,
+        noise=0.1 if self_op else 0.0,
+    )
+    assert out.dtype == torch.complex64 and out.shape == (n, R)
+    assert out.device.type == Vin.device.type
+    got = out.cpu().to(torch.complex128)
+    err = float((got - ref).abs().max() / ref.abs().max())
+    assert err < 2e-5, err
