@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`cg_bsr(..., reduction=None)`: LNC-invariant inner products and norms
+  (trnsci/trnsolver#128).** `"pairwise"` folds the elementwise products with
+  a fixed pairwise tree of device adds and finishes in float64 on the host
+  (the same tree as `trnsolver.cg_block`, kept local in
+  `trnsparse/_reduce.py`, so there is no trnsolver dependency). `"host64"`
+  sums the product on the host in float64. `"device"` (the default, the
+  previous behaviour) uses `torch.dot` / `torch.linalg.norm`. `None` reads
+  `TRNSPARSE_CG_REDUCTION`. The folded modes are opt-in because a BSR
+  matvec is cheap. Trn2, LNC=2, N = 100352 block-tridiagonal: 3.46 ms per
+  iteration with `"device"`, 6.57 ms with `"pairwise"` (+90%) and 3.90 ms
+  with `"host64"` (+13%).
+
 ### Fixed
 
 - **`kernel_matmul` / `KernelOperator` with a complex V dropped its imaginary

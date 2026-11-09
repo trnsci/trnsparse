@@ -17,6 +17,7 @@ from collections.abc import Callable
 import torch
 from torch.autograd.function import once_differentiable
 
+from . import _reduce
 from .formats import BSRMatrix
 from .nki.dispatch import _fp64_host_guard
 from .ops import bsr_spmm
@@ -67,6 +68,11 @@ def _bsr_matvec(A: BSRMatrix) -> Callable[[torch.Tensor], torch.Tensor]:
     return matvec
 
 
+# cg_bsr's default reduction (trnsci/trnsolver#128): "device" until the
+# pairwise fold's cost next to a BSR matvec is measured small enough.
+_CG_BSR_DEFAULT = "device"
+
+
 @_fp64_host_guard("cg_bsr")
 def cg_bsr(
     A: BSRMatrix,
@@ -75,6 +81,8 @@ def cg_bsr(
     tol: float = 1e-6,
     max_iter: int = 1000,
     M: Callable[[torch.Tensor], torch.Tensor] | torch.Tensor | None = None,
+    *,
+    reduction: str | None = None,
 ) -> tuple[torch.Tensor, int, float]:
     """Conjugate Gradient solver for `A @ x = b` with A SPD and BSR-stored.
 
@@ -92,6 +100,19 @@ def cg_bsr(
         M: Preconditioner — callable `M(r) → M^{-1} r` or a dense
             inverse tensor. Build a Jacobi preconditioner from
             `bsr_diagonal(A)` for the common diagonally-dominant case.
+        reduction: How the inner products and norms reduce over N
+            (trnsci/trnsolver#128). `"device"` (default): `torch.dot` /
+            `torch.linalg.norm` on b's device, whose summation order on
+            Trn2 depends on the LNC split (LNC=1 and LNC=2 give different
+            bits). `"pairwise"`: elementwise products, a fixed pairwise
+            tree of elementwise adds on the device, then float64 on the
+            host, so the result does not depend on the LNC split, given an
+            LNC-invariant matvec. `"host64"`: the product is copied to the
+            host and summed in float64. `None` reads
+            `TRNSPARSE_CG_REDUCTION`. Host tensors are multiplied in
+            float64 in the folded modes. `"pairwise"` costs a few small
+            device ops per reduction, which is large next to a cheap BSR
+            matvec, hence opt-in (see `docs/iterative_solvers.md`).
 
     Returns:
         `(x, iters, rel_residual)` — solution, iteration count, final
@@ -111,6 +132,7 @@ def cg_bsr(
     the gradient went through the CG iterations with frozen step sizes and
     was silently wrong (#70).
     """
+    red = _reduce.reduction_mode(reduction, "TRNSPARSE_CG_REDUCTION", _CG_BSR_DEFAULT)
     if M is None:
         precond: Callable[[torch.Tensor], torch.Tensor] | None = None
     elif callable(M):
@@ -128,11 +150,11 @@ def cg_bsr(
         or (isinstance(M, torch.Tensor) and M.requires_grad)
     )
     if not needs_grad:
-        return _cg_bsr_loop(A, b, x0, tol, max_iter, precond)
+        return _cg_bsr_loop(A, b, x0, tol, max_iter, precond, red)
     info: list = []
     A_const = dataclasses.replace(A, blocks=A.blocks.detach())
     x0_const = x0.detach() if x0 is not None else None
-    x = _CGBSRSolve.apply(A.blocks, b, A_const, x0_const, tol, max_iter, precond, info)
+    x = _CGBSRSolve.apply(A.blocks, b, A_const, x0_const, tol, max_iter, precond, info, red)
     return x, info[0], info[1]
 
 
@@ -143,24 +165,26 @@ def _cg_bsr_loop(
     tol: float,
     max_iter: int,
     precond: Callable[[torch.Tensor], torch.Tensor] | None,
+    red: str = "device",
 ) -> tuple[torch.Tensor, int, float]:
     n = b.shape[0]
     matvec = _bsr_matvec(A)
+    dot, norm = _reduce.dot, _reduce.norm
 
     x = x0.clone() if x0 is not None else torch.zeros(n, dtype=b.dtype, device=b.device)
     r = b - matvec(x)
-    b_norm = torch.linalg.norm(b).item()
+    b_norm = norm(b, red)
     if b_norm < 1e-15:
         return x, 0, 0.0
 
     z = precond(r) if precond is not None else r.clone()
     p = z.clone()
-    rz = torch.dot(r, z).item()
-    r_norm = torch.linalg.norm(r).item()
+    rz = dot(r, z, red)
+    r_norm = norm(r, red)
 
     for k in range(max_iter):
         Ap = matvec(p)
-        pAp = torch.dot(p, Ap).item()
+        pAp = dot(p, Ap, red)
         if abs(pAp) < 1e-30:
             # Breakdown: no step can be taken, x is the iterate after k steps.
             return x, k, r_norm / b_norm
@@ -169,13 +193,13 @@ def _cg_bsr_loop(
         x = x + alpha * p
         r = r - alpha * Ap
 
-        r_norm = torch.linalg.norm(r).item()
+        r_norm = norm(r, red)
         rel = r_norm / b_norm
         if rel < tol:
             return x, k + 1, rel
 
         z = precond(r) if precond is not None else r
-        rz_new = torch.dot(r, z).item()
+        rz_new = dot(r, z, red)
         beta = rz_new / rz
         p = z + beta * p
         rz = rz_new
@@ -192,10 +216,11 @@ class _CGBSRSolve(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, blocks, b, A, x0, tol, max_iter, precond, info):
-        x, iters, rel = _cg_bsr_loop(A, b.detach(), x0, tol, max_iter, precond)
+    def forward(ctx, blocks, b, A, x0, tol, max_iter, precond, info, red="device"):
+        x, iters, rel = _cg_bsr_loop(A, b.detach(), x0, tol, max_iter, precond, red)
         info.extend([iters, rel])
         ctx.A, ctx.tol, ctx.max_iter, ctx.precond = A, tol, max_iter, precond
+        ctx.red = red
         ctx.save_for_backward(x)
         return x
 
@@ -204,7 +229,7 @@ class _CGBSRSolve(torch.autograd.Function):
     def backward(ctx, g):
         (x,) = ctx.saved_tensors
         A = ctx.A
-        lam, _, _ = _cg_bsr_loop(A, g, None, ctx.tol, ctx.max_iter, ctx.precond)
+        lam, _, _ = _cg_bsr_loop(A, g, None, ctx.tol, ctx.max_iter, ctx.precond, ctx.red)
         grad_blocks = grad_b = None
         if ctx.needs_input_grad[1]:
             grad_b = lam
@@ -219,7 +244,7 @@ class _CGBSRSolve(torch.autograd.Function):
             cols = A.block_col_indices.to(device=lam.device, dtype=torch.long)
             grad_blocks = -(lam_t[rows].unsqueeze(2) * x_t[cols].conj().unsqueeze(1))
             grad_blocks = grad_blocks.to(dtype=A.blocks.dtype, device=A.blocks.device)
-        return grad_blocks, grad_b, None, None, None, None, None, None
+        return grad_blocks, grad_b, None, None, None, None, None, None, None
 
 
 def jacobi_preconditioner_bsr(

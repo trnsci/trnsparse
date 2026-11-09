@@ -42,6 +42,40 @@ round-trip per iteration. On CPU it's `torch.sparse`-backed and
 roughly on par with `scipy.sparse.linalg.cg` (benchmarked: 369 μs vs
 310 μs at 128×128 SPD, 1.19× slower).
 
+### `cg_bsr(..., reduction=None)`: LNC-invariant reductions (trnsci/trnsolver#128)
+
+On Trn2, device `dot` / `norm` add in an order that depends on how the
+compiler splits the work across logical cores, so LNC=1 and LNC=2 give
+different bits (bitwise reproducible within one LNC). `reduction=` picks how
+`cg_bsr`'s inner products and norms reduce over N:
+
+| `reduction` | How | LNC-invariant |
+|---|---|---|
+| `"device"` (default) | `torch.dot` / `torch.linalg.norm` on b's device | no |
+| `"pairwise"` | elementwise products, a fixed pairwise tree of elementwise adds on the device (pad to m · 2^L, m ≤ 64), then the m leaves in float64 on the host; the same tree as `trnsolver.cg_block` | yes, given an LNC-invariant matvec |
+| `"host64"` | the product is copied to the host and summed in float64 | yes |
+
+`None` reads `TRNSPARSE_CG_REDUCTION`. Host tensors are multiplied in
+float64 in the folded modes.
+
+**Why `"device"` stays the default:** a BSR matvec is cheap, so the extra
+small device ops and host syncs are a large fraction of an iteration. Trn2,
+LNC=2, one logical core, N = 100352, block-tridiagonal compact-support
+kernel (b = 128, 2350 blocks), 60 iterations:
+
+| `reduction` | ms / iteration | vs `"device"` |
+|---|---|---|
+| `"device"` | 3.46 | |
+| `"pairwise"` | 6.57 | +90% |
+| `"host64"` | 3.90 | +13% |
+
+The matvec alone is 1.55 ms. For one vector at this size, `"host64"` (one
+400 KB copy) is cheaper than the 11-level fold, so it is the better choice
+when you need LNC invariance here. trnsolver's `cg` and `gmres` with an
+expensive operator (the GP `KernelOperator`, 289 ms per call) pay +0.1% (cg) or less (gmres) for
+`"pairwise"`, which is why trnsolver defaults to it. `cg_bsr_fused` reduces
+inside the kernel and does not take `reduction=`.
+
 ## Fused CG: `cg_bsr_fused` (#22)
 
 `cg_bsr_fused` runs the whole CG (or block-Jacobi PCG) solve in **one
