@@ -131,7 +131,18 @@ class TestModes:
         b = torch.randn(1000, generator=torch.Generator().manual_seed(2))
         x, it, rel = trnsparse.cg_bsr(A_bsr, b, tol=1e-6, reduction=red)
         x0, it0, _ = trnsparse.cg_bsr(A_bsr, b, tol=1e-6, reduction="device")
-        assert rel < 1e-6 and abs(it - it0) <= 1
+        # On host tensors the folded modes form float64 products while
+        # "device" is an fp32 torch.dot, so the modes do different
+        # arithmetic here. For this system (cond ~1e3) fp32 CG converges
+        # late by an amount that moves with the rounding of the dots and of
+        # the fp32 matvec: pairwise / device take 145 / 153 iterations on
+        # Linux (MKL) and 151 / 152 on macOS (Accelerate); fp64 CG takes
+        # ~108. The counts agree only to a few percent, so the solutions
+        # are checked against float64 instead.
+        assert rel < 1e-6 and abs(it - it0) <= max(2, it0 // 10), (it, it0)
+        x64 = torch.linalg.solve(A.double(), b.double())
+        for xs in (x, x0):
+            assert float((xs.double() - x64).norm() / x64.norm()) < 1e-4
         assert torch.allclose(x, x0, rtol=1e-3, atol=1e-3)
 
     @pytest.mark.parametrize("n", [1, 7, 64, 65, 1000, 4097, 30011])
