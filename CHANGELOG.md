@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.1] — 2026-11-10
+
+Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
+
+Headline: from_dense on the neuron device returns correct indices and values above 2^24 elements (silent, #134)
+
 ### Fixed
 
 - **`from_dense` on the neuron device: wrong column indices and values for
