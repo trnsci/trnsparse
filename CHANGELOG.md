@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`from_dense` on the neuron device: wrong column indices and values for
+  matrices of more than 2^24 elements** (silent, #134, trnsci/trnsci#135).
+  The device `nonzero` / `torch.where` / `A[mask]` round the flat index
+  `row * n + col` through fp32 above 2^24: on Trn2 a (2100, 8100) matrix
+  with 4002 nonzeros came back with 19 wrong column indices. The indices now
+  come from a host `nonzero` of the mask, and the values are gathered on the
+  device in row blocks whose flat indices stay below 2^23 (a device
+  `index_select` at indices above 2^24 is rounded as well).
+  `BSRMatrix.from_dense` takes its block indices from the host mask too.
+
 ## [0.16.0] — 2026-11-10
 
 Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
