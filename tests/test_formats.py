@@ -137,3 +137,97 @@ class TestFromScipy:
         A = trnsparse.from_scipy(M)
         assert A.dtype == torch.float64
         np.testing.assert_array_equal(A.to_dense().numpy(), M.toarray())
+
+
+# from_dense on the device (trnsci/trnsci#135): TorchNeuron's nonzero /
+# torch.where / A[mask] round flat indices above 2^24 through fp32, so a
+# device dense matrix with more than 2^24 elements got wrong column indices
+# (and the values at those wrong positions). The device path takes the
+# indices from a host nonzero instead.
+_BIG_SHAPE = (2100, 8100)  # 17.0M elements > 2^24
+
+
+def _big_sparse_dense(seed=2, nnz=4000):
+    g = torch.Generator().manual_seed(seed)
+    m, n = _BIG_SHAPE
+    D = torch.zeros(m, n)
+    r = torch.randint(0, m, (nnz,), generator=g)
+    c = torch.randint(0, n, (nnz,), generator=g)
+    D[r, c] = torch.randn(nnz, generator=g)
+    D[m - 1, n - 3 :] = torch.tensor([1.5, 2.5, 3.5])  # flat indices above 2^24
+    return D
+
+
+def _assert_same_csr(got, ref):
+    assert got.shape == ref.shape
+    assert torch.equal(got.col_indices.cpu(), ref.col_indices)
+    assert torch.equal(got.row_ptrs.cpu(), ref.row_ptrs)
+    assert torch.equal(got.values.cpu(), ref.values)
+
+
+class TestFromDenseHostIndex:
+    def test_host_index_path_matches_where(self):
+        from trnsparse.formats import _dense_nonzeros
+
+        D = _big_sparse_dense()
+        mask = D != 0
+        r0, c0, v0 = _dense_nonzeros(D, mask, host_index=False)
+        r1, c1, v1 = _dense_nonzeros(D, mask, host_index=True)
+        assert torch.equal(r0, r1) and torch.equal(c0, c1) and torch.equal(v0, v1)
+        assert int(c1[-1]) == _BIG_SHAPE[1] - 1 and float(v1[-1]) == 3.5
+
+    @pytest.mark.parametrize("span", [1, 4, 6, 1 << 23])
+    def test_host_index_path_row_blocks(self, monkeypatch, span):
+        from trnsparse import formats
+        from trnsparse.formats import _dense_nonzeros
+
+        monkeypatch.setattr(formats, "_GATHER_SPAN", span)  # span 1: every row on the host
+        g = torch.Generator().manual_seed(3)
+        A = torch.randn(7, 5, generator=g).masked_fill(torch.rand(7, 5, generator=g) < 0.5, 0.0)
+        A[3] = 0.0  # an empty row block
+        A.requires_grad_(span == 1 << 23)
+        mask = A != 0
+        r1, c1, v1 = _dense_nonzeros(A, mask, host_index=True)
+        r0, c0 = torch.where(mask)
+        assert torch.equal(r0, r1) and torch.equal(c0, c1) and torch.equal(v1, A[mask])
+        if A.requires_grad:
+            v1.sum().backward()
+            assert torch.equal(A.grad, mask.to(A.dtype))
+
+    def test_host_index_path_threshold_and_dtype(self):
+        from trnsparse.formats import _dense_nonzeros
+
+        A = torch.tensor([[0.5, -2.0, 0.0], [3.0, 0.1, -0.2]], dtype=torch.float64)
+        mask = A.abs() > 0.3
+        r, c, v = _dense_nonzeros(A, mask, host_index=True)
+        assert r.tolist() == [0, 0, 1] and c.tolist() == [0, 1, 0]
+        assert v.dtype == torch.float64 and v.tolist() == [0.5, -2.0, 3.0]
+
+
+def _neuron_device():
+    try:
+        import torch_neuronx  # noqa: F401
+    except ImportError:
+        pytest.skip("requires torch-neuronx")
+    return "neuron"
+
+
+@pytest.mark.neuron
+def test_from_dense_on_device_above_2_24_elements():
+    dev = _neuron_device()
+    D = _big_sparse_dense()
+    _assert_same_csr(trnsparse.from_dense(D.to(dev)), trnsparse.from_dense(D))
+
+
+@pytest.mark.neuron
+def test_bsr_from_dense_on_device():
+    dev = _neuron_device()
+    g = torch.Generator().manual_seed(7)
+    D = torch.zeros(1024, 1024)
+    D[:128, 896:] = torch.randn(128, 128, generator=g)
+    D[512:640, 128:256] = torch.randn(128, 128, generator=g)
+    ref = trnsparse.BSRMatrix.from_dense(D, block_size=128)
+    got = trnsparse.BSRMatrix.from_dense(D.to(dev), block_size=128)
+    assert torch.equal(got.block_col_indices.cpu(), ref.block_col_indices)
+    assert torch.equal(got.block_row_ptrs.cpu(), ref.block_row_ptrs)
+    assert torch.equal(got.blocks.cpu(), ref.blocks)
