@@ -183,7 +183,7 @@ DEVICE_KNOWN = {
         "complex aten.mv is unsupported on the neuron device",
     ),
     "fp64-at-fp32": (
-        "trnsci/trnsparse#84",
+        "trnsci/trnsparse#137",
         "device float64 computes at fp32 precision (fp64 policy, explicit nki)",
     ),
     "harness-dense-inverse": (
