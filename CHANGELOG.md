@@ -24,6 +24,20 @@ Headline: from_dense on the neuron device returns correct indices and values abo
   device in row blocks whose flat indices stay below 2^23 (a device
   `index_select` at indices above 2^24 is rounded as well).
   `BSRMatrix.from_dense` takes its block indices from the host mask too.
+### Added
+
+- Tests: device conformance runs are signal-only (trnsci/trnsci#35). Under
+  `--backend nki --conformance-device neuron`, the four known device
+  categories are marked `xfail(strict=False)` at run time by rule, each with
+  its tracking issue: complex `aten.mv` unsupported on device (#130, 64
+  cases), device float64 at fp32 precision (#84, 12), `test_cg_bsr`
+  `dense_inverse` host `M` with a device `b` (#131, 8, test-side) and the fp16
+  `screened_spmm` mask ulp flip (#132, 1, test-side). CPU runs are unmarked.
+  A case that starts passing shows as XPASS. A device run prints passed,
+  xfailed / XPASS by category and NEW failures; `--conformance-json PATH`
+  writes the summary, and `scripts/conformance_expect.py` merges chunked
+  runs (exit 1 on NEW failures). `tests/test_device_known.py` checks the rules
+  on CPU.
 
 ## [0.16.0] — 2026-11-10
 
