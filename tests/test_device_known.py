@@ -67,7 +67,7 @@ def test_summary_groups_by_category():
     s = _expect_summary(
         {
             "passed": [rep("a"), rep("b")],
-            "xfailed": [rep("c", "[device-known:fp64-at-fp32] #84: y"), rep("d", "plain")],
+            "xfailed": [rep("c", "[device-known:fp64-at-fp32] #137: y"), rep("d", "plain")],
             "xpassed": [rep("e", "[device-known:complex-mv] #130: x")],
             "failed": [rep("f")],
         }

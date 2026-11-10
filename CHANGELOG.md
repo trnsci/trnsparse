@@ -30,7 +30,7 @@ Headline: from_dense on the neuron device returns correct indices and values abo
   `--backend nki --conformance-device neuron`, the four known device
   categories are marked `xfail(strict=False)` at run time by rule, each with
   its tracking issue: complex `aten.mv` unsupported on device (#130, 64
-  cases), device float64 at fp32 precision (#84, 12), `test_cg_bsr`
+  cases), device float64 at fp32 precision (#137, 12), `test_cg_bsr`
   `dense_inverse` host `M` with a device `b` (#131, 8, test-side) and the fp16
   `screened_spmm` mask ulp flip (#132, 1, test-side). CPU runs are unmarked.
   A case that starts passing shows as XPASS. A device run prints passed,
