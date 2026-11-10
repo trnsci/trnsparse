@@ -228,8 +228,13 @@ class BSRMatrix:
         block_row_ptrs = torch.zeros(mb + 1, dtype=torch.long)
         block_row_ptrs[1:] = nonzero_mask.sum(dim=1).cumsum(dim=0)
 
-        block_col_indices = nonzero_mask.nonzero(as_tuple=False)[:, 1].to(torch.long)
-        kept_blocks = block_grid[nonzero_mask]  # (n_blocks, block_size, block_size)
+        # Host nonzero: on the device, nonzero rounds flat indices above 2^24
+        # through fp32 (see `_dense_nonzeros`); the block mask is small.
+        mask_h = nonzero_mask.cpu()
+        block_col_indices = mask_h.nonzero(as_tuple=False)[:, 1].contiguous()
+        block_col_indices = block_col_indices.to(nonzero_mask.device)
+        kept = mask_h.reshape(-1).nonzero(as_tuple=False)[:, 0].to(block_grid.device)
+        kept_blocks = block_grid.reshape(-1, block_size, block_size).index_select(0, kept)
 
         return cls(
             blocks=kept_blocks.contiguous(),
@@ -306,12 +311,57 @@ def _csr_to_dense_host(A: CSRMatrix) -> torch.Tensor:
 # --- Construction helpers ---
 
 
+# Value gathers in `_dense_nonzeros` use blocks of rows whose flat indices
+# stay below 2^23: the device's int64 index_select is rounded through fp32
+# above 2^24 as well (an out-of-bounds gather on a 17M-element matrix, Trn2).
+_GATHER_SPAN = 1 << 23
+
+
+def _dense_nonzeros(
+    A: torch.Tensor, mask: torch.Tensor, host_index: bool
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """(rows, cols, values) of the True entries of the 2-D `mask`, row-major.
+
+    On the TorchNeuron ``neuron`` device, ``nonzero`` / ``torch.where`` /
+    ``argwhere`` / ``masked_select`` / boolean-mask indexing of a tensor with
+    more than 2^24 elements round the flat index ``row * n + col`` through
+    fp32: the column of an entry whose flat index is above 2^24 comes back as
+    ``fp32(row * n + col) - row * n``, and ``A[mask]`` returns the values at
+    those positions, silently (Trn2, SDK 2.33, trnsci/trnsci#135; the same
+    fp32 rounding of integers as aws-neuron/aws-neuron-sdk#1466).
+
+    `host_index` (any device other than the CPU) therefore takes the indices
+    from a host ``nonzero`` of the mask (one byte per element) and gathers the
+    values on A's device in blocks of rows, each with flat indices below 2^23.
+    """
+    if not host_index:
+        rows, cols = torch.where(mask)
+        return rows, cols, A[mask]
+    rows_h, cols_h = torch.where(mask.cpu())
+    m, n = A.shape
+    step = max(1, _GATHER_SPAN // max(n, 1))
+    starts = list(range(0, m, step))
+    bounds = torch.searchsorted(rows_h, torch.tensor([*starts, m])).tolist()
+    parts = []
+    for b, r0 in enumerate(starts):
+        lo, hi = bounds[b], bounds[b + 1]
+        if lo == hi:
+            continue
+        local = ((rows_h[lo:hi] - r0) * n + cols_h[lo:hi]).contiguous()
+        block = A[r0 : r0 + step].reshape(-1)
+        if block.numel() > 2 * _GATHER_SPAN:  # a single row above 2^24: gather on the host
+            parts.append(block.detach().cpu().index_select(0, local).to(A.device))
+        else:
+            parts.append(block.index_select(0, local.to(A.device)))
+    vals = torch.cat(parts) if parts else A.new_zeros(0)
+    return rows_h.contiguous().to(A.device), cols_h.contiguous().to(A.device), vals
+
+
 def from_dense(A: torch.Tensor, threshold: float = 0.0) -> CSRMatrix:
     """Convert dense matrix to CSR, dropping values with |v| <= threshold."""
     m, n = A.shape
     mask = torch.abs(A) > threshold
-    rows, cols = torch.where(mask)
-    vals = A[mask]
+    rows, cols, vals = _dense_nonzeros(A, mask, host_index=A.device.type != "cpu")
 
     # Build CSR
     coo = COOMatrix(values=vals, row_indices=rows, col_indices=cols, shape=(m, n))
