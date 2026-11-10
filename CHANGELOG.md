@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0] — 2026-11-10
+
+Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
+
+Headline: `cg_bsr(..., reduction=)` for LNC-invariant inner products and norms (opt-in, trnsci/trnsolver#128), and two silent fixes: `kernel_matmul` with a complex V dropped its imaginary part (#120), and the fused BSR CG / power kernels misread A at 65,536 fp32 blocks or more (#121, aws-neuron-sdk#1457).
+
 ### Added
 
 - **`cg_bsr(..., reduction=None)`: LNC-invariant inner products and norms
