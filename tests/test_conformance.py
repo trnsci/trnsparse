@@ -168,6 +168,79 @@ def value_or_raise(fn, ref, dtype, tol=None):
     assert_close(got, ref, dtype, tol=tol)
 
 
+# ---------------------------------------------------------------- device-known categories
+# A device conformance run (`--backend nki --conformance-device neuron`) has
+# known failures from platform limits and from two test-side issues. Each
+# category has one tracking issue. On device runs only, matching cases are
+# marked `xfail(strict=False)` at run time (the trnsolver#146 pattern), so a
+# NEW failure is the only red and a category that starts passing shows as
+# XPASS, a signal rather than a failure. CPU CI runs every case unmarked.
+# conftest.py prints the per-category summary (trnsci/trnsci#35).
+
+DEVICE_KNOWN = {
+    "complex-mv": (
+        "trnsci/trnsparse#130",
+        "complex aten.mv is unsupported on the neuron device",
+    ),
+    "fp64-at-fp32": (
+        "trnsci/trnsparse#84",
+        "device float64 computes at fp32 precision (fp64 policy, explicit nki)",
+    ),
+    "harness-dense-inverse": (
+        "trnsci/trnsparse#131",
+        "test passes a host M with a device b (test-side)",
+    ),
+    "screened-fp16-mask": (
+        "trnsci/trnsparse#132",
+        "device fp16 sqrt differs by an ulp and flips threshold-mask entries (test-side)",
+    ),
+}
+
+_SPMV_TESTS = {
+    "test_spmv",
+    "test_spmv_alpha_beta",
+    "test_spmv_symmetric",
+    "test_coo_duplicates_sum",
+}
+_FP64_TESTS = {"test_cg_bsr_breakdown_iteration_count", "test_chebyshev_bsr_fixed_k_residual"}
+
+
+def _device_known_category(node) -> str | None:
+    """The DEVICE_KNOWN category of a test item on a device run, or None."""
+    name = getattr(node, "originalname", None) or node.name.split("[")[0]
+    cs = getattr(node, "callspec", None)
+    p = cs.params if cs is not None else {}
+    dtype = p.get("dtype")
+    if name in _SPMV_TESTS and dtype is not None and dtype.is_complex:
+        shape = p.get("shape")
+        if shape is None or min(shape) > 0:  # empty operands never reach aten.mv
+            return "complex-mv"
+    if name == "test_cg_bsr":
+        if p.get("precond") == "dense_inverse":
+            return "harness-dense-inverse"
+        if dtype == torch.float64:
+            return "fp64-at-fp32"
+    if name == "test_power_iteration" and dtype == torch.float64:
+        return "fp64-at-fp32"
+    if name in _FP64_TESTS:
+        return "fp64-at-fp32"
+    if name == "test_screened_spmm_lowp" and dtype == torch.float16:
+        return "screened-fp16-mask"
+    return None
+
+
+@pytest.fixture(autouse=True)
+def _device_known_xfail(request, _conformance_backend):
+    if not (explicit_nki() and on_device()):
+        return
+    cat = _device_known_category(request.node)
+    if cat is not None:
+        issue, what = DEVICE_KNOWN[cat]
+        request.applymarker(
+            pytest.mark.xfail(strict=False, reason=f"[device-known:{cat}] {issue}: {what}")
+        )
+
+
 # ---------------------------------------------------------------- builders
 
 
