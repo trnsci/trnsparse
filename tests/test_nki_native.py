@@ -1,0 +1,577 @@
+"""
+Native TorchNeuron dispatch on hardware (Trn2/Trn3, torch-neuronx 2.14+).
+
+Skipped unless the dispatch path resolves to "native": these do not run on
+the XLA lineage (Trn1) or off-hardware. The existing hardware suites
+(test_nki_spmm, test_nki_bsr, test_nki_attn, ...) also exercise the native
+path automatically on a TorchNeuron host, with host-resident operands; this
+file covers what is specific to it: custom-op registration, no torch_xla,
+host CSR structure against `device="neuron"` dense operands (the neuron
+device has no sparse CSR, aws-neuron-sdk#1442), register_autograd
+backwards, and torch.compile.
+
+    NKI_ENABLE_TRACE_CACHE=0 TRNSPARSE_REQUIRE_NKI=1 pytest tests/test_nki_native.py -v -m neuron
+"""
+
+import subprocess
+import sys
+
+import pytest
+import torch
+
+import trnsparse
+from trnsparse.nki import HAS_NKI
+from trnsparse.nki.dispatch import _get_dispatch_path, _get_native_ops, _use_simulator
+
+
+def _native() -> bool:
+    try:
+        return HAS_NKI and not _use_simulator() and _get_dispatch_path() == "native"
+    except Exception:
+        return False
+
+
+pytestmark = [
+    pytest.mark.neuron,
+    pytest.mark.skipif(not _native(), reason="requires TorchNeuron (native) dispatch path"),
+]
+
+DEV = "neuron"
+P = 128
+ATOL, RTOL = 1e-3, 1e-4
+
+
+@pytest.fixture(autouse=True)
+def nki_backend():
+    prev = trnsparse.get_backend()
+    trnsparse.set_backend("nki")
+    yield
+    trnsparse.set_backend(prev)
+
+
+def _random_csr(M, K, density, seed=0):
+    g = torch.Generator().manual_seed(seed)
+    dense = torch.randn(M, K, generator=g) * (torch.rand(M, K, generator=g) < density)
+    return dense, trnsparse.from_dense(dense)  # host CSR
+
+
+def _block_causal_mask(seq_len):
+    nb = seq_len // P
+    pattern = torch.zeros(seq_len, seq_len)
+    for i in range(nb):
+        for j in range(i + 1):
+            pattern[i * P : (i + 1) * P, j * P : (j + 1) * P] = 1.0
+    return trnsparse.BSRMatrix.from_dense(pattern, block_size=P)
+
+
+class TestNativeRegistration:
+    def test_native_path_never_imports_torch_xla(self):
+        # In-process on purpose: a subprocess that launches a kernel needs its
+        # own Neuron runtime, and nrt_init fails (NRT_FAILURE) while this
+        # pytest process holds the only visible NeuronCore. Fresh-interpreter
+        # import isolation (no _native / torch_neuronx / torch_xla on import)
+        # is covered on CPU by test_native_dispatch.py::TestLazyRegistration.
+        if "torch_xla" in sys.modules:
+            pytest.skip("torch_xla was already imported in this process by something else")
+        A = trnsparse.from_dense(torch.eye(128))
+        C = trnsparse.spmm(A, torch.ones(128, 4, device=DEV))
+        assert C.device.type == DEV
+        assert _get_dispatch_path() == "native"
+        assert "torch_xla" not in sys.modules
+
+    def test_ops_registered_in_torch_ops(self):
+        _get_native_ops()
+        for name in (
+            "spmm_dense",
+            "bsr_spmm",
+            "screened_spmm",
+            "attn_stats",
+            "attn_out",
+            "attn_bwd_dq",
+            "attn_bwd_dkdv",
+            "bsr_attn",
+            "bsr_attn_bwd",
+        ):
+            assert hasattr(torch.ops.trnsparse, name), name
+
+
+class TestHostStructureDeviceOperands:
+    @pytest.mark.parametrize("M,K,N", [(256, 256, 128), (200, 137, 64), (4097, 300, 8)])
+    def test_spmm_host_csr_device_b(self, M, K, N):
+        dense, A = _random_csr(M, K, 0.05, seed=M)
+        B = torch.randn(K, N)
+        C = trnsparse.spmm(A, B.to(DEV))
+        assert C.device.type == DEV
+        torch.testing.assert_close(C.cpu(), dense @ B, atol=ATOL, rtol=RTOL)
+
+    def test_spmm_grad_host_values_device_b(self):
+        dense, A = _random_csr(256, 192, 0.05, seed=1)
+        A.values.requires_grad_(True)
+        B = torch.randn(192, 64).to(DEV).requires_grad_(True)
+        trnsparse.spmm(A, B).sum().backward()
+        assert B.grad.device.type == DEV
+        dense_ref = dense.clone().requires_grad_(True)
+        B_ref = B.detach().cpu().requires_grad_(True)
+        (dense_ref @ B_ref).sum().backward()
+        torch.testing.assert_close(B.grad.cpu(), B_ref.grad, atol=ATOL, rtol=RTOL)
+        rows = torch.repeat_interleave(torch.arange(256), A.row_ptrs[1:] - A.row_ptrs[:-1])
+        torch.testing.assert_close(
+            A.values.grad, dense_ref.grad[rows, A.col_indices], atol=ATOL, rtol=RTOL
+        )
+
+    def test_spmv_host_csr_device_x(self):
+        dense, A = _random_csr(300, 300, 0.05, seed=2)
+        x = torch.randn(300)
+        y = trnsparse.spmv(A, x.to(DEV))
+        assert y.device.type == DEV
+        torch.testing.assert_close(y.cpu(), dense @ x, atol=ATOL, rtol=RTOL)
+
+    def test_bsr_spmm_device_blocks_host_structure_and_grad(self):
+        g = torch.Generator().manual_seed(3)
+        dense = torch.randn(256, 384, generator=g)
+        dense[128:, :256] = 0
+        A = trnsparse.BSRMatrix.from_dense(dense, block_size=P)
+        A.blocks = A.blocks.to(DEV).requires_grad_(True)  # dense blocks on device
+        B = torch.randn(384, 32, generator=g)
+        B_d = B.to(DEV).requires_grad_(True)
+        C = trnsparse.bsr_spmm(A, B_d)
+        assert C.device.type == DEV
+        torch.testing.assert_close(C.detach().cpu(), dense @ B, atol=ATOL, rtol=RTOL)
+        C.sum().backward()
+        torch.testing.assert_close(
+            B_d.grad.cpu(), dense.T @ torch.ones(256, 32), atol=ATOL, rtol=RTOL
+        )
+        assert A.blocks.grad is not None and A.blocks.grad.device.type == DEV
+
+    def test_screened_spmm_device_operands_and_grad(self):
+        g = torch.Generator().manual_seed(4)
+        Am = torch.randn(200, 200, generator=g)
+        diag = torch.rand(200, generator=g)
+        B = torch.randn(200, 48, generator=g)
+        A_d = Am.to(DEV).requires_grad_(True)
+        C = trnsparse.screened_spmm(A_d, diag.to(DEV), B.to(DEV), threshold=0.2)
+        Q = diag.sqrt()
+        mask = ((Q[:, None] * Q[None, :]) > 0.2**0.5).float()
+        torch.testing.assert_close(C.detach().cpu(), (Am * mask) @ B, atol=ATOL, rtol=RTOL)
+        C.sum().backward()
+        torch.testing.assert_close(
+            A_d.grad.cpu(), (torch.ones(200, 48) @ B.T) * mask, atol=ATOL, rtol=RTOL
+        )
+
+    def test_attention_device_qkv_forward_and_backward(self):
+        from trnsparse.ops import _block_sparse_attn_backward, _block_sparse_attn_pytorch
+
+        torch.manual_seed(5)
+        seq_len, hd = 3 * P, 64
+        mask = _block_causal_mask(seq_len)
+        Q, K, V = (torch.randn(seq_len, hd) for _ in range(3))
+        Qd, Kd, Vd = (t.to(DEV).requires_grad_(True) for t in (Q, K, V))
+        out = trnsparse.block_sparse_attention_tiled(Qd, Kd, Vd, mask)
+        assert out.device.type == DEV
+        scale = hd**-0.5
+        ref, rm, rd = _block_sparse_attn_pytorch(Q, K, V, mask, scale, return_stats=True)
+        torch.testing.assert_close(out.detach().cpu(), ref, atol=ATOL, rtol=RTOL)
+
+        dO = torch.randn(seq_len, hd)
+        out.backward(dO.to(DEV))
+        dQ, dK, dV = _block_sparse_attn_backward(
+            Q, K, V, ref, dO, mask, scale, row_max=rm, row_denom=rd
+        )
+        for got, exp in ((Qd.grad, dQ), (Kd.grad, dK), (Vd.grad, dV)):
+            torch.testing.assert_close(got.cpu(), exp, atol=1e-2, rtol=1e-3)
+
+    def test_cg_bsr_device_rhs(self):
+        n = 256
+        g = torch.Generator().manual_seed(6)
+        M = torch.randn(n, n, generator=g)
+        S = M @ M.T / n + torch.eye(n) * 4.0
+        A = trnsparse.BSRMatrix.from_dense(S, block_size=P)
+        b = torch.randn(n, generator=g)
+        x, iters, _ = trnsparse.cg_bsr(A, b.to(DEV), tol=1e-5, max_iter=200)
+        assert x.device.type == DEV
+        torch.testing.assert_close(x.cpu(), torch.linalg.solve(S, b), atol=1e-3, rtol=1e-3)
+
+
+class TestTorchCompile:
+    def test_spmm_dense_op_fullgraph(self):
+        spmm_dense = _get_native_ops()["spmm_dense"]
+        a, b = torch.randn(256, 256), torch.randn(256, 128)
+
+        @torch.compile(backend="neuron", fullgraph=True)
+        def f(a, b):
+            return spmm_dense(a, b) * 2.0
+
+        out = f(a.to(DEV), b.to(DEV)).cpu()
+        torch.testing.assert_close(out, (a @ b) * 2.0, atol=ATOL, rtol=RTOL)
+
+    def test_spmm_host_csr_structure_fullgraph(self):
+        # The B6 compile-coverage rows failed because their CSR inputs were
+        # device tensors. Here the CSR (structure and values) stays on the
+        # host and only B is a neuron tensor; densify, pad, kernel op and
+        # slice are all in one graph.
+        dense, A = _random_csr(256, 256, 0.05, seed=7)
+        B = torch.randn(256, 64)
+
+        @torch.compile(backend="neuron", fullgraph=True, dynamic=False)
+        def f(B):
+            return trnsparse.spmm(A, B)
+
+        out = f(B.to(DEV))
+        assert out.device.type == DEV
+        torch.testing.assert_close(out.cpu(), dense @ B, atol=ATOL, rtol=RTOL)
+
+    def test_spmm_host_csr_structure_passed_as_inputs(self):
+        # Same as B6's spmm(CSR, B) row, with the CSR component tensors
+        # (on the host) as graph inputs and B on the device.
+        dense, A = _random_csr(256, 256, 0.05, seed=8)
+        B = torch.randn(256, 64)
+
+        @torch.compile(backend="neuron", fullgraph=True, dynamic=False)
+        def f(v, ci, rp, B):
+            return trnsparse.spmm(
+                trnsparse.CSRMatrix(values=v, col_indices=ci, row_ptrs=rp, shape=(256, 256)), B
+            )
+
+        out = f(A.values, A.col_indices, A.row_ptrs, B.to(DEV))
+        torch.testing.assert_close(out.cpu(), dense @ B, atol=ATOL, rtol=RTOL)
+
+
+def _rel(x, ref):
+    x, ref = x.detach().cpu().double(), ref.detach().cpu().double()
+    return float((x - ref).norm() / ref.norm())
+
+
+def _skewed_bsr(n_rows, n_cols, seed):
+    """Block row 0 dense (a global-token row), the rest one or two blocks; a middle row empty."""
+    g = torch.Generator().manual_seed(seed)
+    bm = torch.zeros(n_rows, n_cols, dtype=torch.bool)
+    bm[0, :] = True
+    for i in range(1, n_rows):
+        bm[i, i % n_cols] = True
+        bm[i, (3 * i + 1) % n_cols] = True
+    if n_rows > 2:
+        bm[n_rows // 2, :] = False
+    dense = torch.randn(n_rows * P, n_cols * P, generator=g)
+    dense *= bm.repeat_interleave(P, 0).repeat_interleave(P, 1)
+    return dense, trnsparse.BSRMatrix.from_dense(dense, block_size=P)
+
+
+class TestEagerHandle:
+    """Eager calls take the cached handle; results match the custom op bit for bit."""
+
+    @pytest.fixture
+    def D(self, monkeypatch):
+        from trnsparse.nki import dispatch
+
+        monkeypatch.setattr(dispatch, "_eager_handles", {})
+        return dispatch
+
+    @staticmethod
+    def _on_off(D, monkeypatch, fn):
+        """fn() with the handle off (custom op), then on; outputs on the host."""
+
+        def host(out):
+            if isinstance(out, tuple | list):
+                return tuple(host(o) for o in out)
+            return out.detach().cpu() if isinstance(out, torch.Tensor) else out
+
+        monkeypatch.setattr(D, "_EAGER_HANDLE_ENABLED", False)
+        ref = host(fn())
+        assert D._eager_handles == {}
+        monkeypatch.setattr(D, "_EAGER_HANDLE_ENABLED", True)
+        return host(fn()), ref
+
+    @staticmethod
+    def _equal(a, b):
+        if isinstance(a, tuple):
+            return len(a) == len(b) and all(
+                TestEagerHandle._equal(x, y) for x, y in zip(a, b, strict=True)
+            )
+        return torch.equal(a, b) if isinstance(a, torch.Tensor) else a == b
+
+    def test_spmm_dense_handle_matches_op_and_is_cached(self, D, monkeypatch):
+        from trnsparse.nki import kernels
+
+        monkeypatch.setattr(D, "_EAGER_HANDLE_ENABLED", True)
+
+        g = torch.Generator().manual_seed(0)
+        a, b = (t.to(DEV) for t in (torch.randn(256, 256, generator=g), torch.randn(256, 128)))
+        op = _get_native_ops()["spmm_dense"](a, b).cpu()
+        for _ in range(3):
+            out = D._native_call("spmm_dense", [a, b])
+            assert out.device.type == DEV
+            assert torch.equal(out.cpu(), op)
+        assert list(D._eager_handles) == [(id(kernels._spmm_dense_kernel), ())]
+
+    def test_keyed_bsr_spmm_int_key(self, D, monkeypatch):
+        from trnsparse.nki import kernels
+
+        dense, A = _skewed_bsr(6, 4, seed=3)
+        A.blocks = A.blocks.to(DEV)
+        B = torch.randn(4 * P, 256, generator=torch.Generator().manual_seed(1)).to(DEV)
+        out, ref = self._on_off(D, monkeypatch, lambda: trnsparse.bsr_spmm(A, B))
+        assert torch.equal(out, ref)
+        assert {k for k, _ in D._eager_handles} & {
+            id(kernels._bsr_spmm_keyed_kernel),
+            id(kernels._bsr_spmm_static_kernel),
+        }
+        torch.testing.assert_close(out, dense @ B.cpu(), atol=ATOL, rtol=RTOL)
+
+    def _attention(self):
+        torch.manual_seed(5)
+        seq_len, hd = 3 * P, 64
+        return _block_causal_mask(seq_len), [torch.randn(seq_len, hd) for _ in range(4)]
+
+    def test_attention_forward(self, D, monkeypatch):
+        """No grad: the kernel launches inside the composite `bsr_attn` op
+        (which keeps the custom op itself) take the handle, `int(key)` applied."""
+        mask, (Q, K, V, _) = self._attention()
+        Qd, Kd, Vd = (t.to(DEV) for t in (Q, K, V))
+        fwd = lambda: trnsparse.block_sparse_attention_tiled(Qd, Kd, Vd, mask)  # noqa: E731
+        out, ref = self._on_off(D, monkeypatch, fwd)
+        assert torch.equal(out, ref)
+        assert D._eager_handles, "no attention kernel went through the handle"
+
+    def test_attention_backward_unchanged(self, D, monkeypatch):
+        """With grad, the launches see grad-requiring inputs and keep the op;
+        the results are the same bits either way."""
+        mask, (Q, K, V, dO) = self._attention()
+
+        def run():
+            Qd, Kd, Vd = (t.to(DEV).requires_grad_(True) for t in (Q, K, V))
+            out = trnsparse.block_sparse_attention_tiled(Qd, Kd, Vd, mask)
+            out.backward(dO.to(DEV))
+            return out, Qd.grad, Kd.grad, Vd.grad
+
+        out, ref = self._on_off(D, monkeypatch, run)
+        assert self._equal(out, ref)
+
+    def test_fused_cg_int_settings(self, D, monkeypatch):
+        n = 256
+        g = torch.Generator().manual_seed(6)
+        M = torch.randn(n, n, generator=g)
+        S = M @ M.T / n + torch.eye(n) * 4.0
+        A = trnsparse.BSRMatrix.from_dense(S, block_size=P)
+        b = torch.randn(n, generator=g).to(DEV)
+        out, ref = self._on_off(
+            D, monkeypatch, lambda: trnsparse.cg_bsr_fused(A, b, tol=1e-5, max_iter=200)
+        )
+        assert self._equal(out, ref)
+        from trnsparse.nki import kernels
+
+        assert (id(kernels._cg_bsr_keyed_kernel), ()) in D._eager_handles
+        torch.testing.assert_close(out[0], torch.linalg.solve(S, b.cpu()), atol=1e-3, rtol=1e-3)
+
+    def test_flag_off_uses_op(self, D, monkeypatch):
+        monkeypatch.setattr(D, "_EAGER_HANDLE_ENABLED", False)
+        a, b = torch.randn(256, 256), torch.randn(256, 128)
+        out = D._native_call("spmm_dense", [a.to(DEV), b.to(DEV)]).cpu()
+        assert D._eager_handles == {}
+        torch.testing.assert_close(out, a @ b, atol=ATOL, rtol=RTOL)
+
+    def test_native_call_inside_compile_uses_op(self, D):
+        @torch.compile(backend="neuron", fullgraph=True)
+        def f(a, b):
+            return D._native_call("spmm_dense", [a, b]) * 2.0
+
+        a, b = torch.randn(256, 256), torch.randn(256, 128)
+        out = f(a.to(DEV), b.to(DEV)).cpu()
+        assert D._eager_handles == {}
+        torch.testing.assert_close(out, (a @ b) * 2.0, atol=2 * ATOL, rtol=RTOL)
+
+
+class TestTwoCoreAndBf16:
+    """Static kernels split across both physical cores (LNC=2), fp32 and bf16 (#30).
+
+    A core that skipped its share would leave whole output tiles unwritten,
+    so the fp32 cases use tight tolerances over every row and column tile.
+    """
+
+    @pytest.mark.parametrize(
+        "n_rows,n_cols,N",
+        [(6, 6, 128), (6, 4, 1024), (1, 3, 512), (1, 2, 128), (9, 5, 200)],
+    )
+    def test_bsr_static_fp32_every_tile(self, n_rows, n_cols, N):
+        dense, A = _skewed_bsr(n_rows, n_cols, seed=n_rows * 10 + N)
+        B = torch.randn(n_cols * P, N, generator=torch.Generator().manual_seed(1))
+        A.blocks = A.blocks.to(DEV)
+        C = trnsparse.bsr_spmm(A, B.to(DEV))
+        assert C.dtype == torch.float32
+        torch.testing.assert_close(C.cpu(), dense @ B, atol=ATOL, rtol=RTOL)
+
+    @pytest.mark.parametrize("n_rows,n_cols,N", [(6, 6, 128), (6, 4, 1024), (1, 3, 512)])
+    def test_bsr_static_bf16(self, n_rows, n_cols, N):
+        dense, A = _skewed_bsr(n_rows, n_cols, seed=n_rows * 10 + N)
+        B = torch.randn(n_cols * P, N, generator=torch.Generator().manual_seed(1))
+        A.blocks = A.blocks.to(DEV, torch.bfloat16)
+        Bh = B.to(DEV, torch.bfloat16)
+        C = trnsparse.bsr_spmm(A, Bh)
+        assert C.dtype == torch.bfloat16 and C.device.type == DEV
+        ref = dense.bfloat16().double() @ B.bfloat16().double()  # bf16 inputs, exact sum
+        assert _rel(C, ref) < 1e-2
+
+    def test_bsr_static_bf16_grad(self):
+        dense, A = _skewed_bsr(4, 4, seed=2)
+        B = torch.randn(4 * P, 64, generator=torch.Generator().manual_seed(2))
+        A.blocks = A.blocks.to(DEV, torch.bfloat16).requires_grad_(True)
+        Bd = B.to(DEV, torch.bfloat16).requires_grad_(True)
+        trnsparse.bsr_spmm(A, Bd).float().sum().backward()
+        ref = dense.bfloat16().double().T @ torch.ones(4 * P, 64, dtype=torch.float64)
+        assert Bd.grad.dtype == torch.bfloat16
+        assert _rel(Bd.grad, ref) < 1e-2
+
+    @pytest.mark.parametrize("dtype,tol", [(torch.float32, 1e-5), (torch.bfloat16, 3e-2)])
+    @pytest.mark.parametrize("hd", [64, 128])
+    def test_attention_static_two_core(self, dtype, tol, hd):
+        from trnsparse.ops import _block_sparse_attn_backward, _block_sparse_attn_pytorch
+
+        torch.manual_seed(7)
+        seq_len = 5 * P
+        # Global-token block row/column 0 plus a local band: skewed per-row cost.
+        nb = seq_len // P
+        bm = torch.zeros(nb, nb)
+        bm[0, :] = 1
+        bm[:, 0] = 1
+        for i in range(nb):
+            bm[i, max(0, i - 1) : i + 2] = 1
+        mask = trnsparse.BSRMatrix.from_dense(
+            bm.repeat_interleave(P, 0).repeat_interleave(P, 1), block_size=P
+        )
+        Q, K, V, dO = (torch.randn(seq_len, hd).to(dtype) for _ in range(4))
+        Qd, Kd, Vd = (t.to(DEV).requires_grad_(True) for t in (Q, K, V))
+        out = trnsparse.block_sparse_attention_tiled(Qd, Kd, Vd, mask)
+        assert out.dtype == dtype
+        q64, k64, v64, do64 = (t.double() for t in (Q, K, V, dO))
+        scale = hd**-0.5
+        ref, rm, rd = _block_sparse_attn_pytorch(q64, k64, v64, mask, scale, return_stats=True)
+        assert _rel(out, ref) < tol
+        out.backward(dO.to(DEV))
+        dQ, dK, dV = _block_sparse_attn_backward(
+            q64, k64, v64, ref, do64, mask, scale, row_max=rm, row_denom=rd
+        )
+        for got, exp in ((Qd.grad, dQ), (Kd.grad, dK), (Vd.grad, dV)):
+            assert got.dtype == dtype
+            assert _rel(got, exp) < tol
+
+    # fp32 gradients at scale 2.0 measure ~1.2e-5 against fp64 on Trn2.
+    @pytest.mark.parametrize("dtype,tol", [(torch.float32, 1e-5), (torch.bfloat16, 3e-2)])
+    @pytest.mark.parametrize("scale", [0.1, 1.0, 2.0])
+    def test_attention_custom_scale(self, scale, dtype, tol):
+        """trnsparse#47: a non-default scale reaches the forward and backward kernels.
+
+        Same shape for every scale in one process, so a trace cache keyed
+        without the scale would reuse the first trace and fail the later ones.
+        """
+        g = torch.Generator().manual_seed(16)
+        seq_len, hd = 3 * P, 64
+        mask = _block_causal_mask(seq_len)
+        Q, K, V, dO = (torch.randn(seq_len, hd, generator=g).to(dtype) for _ in range(4))
+        q64, k64, v64, do64 = (t.double().requires_grad_(True) for t in (Q, K, V, dO))
+        allowed = mask.to_dense().bool()
+        s = (q64 @ k64.T * scale).masked_fill(~allowed, float("-inf"))
+        ref = torch.softmax(s, dim=-1) @ v64
+        ref.backward(do64.detach())
+
+        Qd, Kd, Vd = (t.to(DEV).requires_grad_(True) for t in (Q, K, V))
+        out = trnsparse.block_sparse_attention_tiled(Qd, Kd, Vd, mask, scale=scale)
+        assert _rel(out, ref.detach()) < tol
+        out.backward(dO.to(DEV))
+        for got, exp in ((Qd.grad, q64.grad), (Kd.grad, k64.grad), (Vd.grad, v64.grad)):
+            assert _rel(got, exp) < 5 * tol
+        with torch.no_grad():
+            out2 = trnsparse.block_sparse_attention_tiled(
+                Q.to(DEV), K.to(DEV), V.to(DEV), mask, scale=scale
+            )
+        assert _rel(out2, ref.detach()) < tol
+
+    def test_attention_default_scale_unchanged(self):
+        """scale=None and scale=head_dim**-0.5 give bit-identical results."""
+        g = torch.Generator().manual_seed(17)
+        seq_len, hd = 3 * P, 64
+        mask = _block_causal_mask(seq_len)
+        Q, K, V = (torch.randn(seq_len, hd, generator=g).to(DEV) for _ in range(3))
+        a = trnsparse.block_sparse_attention_tiled(Q, K, V, mask)
+        b = trnsparse.block_sparse_attention_tiled(Q, K, V, mask, scale=hd**-0.5)
+        assert torch.equal(a.cpu(), b.cpu())
+
+    def test_attention_bf16_stats_are_fp32(self):
+        seq_len, hd = 2 * P, 64
+        mask = _block_causal_mask(seq_len)
+        Q, K, V = (torch.randn(seq_len, hd, dtype=torch.bfloat16).to(DEV) for _ in range(3))
+        out, rm, rd = torch.ops.trnsparse.bsr_attn(
+            Q, K, V, mask.block_col_indices, mask.block_row_ptrs, P
+        )
+        assert out.dtype == torch.bfloat16
+        assert rm.dtype == torch.float32 and rd.dtype == torch.float32
+
+
+class TestGatherAttentionDtypes:
+    """trnsparse#49: bf16 Q / K / V on the gather attention kernels.
+
+    The gather (non-static) kernels run for head_dim > 128, or with the
+    static structure off. bf16 used to raise in `_attn_out_kernel`
+    ("nc_matmul: ... stationary=float32, moving=bfloat16"). Checked against
+    fp64 dense attention of the rounded inputs, forward and dQ / dK / dV,
+    with `_REQUIRE_NKI` on so a kernel failure cannot fall back to PyTorch.
+    head_dim 192 is zero-padded to 256 (two K tiles); before, it raised.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _require_nki(self, monkeypatch):
+        from trnsparse.nki import dispatch
+
+        monkeypatch.setattr(dispatch, "_REQUIRE_NKI", True)
+
+    @staticmethod
+    def _check(hd, dtype, tol, scale=None, seq_len=3 * P, kv_dtype=None, seed=49):
+        g = torch.Generator().manual_seed(seed + hd)
+        mask = _block_causal_mask(seq_len)  # the #49 repro: seq 384, block-causal, block 128
+        Q, dO = (torch.randn(seq_len, hd, generator=g).to(dtype) for _ in range(2))
+        K, V = (torch.randn(seq_len, hd, generator=g).to(kv_dtype or dtype) for _ in range(2))
+        q64, k64, v64 = (t.double().requires_grad_(True) for t in (Q, K, V))
+        sc = hd**-0.5 if scale is None else scale
+        s = (q64 @ k64.T * sc).masked_fill(~mask.to_dense().bool(), float("-inf"))
+        ref = torch.softmax(s, dim=-1) @ v64
+        ref.backward(dO.double())
+
+        Qd, Kd, Vd = (t.to(DEV).requires_grad_(True) for t in (Q, K, V))
+        out = trnsparse.block_sparse_attention_tiled(Qd, Kd, Vd, mask, scale=scale)
+        assert out.dtype == dtype and out.shape == (seq_len, hd)
+        assert _rel(out, ref.detach()) < tol
+        out.backward(dO.to(DEV))
+        for got, exp in ((Qd.grad, q64.grad), (Kd.grad, k64.grad), (Vd.grad, v64.grad)):
+            assert got.shape == exp.shape
+            assert _rel(got, exp) < 5 * tol
+        return Qd, Kd, Vd
+
+    @pytest.mark.parametrize("hd", [192, 256])
+    @pytest.mark.parametrize("scale", [None, 0.5])
+    def test_bf16_forward_backward(self, hd, scale):
+        Qd, Kd, Vd = self._check(hd, torch.bfloat16, 3e-2, scale=scale)
+        assert Qd.grad.dtype == Kd.grad.dtype == Vd.grad.dtype == torch.bfloat16
+
+    @pytest.mark.parametrize("hd", [192, 256])
+    def test_fp32_forward_backward(self, hd):
+        self._check(hd, torch.float32, 1e-5)
+
+    def test_bf16_static_off(self, monkeypatch):
+        """head_dim 64 with the static structure off takes the gather kernels too."""
+        from trnsparse.nki import dispatch
+
+        monkeypatch.setattr(dispatch, "_STATIC_STRUCTURE", False)
+        self._check(64, torch.bfloat16, 3e-2)
+
+    def test_mixed_dtypes_run_fp32(self):
+        """bf16 Q with fp32 K / V: one fp32 operand dtype, output in Q's dtype."""
+        self._check(256, torch.bfloat16, 3e-2, kv_dtype=torch.float32)
+
+    @pytest.mark.parametrize("hd", [192, 256])
+    def test_bf16_stats_are_fp32(self, hd):
+        seq_len = 3 * P
+        mask = _block_causal_mask(seq_len)
+        Q, K, V = (torch.randn(seq_len, hd, dtype=torch.bfloat16).to(DEV) for _ in range(3))
+        out, rm, rd = torch.ops.trnsparse.bsr_attn(
+            Q, K, V, mask.block_col_indices, mask.block_row_ptrs, P
+        )
+        assert out.dtype == torch.bfloat16 and out.shape == (seq_len, hd)
+        assert rm.dtype == torch.float32 and rd.dtype == torch.float32

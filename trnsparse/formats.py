@@ -27,6 +27,13 @@ class CSRMatrix:
         col_indices: (nnz,) — column index for each value
         row_ptrs: (m+1,) — row_ptrs[i]:row_ptrs[i+1] span row i's entries
         shape: (m, n)
+
+    Placement on Trainium (native TorchNeuron, Trn2/Trn3): keep all three
+    tensors on the host. The `neuron` device has no sparse CSR tensors, so
+    `spmm` / `spmv` densify A on the host and move only dense data to the
+    device of the dense operand, which may be `neuron`. Results land on the
+    dense operand's device. Index tensors found on a device are copied to
+    the host on each call.
     """
 
     values: torch.Tensor
@@ -96,10 +103,15 @@ class COOMatrix:
         return self.nnz / (self.shape[0] * self.shape[1])
 
     def to_dense(self) -> torch.Tensor:
+        """Convert to dense tensor. Duplicate entries are summed, as in
+        `to_csr().to_dense()`, `torch.sparse_coo_tensor` and `scipy.sparse`."""
         m, n = self.shape
         dense = torch.zeros(m, n, dtype=self.dtype)
-        dense[self.row_indices, self.col_indices] = self.values
-        return dense
+        return dense.index_put(
+            (self.row_indices.to(torch.long), self.col_indices.to(torch.long)),
+            self.values,
+            accumulate=True,
+        )
 
     def to_csr(self) -> CSRMatrix:
         """Convert to CSR format."""
@@ -152,6 +164,13 @@ class BSRMatrix:
     and interop; on-device compute should go through BSR wherever the
     matrix has block structure (Fock matrices, FEM stiffness, GNN
     adjacencies, block-sparse attention masks).
+
+    Placement on Trainium (native TorchNeuron, Trn2/Trn3): keep
+    `block_col_indices` and `block_row_ptrs` on the host. `blocks` is dense
+    and may live on the host or on `neuron`; `bsr_spmm` moves it to the
+    dense operand's device, gathers the kernel tiles there and returns the
+    result on that device. Index tensors found on a device are copied to
+    the host on each call.
     """
 
     blocks: torch.Tensor
@@ -209,8 +228,13 @@ class BSRMatrix:
         block_row_ptrs = torch.zeros(mb + 1, dtype=torch.long)
         block_row_ptrs[1:] = nonzero_mask.sum(dim=1).cumsum(dim=0)
 
-        block_col_indices = nonzero_mask.nonzero(as_tuple=False)[:, 1].to(torch.long)
-        kept_blocks = block_grid[nonzero_mask]  # (n_blocks, block_size, block_size)
+        # Host nonzero: on the device, nonzero rounds flat indices above 2^24
+        # through fp32 (see `_dense_nonzeros`); the block mask is small.
+        mask_h = nonzero_mask.cpu()
+        block_col_indices = mask_h.nonzero(as_tuple=False)[:, 1].contiguous()
+        block_col_indices = block_col_indices.to(nonzero_mask.device)
+        kept = mask_h.reshape(-1).nonzero(as_tuple=False)[:, 0].to(block_grid.device)
+        kept_blocks = block_grid.reshape(-1, block_size, block_size).index_select(0, kept)
 
         return cls(
             blocks=kept_blocks.contiguous(),
@@ -263,15 +287,81 @@ class BSRMatrix:
         )
 
 
+def _csr_to_dense_host(A: CSRMatrix) -> torch.Tensor:
+    """Densify a CSRMatrix on the host, without a torch sparse tensor.
+
+    Used where the dense view has to reach a device that has no sparse CSR
+    support (the TorchNeuron `neuron` device, aws-neuron-sdk#1442): build
+    the dense matrix on the host, then move only the dense result. Every
+    shape here is static (`searchsorted` over `nnz` positions instead of a
+    data-dependent `repeat_interleave`), so the function also traces under
+    `torch.compile`. Differentiable w.r.t. `A.values`; duplicate entries are
+    summed, as in `torch.sparse_csr_tensor(...).to_dense()`.
+    """
+    m, n = A.shape
+    row_ptrs = A.row_ptrs.cpu()
+    values = A.values.cpu()
+    positions = torch.arange(values.shape[0], dtype=row_ptrs.dtype)
+    rows = torch.searchsorted(row_ptrs, positions, right=True) - 1
+    cols = A.col_indices.cpu().to(torch.long)
+    dense = torch.zeros(m, n, dtype=values.dtype)
+    return dense.index_put((rows.to(torch.long), cols), values, accumulate=True)
+
+
 # --- Construction helpers ---
+
+
+# Value gathers in `_dense_nonzeros` use blocks of rows whose flat indices
+# stay below 2^23: the device's int64 index_select is rounded through fp32
+# above 2^24 as well (an out-of-bounds gather on a 17M-element matrix, Trn2).
+_GATHER_SPAN = 1 << 23
+
+
+def _dense_nonzeros(
+    A: torch.Tensor, mask: torch.Tensor, host_index: bool
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """(rows, cols, values) of the True entries of the 2-D `mask`, row-major.
+
+    On the TorchNeuron ``neuron`` device, ``nonzero`` / ``torch.where`` /
+    ``argwhere`` / ``masked_select`` / boolean-mask indexing of a tensor with
+    more than 2^24 elements round the flat index ``row * n + col`` through
+    fp32: the column of an entry whose flat index is above 2^24 comes back as
+    ``fp32(row * n + col) - row * n``, and ``A[mask]`` returns the values at
+    those positions, silently (Trn2, SDK 2.33, trnsci/trnsci#135; the same
+    fp32 rounding of integers as aws-neuron/aws-neuron-sdk#1466).
+
+    `host_index` (any device other than the CPU) therefore takes the indices
+    from a host ``nonzero`` of the mask (one byte per element) and gathers the
+    values on A's device in blocks of rows, each with flat indices below 2^23.
+    """
+    if not host_index:
+        rows, cols = torch.where(mask)
+        return rows, cols, A[mask]
+    rows_h, cols_h = torch.where(mask.cpu())
+    m, n = A.shape
+    step = max(1, _GATHER_SPAN // max(n, 1))
+    starts = list(range(0, m, step))
+    bounds = torch.searchsorted(rows_h, torch.tensor([*starts, m])).tolist()
+    parts = []
+    for b, r0 in enumerate(starts):
+        lo, hi = bounds[b], bounds[b + 1]
+        if lo == hi:
+            continue
+        local = ((rows_h[lo:hi] - r0) * n + cols_h[lo:hi]).contiguous()
+        block = A[r0 : r0 + step].reshape(-1)
+        if block.numel() > 2 * _GATHER_SPAN:  # a single row above 2^24: gather on the host
+            parts.append(block.detach().cpu().index_select(0, local).to(A.device))
+        else:
+            parts.append(block.index_select(0, local.to(A.device)))
+    vals = torch.cat(parts) if parts else A.new_zeros(0)
+    return rows_h.contiguous().to(A.device), cols_h.contiguous().to(A.device), vals
 
 
 def from_dense(A: torch.Tensor, threshold: float = 0.0) -> CSRMatrix:
     """Convert dense matrix to CSR, dropping values with |v| <= threshold."""
     m, n = A.shape
     mask = torch.abs(A) > threshold
-    rows, cols = torch.where(mask)
-    vals = A[mask]
+    rows, cols, vals = _dense_nonzeros(A, mask, host_index=A.device.type != "cpu")
 
     # Build CSR
     coo = COOMatrix(values=vals, row_indices=rows, col_indices=cols, shape=(m, n))
@@ -279,12 +369,30 @@ def from_dense(A: torch.Tensor, threshold: float = 0.0) -> CSRMatrix:
 
 
 def from_scipy(sp_matrix) -> CSRMatrix:
-    """Convert scipy.sparse matrix to CSRMatrix."""
+    """Convert scipy.sparse matrix to CSRMatrix.
+
+    The values keep the scipy dtype (float64 stays float64, int64 stays
+    int64, complex128 stays complex128, ...). When the input is already CSR
+    with native-endian, writable data, the values tensor shares memory with
+    ``sp_matrix.data`` (zero-copy); otherwise they are copied. The index
+    arrays are always copied to int64.
+
+    Through 0.13.0 every real input was stored as float32 and complex input
+    as complex64 (#69); cast afterwards if single precision is wanted, e.g.
+    ``from_scipy(M.astype(np.float32))``.
+    """
+    import numpy as np
     import scipy.sparse as sp
 
     csr = sp.csr_matrix(sp_matrix)
+    data = csr.data
+    if not data.dtype.isnative:
+        data = data.astype(data.dtype.newbyteorder("="))
+    if not data.flags.writeable:
+        data = data.copy()
+    values = torch.from_numpy(np.ascontiguousarray(data))
     return CSRMatrix(
-        values=torch.tensor(csr.data, dtype=torch.float32),
+        values=values,
         col_indices=torch.tensor(csr.indices, dtype=torch.long),
         row_ptrs=torch.tensor(csr.indptr, dtype=torch.long),
         shape=csr.shape,

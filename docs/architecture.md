@@ -15,7 +15,7 @@ exact.
 
 Contrast with CSR, which stores individual nonzero elements. The v0.2.0
 NKI path for CSR materializes the matrix into a dense `(M, K)` tile
-before the matmul (see the [SpMM path](#v020-csr-spmm-path) below) —
+before the matmul (see the [dispatch hierarchy](#nki-dispatch-hierarchy) below) —
 necessary for correctness, but it pays the full `M × K` cost whether the
 matrix is sparse or not. BSR skips this because blocks are already dense.
 
@@ -37,11 +37,14 @@ trnsparse/
 │   ├── formats.py       # CSRMatrix, COOMatrix, BSRMatrix, from_dense
 │   ├── ops.py           # spmv, spmm, bsr_spmm, screened_spmm, ...
 │   ├── screening.py     # schwarz_bounds, screen_quartets, density_screen
-│   ├── iterative.py     # cg_bsr, power_iteration_bsr, jacobi_preconditioner_bsr
+│   ├── iterative.py     # cg_bsr, cg_bsr_fused, power_iteration_bsr(_fused), chebyshev/richardson
+│   ├── multicore.py     # ShardedBSR, ShardedAttention (logical NeuronCores of one chip)
 │   └── nki/
 │       ├── __init__.py
-│       ├── kernels.py   # _bsr_spmm_kernel, _screened_spmm_kernel
-│       └── dispatch.py  # torch.autograd.Function wrappers + routing
+│       ├── kernels.py       # BSR / screened / attention / fused CG kernels
+│       ├── dispatch.py      # path selection, torch.autograd.Function wrappers (XLA/CPU)
+│       ├── _native.py       # TorchNeuron custom ops + register_autograd
+│       └── _native_attn.py  # trnsparse::bsr_attn / bsr_attn_bwd composite ops
 ├── tests/
 ├── examples/
 │   ├── sparse_fock.py             # Schwarz-screened Fock (3 paths + trnblas)
@@ -56,12 +59,17 @@ compute format. `nki/dispatch.py` exposes `HAS_NKI`,
 `set_backend("auto"|"pytorch"|"nki")`, `get_backend()`, and the NKI
 entry points.
 
-### `spmm(csr, B)` — PyTorch fallback
+### `spmm(csr, B)` — densify-then-GEMM on NKI, `torch.sparse` otherwise
 
-Routes through `torch.sparse_csr_tensor` operations. Benchmarked within
-2× of scipy at typical shapes; the NKI per-op overhead doesn't pay off
-for CSR SpMM until the matrix is large enough that the v0.2.0 CSR kernel
-(densify-then-GEMM) would dominate anyway. SpMV also stays on this path.
+On the `pytorch` backend (and under `auto` without NKI) this routes
+through `torch.sparse_csr_tensor` operations, benchmarked within 2× of
+scipy at typical shapes. Under `nki`, and under `auto` when NKI is
+available, A is densified on the host and the v0.2.0 dense GEMM kernel
+runs on the Tensor Engine (`trnsparse::spmm_dense` on the native path). It
+pays the full `M × K` cost, so on Trn2 it stays behind dense aten and far
+behind `torch.sparse` on CPU at low density ([Benchmarks](benchmarks.md)):
+for repeated products on the device, use BSR. SpMV stays on the
+`torch.sparse` path (densified on the host when `x` is on a device).
 
 ### `bsr_spmm(bsr, B)` — NKI, `_bsr_spmm_kernel`
 
@@ -83,13 +91,49 @@ Fock-build-sized inputs.
 kernel — a `BSRMatrix` with a local-window or dilated block pattern IS
 an attention mask. See [sparse_attention.md](sparse_attention.md).
 
+### Static structure on the native path (Trn2/Trn3)
+
+TorchNeuron has no device sparse CSR, so the structure stays on the host
+(#30). The native path turns that into an advantage: `bsr_spmm` and
+block-sparse attention pass `block_row_ptrs` / `block_col_indices` to the
+kernel as compile-time constants (`trnsparse::bsr_spmm_static`,
+`attn_fwd_static`, `attn_bwd_static`). The trace unrolls exactly the stored
+blocks with static DMA addresses: no `(M_tiles, K_max)` padding (one dense
+global-token row no longer makes every row cost `K_max` blocks), no gathered
+copies of B / K / V, and the attention softmax statistics stay on chip. The
+cost is one compile per distinct structure (seconds), which a reused pattern
+amortizes. `TRNSPARSE_STATIC_STRUCTURE=0` restores the gather path. Measured
+crossovers against dense aten: `docs/benchmarks.md`.
+
+Under LNC=2 (the Trn2 default) NKI traces each kernel once per physical
+core, with `program_id` 0 and 1 as Python ints. The static kernels split
+their output tiles between the two traces, balanced by stored blocks:
+
+- SpMM: block rows and 512-column tiles.
+- Attention forward: block rows.
+- Attention backward: one pool of dQ block rows and dK/dV block columns.
+
+Each output tile has exactly one writer. `TRNSPARSE_CORE_SPLIT=0` turns the
+split off, for A/B measurements.
+
+The static kernels take fp32 or bf16 operands. When every operand is bf16,
+the matmuls run in bf16 and accumulate in fp32 PSUM. Scores, softmax
+statistics and score-space arithmetic stay fp32; only P and dS are rounded
+to bf16 for their matmuls. Outputs come back in bf16, and the attention
+statistics (`row_max`, `row_denom`) are always fp32. Mixed fp32/bf16
+operands run in fp32.
+
 ## Formats
 
 - **CSR**: row pointer + column indices + values. Preferred for construction,
   interop with scipy/PyTorch, and SpMV.
 - **COO**: three parallel 1-D tensors. Preferred for construction and permutation.
 - **BSR** (`block_size=128`): stacked 128×128 blocks + block-level CSR pattern.
-  Every block maps to one `nc_matmul`; zero gather overhead.
+  Every block maps to one `nc_matmul`; zero gather overhead. Other block
+  sizes work everywhere on the PyTorch path. The NKI kernels take 128 only, so
+  `bsr_spmm` and `block_sparse_attention_tiled` send any other block size
+  straight to PyTorch, or raise `NotImplementedError` under
+  `TRNSPARSE_REQUIRE_NKI=1`.
 
 All three support `from_dense`, `to_dense`, and interconversion.
 
@@ -121,23 +165,101 @@ Restricted to square A (`M == K`) with 1-D `diag_integrals` in v0.4.0
 — the common Fock-build case. Rectangular / asymmetric-bounds
 extension is a follow-up if asked for.
 
+## Precision and dtypes
+
+Every NKI kernel computes in fp32 or bf16 with fp32 PSUM accumulation.
+Trainium computes float64 at fp32 precision, so no kernel can return a
+float64-accurate result. float64 operands (and complex128 in `bsr_spmm`,
+whose complex path runs as real kernel launches) follow one rule across
+the trnsci suite (#84):
+
+| configuration | float64 / complex128 operands |
+|---|---|
+| `set_backend("auto")` (default) | the PyTorch path, at float64 accuracy, the same code as `set_backend("pytorch")`; on the host, also for operands that live on the `neuron` device (see below) |
+| `set_backend("nki")` | cast to fp32 (complex64) for the kernel; one `UserWarning` per op per process says precision is reduced to fp32 |
+| `TRNSPARSE_REQUIRE_NKI=1` | `NotImplementedError` (takes precedence over the explicit-nki cast) |
+
+This covers `spmm`, `bsr_spmm`, `screened_spmm`,
+`block_sparse_attention_tiled` (forward and backward), `cg_bsr` (through
+`bsr_spmm`) and the fused solvers `cg_bsr_fused` /
+`power_iteration_bsr_fused`, whose host path then runs in float64. A
+call with any float64 value operand counts (for example fp32 CSR values
+with a float64 `B`). `screened_spmm` decides on `A` and `B`; the Schwarz
+bound vector `diag_integrals` only builds the mask.
+
+The result dtype is always what `set_backend("pytorch")` returns for the
+same inputs, including bf16 / fp16 operands and mixed-dtype promotion
+(`torch.promote_types` of the operands); a kernel that computes in fp32
+has its result cast to that dtype. fp32, bf16 and fp16 operands take the
+kernels unchanged. Integer, bool and complex operands (outside
+`bsr_spmm`) have no kernel and take the PyTorch path, or raise
+`NotImplementedError` under `TRNSPARSE_REQUIRE_NKI`.
+
+Before 0.14.0 (0.2.0 through 0.13.0), float64 under `auto` was cast to
+fp32 on the NKI path without a warning.
+
+### float64 on the `neuron` device
+
+On the `neuron` device the PyTorch path would be device aten, and device
+aten computes float64 at fp32 precision too (measured on Trn2). So under
+`auto`, when any float64 or complex128 operand of a public op lives on a
+`neuron` device (a dense tensor, or the values / blocks of a CSR, COO or
+BSR matrix), the op runs on the host instead: the device-resident operands
+are copied to the CPU (indices included), host torch computes at float64,
+and the result is copied back to the dense operand's device in float64
+(complex128). The copies are differentiable, so autograd flows through
+them. The first such call of each op emits one `UserWarning`: "float64 on
+the neuron device is computed on the host for float64 accuracy (device
+arithmetic is fp32); pass float32 to stay on device".
+
+This covers `spmv`, `spmm`, `spmv_symmetric`, `bsr_spmm`, `screened_spmm`,
+`block_sparse_attention_tiled` (forward and backward), `cg_bsr`,
+`chebyshev_bsr`, `richardson_bsr`, `power_iteration_bsr` and the
+preconditioner returned by `jacobi_preconditioner_bsr`; a solver moves its
+operands once, not once per iteration. The fused solvers `cg_bsr_fused` /
+`power_iteration_bsr_fused` already run float64 on their host path.
+
+To keep float64 on the device anyway (faster, fp32 precision), set
+`TRNSPARSE_FP64_ON_DEVICE=1`: device-resident float64 then runs in device
+aten, without copies or the warning. The explicit `set_backend("nki")`
+cast, the pytorch backend and host-resident float64 are not affected.
+float32, bf16 and fp16 operands on the device stay on the device.
+
+Under `TRNSPARSE_REQUIRE_NKI=1` (backends `auto` and `nki`), a float64 /
+complex128 operand on the `neuron` device raises `NotImplementedError` at
+every public op, before any host copy or kernel, also with
+`TRNSPARSE_FP64_ON_DEVICE=1`: no kernel computes float64 at float64
+accuracy, and the routes without a kernel (CSR `spmv` / `spmv_symmetric` /
+`spmm`) would otherwise run device aten at fp32 precision with no error.
+
 ## Known limits
 
+- **BSR block size.** The NKI kernels take `block_size=128` only. Other block
+  sizes run on the PyTorch path under `auto` and `nki` (correct, no NKI, no
+  failed compile since 0.12.0), and raise `NotImplementedError` under
+  `TRNSPARSE_REQUIRE_NKI=1`. `cg_bsr_fused` / `prepare_cg_bsr` raise
+  `ValueError` for any other block size.
 - **Row-bucketing CSR** ([#15](https://github.com/trnsci/trnsparse/issues/15)) — parked.
   Requires NKI indirect-DMA gather (not exposed as of NKI 0.3.0). The CSR PyTorch
   fallback is within 2× of scipy; that's the current story.
 - **Fused tile-level attention scores** ([#25](https://github.com/trnsci/trnsparse/issues/25)) —
-  **v0.4.4 ships the NKI kernel pair** (`_attn_stats_kernel` + `_attn_out_kernel`).
+  shipped: the NKI kernel pair in v0.4.4, the NKI backward in 0.5.1, and
+  K-tiling for `head_dim` a multiple of 128 (256, 512) in 0.6.0.
   `block_sparse_attention_tiled` routes through NKI on the `nki` backend; the
-  PyTorch two-pass reference remains on the `pytorch` backend. `head_dim ≤ 128`
-  in v0.4.4 (nc_matmul partition limit); `head_dim=256` requires K-tiling.
+  PyTorch two-pass reference remains on the `pytorch` backend. `seq_len` must
+  be a multiple of the mask's block size (`ValueError` since 0.11.0). bf16
+  inputs raise on the gather kernels used for `head_dim > 128`
+  ([#49](https://github.com/trnsci/trnsparse/issues/49)); the static path
+  (`head_dim ≤ 128`) takes bf16.
 - **Fused iterative solvers** ([#22](https://github.com/trnsci/trnsparse/issues/22)) —
-  CG blocked on `nl.affine_range` iteration-carried scalar state. **v0.4.3 ships
-  `chebyshev_bsr` and `richardson_bsr`**: fixed-K solvers with pre-computed
-  coefficients (no inner products in the loop) that have the correct structure for
-  eventual NKI fusion. The "A SBUF-resident across all iterations" win remains gated
-  on `affine_range` vector-carry support.
+  shipped in 0.11.0: `cg_bsr_fused` runs CG or block-Jacobi PCG in one launch
+  with A SBUF-resident and a device-side `nl.while_loop` convergence check, and
+  `power_iteration_bsr_fused` uses the same kernel. See
+  [Iterative solvers](iterative_solvers.md). `chebyshev_bsr` and
+  `richardson_bsr` (v0.4.3) remain host-driven loops over `bsr_spmm`.
 - **Multi-chip sharded BSR** ([#16](https://github.com/trnsci/trnsparse/issues/16)) —
-  gated on suite-level multi-chip collectives.
+  across the logical NeuronCores of one Trn2 chip, `ShardedBSR` and
+  `ShardedAttention` shipped in 0.10.0 (`trnsparse.multicore`). Sharding across
+  chips is still gated on suite-level multi-chip collectives.
 - **SpMV stays PyTorch.** Single output column on the Tensor Engine doesn't amortize
   compile + dispatch overhead.

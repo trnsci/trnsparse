@@ -12,11 +12,11 @@ when you port code across.
 | `csr_matrix((data, indices, indptr))` | `CSRMatrix(data, indices, indptr, shape)` | Same CSR layout, explicit shape required in trnsparse. |
 | `coo_matrix((data, (row, col)))` | `COOMatrix(data, row, col, shape)` | Same COO triple layout. |
 | `csr_matrix(dense_array)` | `from_dense(torch_tensor, threshold=0.0)` | Densify → sparsify helper; `threshold` filters below-tolerance values. |
-| `csr_matrix(scipy_matrix)` (passthrough) | `from_scipy(sp_matrix)` | Ingests an existing `scipy.sparse` matrix directly — zero-copy where possible. |
+| `csr_matrix(scipy_matrix)` (passthrough) | `from_scipy(sp_matrix)` | Ingests an existing `scipy.sparse` matrix and keeps its value dtype. The values are zero-copy for CSR input; other formats are converted (copied). |
 | `eye(n, format='csr')` | `eye_sparse(n, dtype=torch.float32)` | Identity CSR. |
 | `A @ x` (SpMV) | `spmv(A, x)` | Function call, not operator; supports `alpha` / `beta` scaling. |
 | `A @ B` (SpMM) | `spmm(A, B)` | Same; supports `alpha` / `beta`. |
-| `A @ x` with symmetric A | `spmv_symmetric(A, x)` | Exploits symmetry for ~2× throughput when you can guarantee it. |
+| `A @ x` with symmetric A | `spmv_symmetric(A, x, uplo="upper")` | Only the `uplo` triangle is referenced (as in BLAS `symv`), so A may store one triangle (half the memory) or the full matrix. |
 | `alpha * A + beta * B` | `sparse_add(A, B, alpha=alpha, beta=beta)` | Combined scale + add. |
 | `alpha * A` | `sparse_scale(A, alpha)` | In-place-style scalar scaling. |
 | `A.T` | `sparse_transpose(A)` | Returns a new CSRMatrix. |
@@ -39,8 +39,8 @@ have a direct `scipy.sparse` equivalent:
 - **CSR layout bit-for-bit.** The `indptr`, `indices`, `data` arrays
   match `scipy.sparse.csr_matrix` exactly — same dtype conventions
   (`int32`/`int64` for indices, user-specified for data) and the same
-  zero-indexed, sorted-column-within-row invariants. You can round-trip
-  via `from_scipy` / `.to_scipy()` without layout surprises.
+  zero-indexed, sorted-column-within-row invariants. `from_scipy` keeps
+  the scipy value dtype (float64 stays float64, int64 stays int64).
 - **Matrix-vector semantics.** `spmv(A, x)` produces the same output as
   `A @ x` in scipy (modulo floating-point summation order). Symmetric
   and triangular variants use the same conventions.
@@ -53,17 +53,20 @@ have a direct `scipy.sparse` equivalent:
 `numpy.ndarray`. `CSRMatrix.data`, `.indices`, `.indptr` are all
 `torch.Tensor`. Device placement follows torch conventions:
 `A.data.to('cuda')` or similar. On Trainium, use `set_backend("nki")`
-to dispatch `spmv` / `spmm` to the on-device kernel path.
+to dispatch `spmv` / `spmm` to the on-device kernel path. With TorchNeuron
+(Trn2/Trn3), keep the sparse matrix itself on the host and put the dense
+operand on `device="neuron"`: the `neuron` device has no sparse CSR
+tensors (see [Installation](installation.md#placement-sparse-structure-on-the-host)).
 
 **Constructor signature.** trnsparse requires an explicit `shape`
 argument; scipy infers it from the indices when possible. Be explicit:
 
 ```python
 # scipy
-A = csr_matrix((data, indices, indptr))              # shape inferred
+A = csr_matrix((data, indices, indptr))  # shape inferred
 
 # trnsparse
-A = CSRMatrix(data, indices, indptr, shape=(m, n))   # shape required
+A = CSRMatrix(data, indices, indptr, shape=(m, n))  # shape required
 ```
 
 **Operator access.** scipy overloads `@`, `+`, `*` on its matrix
@@ -77,7 +80,7 @@ backend dispatch easier to reason about.
 |---|---|
 | `A.multiply(B)` (elementwise) | Densify one side: `torch.sparse.mm(A.to_torch_sparse(), B)` with dense mask. |
 | `A.power(n)` | Materialize via `from_dense((A.to_dense() ** n).to(...))`. |
-| Slicing (`A[i:j, :]`) | Extract on the CPU side via `from_scipy(A.to_scipy()[i:j])`. |
+| Slicing (`A[i:j, :]`) | Slice the scipy matrix on the CPU side, then `from_scipy(M[i:j])`. |
 | Elementwise division | Not supported — use dense path. |
 
 Track these in the [issue tracker](https://github.com/trnsci/trnsparse/issues)
@@ -107,9 +110,9 @@ import torch
 import trnsparse
 import trnsolver
 
-A = trnsparse.from_scipy(scipy_matrix)            # zero-copy ingestion
-b = torch.as_tensor(b_numpy, dtype=torch.float32)
-x = trnsolver.cg(A, b, tol=1e-6)                  # uses trnsparse.spmv
+A = trnsparse.from_scipy(scipy_matrix)  # keeps float64; values zero-copy for CSR
+b = torch.as_tensor(b_numpy, dtype=A.dtype)
+x = trnsolver.cg(A, b, tol=1e-6)  # uses trnsparse.spmv
 ```
 
 The hot path (`spmv` inside CG) dispatches to NKI when

@@ -110,4 +110,8 @@ class TestNkiBSRDifferentiability:
                 B,
             )
 
-        assert torch.autograd.gradcheck(func, (bsr.blocks, B), eps=1e-6, atol=1e-4)
+        # The kernel runs in fp32 (Trainium has no fp64 datapath; dispatch
+        # downcasts and casts the result back), so fp64 finite differences at
+        # eps=1e-6 would measure fp32 roundoff, not the gradient. The op is
+        # linear in each input, so a large eps has no truncation error.
+        assert torch.autograd.gradcheck(func, (bsr.blocks, B), eps=1e-2, atol=1e-2, rtol=1e-2)

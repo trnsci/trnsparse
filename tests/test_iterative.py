@@ -86,6 +86,118 @@ class TestCgBsr:
         assert iters == 0
         assert rel == 0.0
 
+    def test_breakdown_on_first_step(self):
+        """p . A p = 0 at k=0 (A = 0): no step, x = x0, iters 0, rel 1 (#86)."""
+        A = trnsparse.BSRMatrix.from_dense(torch.zeros(128, 128), block_size=128)
+        b = torch.ones(128)
+        x, iters, rel = trnsparse.cg_bsr(A, b)
+        torch.testing.assert_close(x, torch.zeros(128))
+        assert iters == 0
+        assert rel == pytest.approx(1.0)
+
+    def test_exact_x0_with_zero_tol(self):
+        """x0 already solves A x = b and tol=0: breakdown at k=0 returns x0 (#71)."""
+        A = trnsparse.BSRMatrix.from_dense(2.0 * torch.eye(16, dtype=torch.float64), block_size=8)
+        b = torch.ones(16, dtype=torch.float64)
+        x0 = torch.full((16,), 0.5, dtype=torch.float64)
+        x, iters, rel = trnsparse.cg_bsr(A, b, x0=x0, tol=0.0, max_iter=50)
+        torch.testing.assert_close(x, x0)
+        assert iters == 0
+        assert rel == 0.0
+
+    def test_max_iter_zero(self):
+        """max_iter=0 returns (x0, 0, ||b - A x0|| / ||b||) (#71)."""
+        # Local generator: the global RNG state is left alone for other tests.
+        gen = torch.Generator().manual_seed(5)
+        Mr = torch.randn(64, 64, dtype=torch.float64, generator=gen)
+        Ad = Mr @ Mr.T + 64 * torch.eye(64, dtype=torch.float64)
+        A = trnsparse.BSRMatrix.from_dense(Ad, block_size=8)
+        b = torch.randn(64, dtype=torch.float64, generator=gen)
+        x0 = torch.randn(64, dtype=torch.float64, generator=gen)
+        x, iters, rel = trnsparse.cg_bsr(A, b, x0=x0, max_iter=0)
+        torch.testing.assert_close(x, x0)
+        assert iters == 0
+        ref = (torch.linalg.norm(b - Ad @ x0) / torch.linalg.norm(b)).item()
+        assert rel == pytest.approx(ref, rel=1e-12)
+
+    def test_breakdown_reports_steps_taken(self):
+        """A = I with tol=0: one step solves exactly, then p = 0 breaks down.
+
+        The reported count is the steps taken (1), not max_iter (#71).
+        """
+        A = trnsparse.BSRMatrix.from_dense(torch.eye(16, dtype=torch.float64), block_size=8)
+        b = torch.arange(1.0, 17.0, dtype=torch.float64)
+        x, iters, rel = trnsparse.cg_bsr(A, b, tol=0.0, max_iter=500)
+        torch.testing.assert_close(x, b)
+        assert iters == 1
+        assert rel == 0.0
+
+
+class TestCgBsrAutograd:
+    """cg_bsr differentiates as the exact solve A^{-1} b (#70)."""
+
+    @staticmethod
+    def _randn(*shape, seed=0):
+        gen = torch.Generator().manual_seed(seed)
+        return torch.randn(*shape, dtype=torch.float64, generator=gen)
+
+    @staticmethod
+    def _spd(n=64, bs=8):
+        # Local generator: the global RNG state is left alone for other tests.
+        gen = torch.Generator().manual_seed(3)
+        d = torch.linspace(1.0, 50.0, n, dtype=torch.float64)
+        Q = torch.linalg.qr(torch.randn(n, n, dtype=torch.float64, generator=gen))[0]
+        Ad = Q @ torch.diag(d) @ Q.T
+        return Ad, d, Q, trnsparse.BSRMatrix.from_dense(Ad, block_size=bs)
+
+    def test_grad_b_one_step_convergence(self):
+        # b along an eigenvector: CG stops after one step, where the old
+        # frozen-step-size graph gave a gradient ~20% off A^{-1} g.
+        Ad, _, Q, A = self._spd()
+        b = Q[:, -1].clone().requires_grad_()
+        x, iters, _ = trnsparse.cg_bsr(A, b, tol=1e-12, max_iter=500)
+        assert iters == 1
+        assert x.requires_grad
+        g = self._randn(64, seed=1)
+        (x * g).sum().backward()
+        torch.testing.assert_close(b.grad, torch.linalg.solve(Ad, g), rtol=1e-8, atol=1e-8)
+
+    def test_grad_blocks_matches_dense_solve(self):
+        Ad, _, Q, A = self._spd()
+        rhs = Q[:, -1].clone()
+        blk = A.blocks.clone().requires_grad_()
+        A2 = trnsparse.BSRMatrix(blk, A.block_col_indices, A.block_row_ptrs, A.shape, A.block_size)
+        x, _, _ = trnsparse.cg_bsr(A2, rhs, tol=1e-12, max_iter=500)
+        g = self._randn(64, seed=1)
+        (x * g).sum().backward()
+
+        Ad_leaf = Ad.clone().requires_grad_()
+        (torch.linalg.solve(Ad_leaf, rhs) * g).sum().backward()
+        ref = trnsparse.BSRMatrix.from_dense(Ad_leaf.grad, block_size=8)
+        # same block structure (dense matrix -> every block stored)
+        assert torch.equal(ref.block_col_indices, A.block_col_indices)
+        torch.testing.assert_close(blk.grad, ref.blocks, rtol=1e-7, atol=1e-9)
+
+    def test_values_and_info_unchanged_by_grad(self):
+        _, _, _, A = self._spd()
+        b = self._randn(64, seed=2)
+        x0, it0, r0 = trnsparse.cg_bsr(A, b, tol=1e-10)
+        x1, it1, r1 = trnsparse.cg_bsr(A, b.clone().requires_grad_(), tol=1e-10)
+        assert torch.equal(x0, x1.detach()) and (it0, r0) == (it1, r1)
+
+    def test_gradcheck(self):
+        _, _, _, A = self._spd(16, 4)
+        blk = A.blocks.clone().requires_grad_()
+        b = self._randn(16, seed=4).requires_grad_()
+
+        def f(blk, b):
+            M = trnsparse.BSRMatrix(blk, A.block_col_indices, A.block_row_ptrs, A.shape, 4)
+            return trnsparse.cg_bsr(M, b, tol=1e-14, max_iter=200)[0]
+
+        # Perturbing single block entries makes A nonsymmetric, where CG is
+        # not a solve; gradcheck b (A is covered by the dense-solve test above).
+        assert torch.autograd.gradcheck(lambda b: f(blk.detach(), b), (b,))
+
 
 class TestPowerIterationBsr:
     def test_dominant_eigenvalue_diagonal(self):
@@ -116,6 +228,91 @@ class TestPowerIterationBsr:
         assert abs(lam_ours - lam_ref) / lam_ref < 1e-3, f"ours={lam_ours}, ref={lam_ref}"
 
 
+class TestPowerIterationBsrAutograd:
+    """power_iteration_bsr differentiates as the exact unit eigenvector (#96)."""
+
+    N, BS = 24, 8
+
+    @staticmethod
+    def _gen(seed):
+        return torch.Generator().manual_seed(seed)
+
+    def _sym(self):
+        # Symmetric, dominant eigenvalue 20 with gap ratio 0.5: converges to
+        # machine precision well inside max_iter.
+        gen = self._gen(7)
+        Q = torch.linalg.qr(torch.randn(self.N, self.N, dtype=torch.float64, generator=gen))[0]
+        d = torch.linspace(1.0, 10.0, self.N, dtype=torch.float64)
+        d[-1] = 20.0
+        return Q @ torch.diag(d) @ Q.T
+
+    def _run(self, Ad, seed=1, v0_grad=False):
+        A = trnsparse.BSRMatrix.from_dense(Ad, block_size=self.BS)
+        blk = A.blocks.clone().requires_grad_()
+        A2 = trnsparse.BSRMatrix(blk, A.block_col_indices, A.block_row_ptrs, A.shape, self.BS)
+        v0 = torch.ones(self.N, dtype=torch.float64)
+        if v0_grad:
+            v0.requires_grad_()
+        lam, v, iters = trnsparse.power_iteration_bsr(A2, v0=v0, max_iter=2000, tol=0.0)
+        g = torch.randn(self.N, dtype=torch.float64, generator=self._gen(seed))
+        (v * g).sum().backward()
+        dense_grad = trnsparse.BSRMatrix(
+            blk.grad, A.block_col_indices, A.block_row_ptrs, A.shape, self.BS
+        ).to_dense()
+        return lam, v.detach(), g, dense_grad, v0
+
+    def test_grad_matches_eigh(self):
+        Ad = self._sym()
+        lam, v, g, G, _ = self._run(Ad)
+        Al = Ad.clone().requires_grad_()
+        _, V = torch.linalg.eigh(Al)
+        sign = torch.sign(torch.dot(V[:, -1].detach(), v))
+        ((sign * V[:, -1]) * g).sum().backward()
+        assert lam == pytest.approx(20.0, rel=1e-12)
+        # eigh differentiates w.r.t. symmetric perturbations: compare the
+        # symmetric part of the (unconstrained) gradient.
+        torch.testing.assert_close(0.5 * (G + G.T), Al.grad, rtol=1e-8, atol=1e-10)
+
+    def test_grad_nonsymmetric_vs_finite_difference(self):
+        Ad = self._sym() + 0.3 * torch.randn(
+            self.N, self.N, dtype=torch.float64, generator=self._gen(8)
+        )
+        _, v, g, G, _ = self._run(Ad)
+
+        def dominant(B):  # independent reference: dense eig, unit norm, sign-aligned
+            ev, V = torch.linalg.eig(B)
+            u = V[:, ev.abs().argmax()].real
+            u = u / torch.linalg.norm(u)
+            return u * torch.sign(torch.dot(u, v))
+
+        E = torch.randn(self.N, self.N, dtype=torch.float64, generator=self._gen(9))
+        h = 1e-6
+        fd = torch.dot(dominant(Ad + h * E) - dominant(Ad - h * E), g) / (2 * h)
+        assert (G * E).sum().item() == pytest.approx(fd.item(), rel=1e-6, abs=1e-9)
+
+    def test_no_grad_to_v0_and_values_unchanged(self):
+        Ad = self._sym()
+        A = trnsparse.BSRMatrix.from_dense(Ad, block_size=self.BS)
+        v0 = torch.ones(self.N, dtype=torch.float64)
+        ref = trnsparse.power_iteration_bsr(A, v0=v0, max_iter=50, tol=1e-9)
+        out = trnsparse.power_iteration_bsr(
+            A, v0=v0.clone().requires_grad_(), max_iter=50, tol=1e-9
+        )
+        assert out[1].requires_grad
+        assert (ref[0], ref[2]) == (out[0], out[2]) and torch.equal(ref[1], out[1].detach())
+        _, _, _, _, v0l = self._run(Ad, v0_grad=True)
+        assert v0l.grad is None
+
+    def test_complex_backward_raises(self):
+        Ad = torch.diag(torch.arange(1.0, 9.0, dtype=torch.float64)).to(torch.complex128)
+        A = trnsparse.BSRMatrix.from_dense(Ad, block_size=8)
+        blk = A.blocks.clone().requires_grad_()
+        A2 = trnsparse.BSRMatrix(blk, A.block_col_indices, A.block_row_ptrs, A.shape, 8)
+        _, v, _ = trnsparse.power_iteration_bsr(A2, v0=torch.ones(8, dtype=torch.complex128))
+        with pytest.raises(NotImplementedError, match="complex"):
+            v.real.sum().backward()
+
+
 class TestBsrDiagonal:
     def test_diagonal_of_identity(self):
         I_bsr = trnsparse.BSRMatrix.from_dense(torch.eye(128), block_size=128)
@@ -133,6 +330,13 @@ class TestBsrDiagonal:
         A_bsr = trnsparse.BSRMatrix.from_dense(A_dense, block_size=128)
         d = trnsparse.bsr_diagonal(A_bsr)
         torch.testing.assert_close(d, torch.zeros(256))
+
+    def test_diagonal_of_tall_and_wide(self):
+        """Rectangular A gives length min(m, n), like torch.diagonal (#74)."""
+        A_tall = torch.arange(1.0, 97.0).reshape(12, 8)
+        for A_dense in (A_tall, A_tall.T.contiguous()):
+            d = trnsparse.bsr_diagonal(trnsparse.BSRMatrix.from_dense(A_dense, block_size=4))
+            torch.testing.assert_close(d, torch.diagonal(A_dense))
 
 
 class TestRichardsonBsr:
@@ -206,6 +410,38 @@ class TestChebyshevBsr:
         assert abs(alpha[0].item() - 1.0 / d) < 1e-5
         assert abs(beta[0].item()) < 1e-6  # first step has no momentum
 
+    @pytest.mark.parametrize("K", [1, 2, 3, 7, 30])
+    @pytest.mark.parametrize("bounds", [(0.5, 4.0), (1e-2, 1.0)])
+    def test_residual_is_scaled_chebyshev(self, K, bounds):
+        """Residual polynomial is T_K((d - lam)/c) / T_K(d/c) and meets the
+        bound 2 / (q^K + q^-K) (#73). Dense reference, A = diag(lam), b = 1."""
+        lam_min, lam_max = bounds
+        d, c = (lam_max + lam_min) / 2, (lam_max - lam_min) / 2
+        alpha, beta = trnsparse.chebyshev_coeffs(lam_min, lam_max, K)
+        lam = torch.linspace(lam_min, lam_max, 65, dtype=torch.float64)
+        A = torch.diag(lam)
+        b = torch.ones(65, dtype=torch.float64)
+        x_prev = x = torch.zeros(65, dtype=torch.float64)
+        for k in range(K):
+            r = b - A @ x
+            x, x_prev = x + float(alpha[k]) * r + float(beta[k]) * (x - x_prev), x
+        res = b - A @ x
+        T = np.polynomial.chebyshev.Chebyshev.basis(K)
+        ref = torch.from_numpy(T(((d - lam) / c).numpy()) / T(d / c))
+        torch.testing.assert_close(res, ref, atol=1e-6, rtol=0)
+        kappa = lam_max / lam_min
+        q = (kappa**0.5 + 1) / (kappa**0.5 - 1)
+        bound = 2 / (q**K + q**-K)
+        assert res.abs().max().item() <= bound * (1 + 1e-4)  # fp32 coefficients
+        # The bound is attained (equioscillation) at the Chebyshev extrema.
+        assert res.abs().max().item() >= bound * (1 - 1e-2)
+
+    def test_coeffs_degenerate_interval(self):
+        """lam_min == lam_max: one step at 1/d is exact, no division by zero."""
+        alpha, beta = trnsparse.chebyshev_coeffs(2.0, 2.0, 4)
+        torch.testing.assert_close(alpha, torch.full((4,), 0.5))
+        torch.testing.assert_close(beta, torch.zeros(4))
+
     def test_lower_residual_than_richardson_same_K(self):
         """For well-conditioned SPD, Chebyshev beats Richardson at same K."""
         n = 128
@@ -224,3 +460,360 @@ class TestChebyshevBsr:
             f"Chebyshev should converge at least as fast as Richardson "
             f"(cheb={rel_cheb:.4f}, rich={rel_rich:.4f})"
         )
+
+
+# ── cg_bsr_fused: host path (#22). The NKI kernel runs the same algorithm;
+# tests/test_nki_cg_fused.py checks it against this path on hardware. ────────
+
+
+def _block_spd(T: int, band: int = 1, n: int | None = None, seed: int = 0, shift: float = 0.5):
+    """Block-banded SPD matrix (fp64) with 128x128 blocks; optional order n < 128 T."""
+    g = torch.Generator().manual_seed(seed)
+    N = T * 128
+    M = torch.randn(N, N, generator=g, dtype=torch.float64) / N**0.5
+    mask = torch.zeros(T, T, dtype=torch.float64)
+    for i in range(T):
+        mask[i, max(0, i - band) : i + band + 1] = 1.0
+    M = M * torch.kron(mask, torch.ones(128, 128, dtype=torch.float64))
+    A = (M + M.T) / 2
+    A = A + (torch.linalg.eigvalsh(A)[0].abs() + shift) * torch.eye(N, dtype=torch.float64)
+    if n is not None:
+        A = A[:n, :n].contiguous()
+    return A
+
+
+class TestCgBsrFused:
+    def test_matches_direct_solve(self):
+        A = _block_spd(3)
+        b = torch.randn(A.shape[0], dtype=torch.float64, generator=torch.Generator().manual_seed(1))
+        bsr = trnsparse.BSRMatrix.from_dense(A, block_size=128)
+        x, iters, rel = trnsparse.cg_bsr_fused(bsr, b, tol=1e-10, max_iter=500)
+        assert x.dtype == torch.float64
+        assert rel < 1e-10
+        torch.testing.assert_close(x, torch.linalg.solve(A, b), atol=1e-8, rtol=1e-8)
+        assert 0 < iters < 500
+
+    def test_parity_vs_scipy_cg(self):
+        sp = pytest.importorskip("scipy.sparse")
+        spla = pytest.importorskip("scipy.sparse.linalg")
+        A = _block_spd(4, band=1, seed=2)
+        b = torch.randn(A.shape[0], dtype=torch.float64, generator=torch.Generator().manual_seed(3))
+        bsr = trnsparse.BSRMatrix.from_dense(A, block_size=128)
+        x, iters, _ = trnsparse.cg_bsr_fused(bsr, b, tol=1e-8, max_iter=1000)
+        count = [0]
+        xs, info = spla.cg(
+            sp.csr_matrix(A.numpy()),
+            b.numpy(),
+            rtol=1e-8,
+            atol=0.0,
+            maxiter=1000,
+            callback=lambda _: count.__setitem__(0, count[0] + 1),
+        )
+        assert info == 0
+        np.testing.assert_allclose(x.numpy(), xs, atol=1e-6, rtol=1e-6)
+        assert abs(iters - count[0]) <= 1
+
+    def test_block_jacobi_fewer_iterations(self):
+        # Badly scaled diagonal blocks: block-Jacobi removes the scaling.
+        A = _block_spd(4, seed=4)
+        s = torch.repeat_interleave(torch.tensor([1.0, 30.0, 0.05, 4.0], dtype=torch.float64), 128)
+        A = s[:, None] ** 0.5 * A * s[None, :] ** 0.5
+        b = torch.randn(A.shape[0], dtype=torch.float64, generator=torch.Generator().manual_seed(5))
+        bsr = trnsparse.BSRMatrix.from_dense(A, block_size=128)
+        x0, k0, _ = trnsparse.cg_bsr_fused(bsr, b, tol=1e-8, max_iter=2000)
+        x1, k1, r1 = trnsparse.cg_bsr_fused(
+            bsr, b, tol=1e-8, max_iter=2000, preconditioner="block_jacobi"
+        )
+        assert r1 < 1e-8
+        assert k1 < k0
+        ref = torch.linalg.solve(A, b)
+        torch.testing.assert_close(x1, ref, atol=1e-6, rtol=1e-6)
+
+    def test_order_not_multiple_of_128(self):
+        A = _block_spd(3, n=300, seed=6)
+        b = torch.randn(300, dtype=torch.float64, generator=torch.Generator().manual_seed(7))
+        bsr = trnsparse.BSRMatrix.from_dense(A, block_size=128)
+        assert bsr.shape == (300, 300)  # last block row/column zero-padded
+        # the operator puts identity on the padded diagonal (SPD padded system)
+        x, _, rel = trnsparse.cg_bsr_fused(bsr, b, tol=1e-10, preconditioner="block_jacobi")
+        assert x.shape == (300,) and rel < 1e-10
+        torch.testing.assert_close(x, torch.linalg.solve(A, b), atol=1e-8, rtol=1e-8)
+
+    def test_initial_guess_and_cap(self):
+        A = _block_spd(2, seed=8)
+        b = torch.randn(A.shape[0], dtype=torch.float64, generator=torch.Generator().manual_seed(9))
+        bsr = trnsparse.BSRMatrix.from_dense(A, block_size=128)
+        ref = torch.linalg.solve(A, b)
+        x, iters, rel = trnsparse.cg_bsr_fused(bsr, b, x0=ref, tol=1e-6)
+        assert iters == 0 and rel < 1e-6
+        x, iters, rel, info = trnsparse.cg_bsr_fused(
+            bsr, b, tol=1e-14, max_iter=5, check_every=4, return_info=True
+        )
+        assert iters == 5 and rel > 1e-14
+        assert info["path"] == "pytorch" and info["trips"] == 2
+
+    def test_zero_rhs(self):
+        bsr = trnsparse.BSRMatrix.from_dense(_block_spd(1), block_size=128)
+        x, iters, rel = trnsparse.cg_bsr_fused(bsr, torch.zeros(128, dtype=torch.float64))
+        assert iters == 0 and rel == 0.0 and torch.count_nonzero(x) == 0
+
+    def test_operator_reuse_and_fp32(self):
+        A = _block_spd(2, seed=10)
+        bsr = trnsparse.BSRMatrix.from_dense(A.float(), block_size=128)
+        op = trnsparse.prepare_cg_bsr(bsr, preconditioner="block_jacobi")
+        assert isinstance(op, trnsparse.FusedCGOperator)
+        assert op.resident_blocks == op.n_blocks == bsr.n_blocks
+        for seed in (11, 12):
+            b = torch.randn(256, generator=torch.Generator().manual_seed(seed))
+            x, _, rel = trnsparse.cg_bsr_fused(op, b, tol=1e-5)
+            assert x.dtype == torch.float32
+            assert rel < 1e-5
+            res = torch.linalg.norm(b.double() - A @ x.double()) / torch.linalg.norm(b.double())
+            assert res < 1e-4
+
+    def test_resident_block_budget(self, monkeypatch):
+        from trnsparse.nki.kernels import cg_resident_blocks
+
+        # 160 KiB / partition, 512 B per fp32 block per partition
+        assert cg_resident_blocks(1000, 32, False) == 320
+        assert cg_resident_blocks(1000, 32, True) == 288
+        assert cg_resident_blocks(100, 32, True) == 100
+        monkeypatch.setenv("TRNSPARSE_CG_SBUF_KIB", "8")
+        assert cg_resident_blocks(100, 4, False) == 16
+
+    def test_rejects_bad_inputs(self):
+        bsr = trnsparse.BSRMatrix.from_dense(torch.eye(64), block_size=32)
+        with pytest.raises(ValueError, match="block_size=128"):
+            trnsparse.prepare_cg_bsr(bsr)
+        rect = trnsparse.BSRMatrix.from_dense(torch.ones(128, 256), block_size=128)
+        with pytest.raises(ValueError, match="square"):
+            trnsparse.prepare_cg_bsr(rect)
+        off = torch.zeros(256, 256)
+        off[:128, 128:] = 1.0
+        off[128:, :128] = 1.0
+        offb = trnsparse.BSRMatrix.from_dense(off, block_size=128)
+        with pytest.raises(ValueError, match="diagonal block"):
+            trnsparse.prepare_cg_bsr(offb, preconditioner="block_jacobi")
+        sq = trnsparse.BSRMatrix.from_dense(torch.eye(128), block_size=128)
+        with pytest.raises(ValueError, match="preconditioner"):
+            trnsparse.prepare_cg_bsr(sq, preconditioner="ilu")
+        with pytest.raises(ValueError, match="shape"):
+            trnsparse.cg_bsr_fused(sq, torch.ones(64))
+
+    def test_multiple_rhs_match_single_solves(self):
+        A = _block_spd(3, seed=13)
+        g = torch.Generator().manual_seed(14)
+        B = torch.randn(A.shape[0], 4, dtype=torch.float64, generator=g)
+        B[:, 1] *= 1e3  # columns are scaled independently
+        B[:, 2] = 0.0  # a zero column converges at once
+        bsr = trnsparse.BSRMatrix.from_dense(A, block_size=128)
+        X, iters, rel = trnsparse.cg_bsr_fused(
+            bsr, B, tol=1e-9, preconditioner="block_jacobi", max_iter=500
+        )
+        assert X.shape == B.shape and iters.shape == (4,) and rel.shape == (4,)
+        assert int(iters[2]) == 0 and torch.count_nonzero(X[:, 2]) == 0
+        for c in (0, 1, 3):
+            x, k, r = trnsparse.cg_bsr_fused(
+                bsr, B[:, c], tol=1e-9, preconditioner="block_jacobi", max_iter=500
+            )
+            assert int(iters[c]) == k
+            torch.testing.assert_close(X[:, c], x, atol=1e-9 * float(B[:, c].norm()), rtol=1e-9)
+        torch.testing.assert_close(X, torch.linalg.solve(A, B), atol=1e-6, rtol=1e-6)
+
+    def test_rhs_count_limits(self):
+        sq = trnsparse.BSRMatrix.from_dense(torch.eye(128), block_size=128)
+        with pytest.raises(ValueError, match="right-hand sides"):
+            trnsparse.cg_bsr_fused(sq, torch.ones(128, 513))
+        with pytest.raises(ValueError, match="shape"):
+            trnsparse.cg_bsr_fused(sq, torch.ones(128, 2, 2))
+
+    def test_matvec_and_precision_options(self):
+        A = _block_spd(2, seed=15)
+        bsr = trnsparse.BSRMatrix.from_dense(A, block_size=128)
+        b = torch.randn(256, dtype=torch.float64, generator=torch.Generator().manual_seed(16))
+        _, _, _, info = trnsparse.cg_bsr_fused(bsr, b, return_info=True)
+        assert info["matvec"] == "column" and info["precision"] == "fp32"
+        _, _, _, info = trnsparse.cg_bsr_fused(bsr, b[:, None].repeat(1, 33), return_info=True)
+        assert info["matvec"] == "row"  # "auto": more than 32 right-hand sides
+        with pytest.raises(ValueError, match="matvec"):
+            trnsparse.cg_bsr_fused(bsr, b, matvec="diagonal")
+        with pytest.raises(ValueError, match="precision"):
+            trnsparse.cg_bsr_fused(bsr, b, precision="fp16")
+        with pytest.raises(ValueError, match="column"):
+            trnsparse.cg_bsr_fused(bsr, b, matvec="row", precision="bf16")
+        with pytest.raises(ValueError, match="right-hand sides"):
+            trnsparse.cg_bsr_fused(bsr, b[:, None].repeat(1, 17), precision="bf16x2")
+
+    def test_bf16_emulation_solves_the_rounded_system(self):
+        # The host path emulates the bf16 column matvec: CG converges for the
+        # bf16-rounded A, so the residual against A itself stalls near the
+        # rounding (~2^-9), and bf16 hi + lo (~2^-17) lands close to fp32.
+        from trnsparse.iterative import _bf16_parts
+
+        A = _block_spd(2, seed=17, shift=5.0)
+        bsr = trnsparse.BSRMatrix.from_dense(A, block_size=128)
+        b = torch.randn(256, dtype=torch.float64, generator=torch.Generator().manual_seed(18))
+        op = trnsparse.prepare_cg_bsr(bsr)
+
+        def true_res(x):
+            return float(torch.linalg.norm(b - A @ x) / torch.linalg.norm(b))
+
+        x32, _, _ = trnsparse.cg_bsr_fused(op, b, tol=1e-10, max_iter=500)
+        x16, _, rel16 = trnsparse.cg_bsr_fused(op, b, tol=1e-10, max_iter=500, precision="bf16")
+        x2, _, _ = trnsparse.cg_bsr_fused(op, b, tol=1e-10, max_iter=500, precision="bf16x2")
+        assert rel16 < 1e-6  # the recursive residual converges ...
+        assert 1e-5 < true_res(x16) < 3e-2  # ... to the bf16-rounded system
+        assert true_res(x2) < 1e-4 and true_res(x32) < 1e-9
+        hi, lo = _bf16_parts(op._blocks64, 2)
+        assert hi.dtype == lo.dtype == torch.bfloat16
+        err = (hi.double() + lo.double() - op._blocks64).abs().max()
+        assert err <= 2.0**-15 * op._blocks64.abs().max()
+
+    def test_resident_blocks_bf16(self):
+        from trnsparse.nki.kernels import cg_resident_blocks
+
+        # bf16 A takes 256 B per block per partition: twice the blocks
+        assert cg_resident_blocks(1000, 32, False, block_bytes=256) == 640
+        assert cg_resident_blocks(1000, 32, True, block_bytes=256) == 576
+        assert cg_resident_blocks(1000, 32, False, block_bytes=512) == 320
+
+    def test_chronopoulos_gear_recurrence(self):
+        # Opt-in Chronopoulos-Gear CG: the same Krylov iterates in exact
+        # arithmetic, so in fp64 it matches standard CG closely.
+        A = _block_spd(4, seed=21)
+        b = torch.randn(
+            A.shape[0], dtype=torch.float64, generator=torch.Generator().manual_seed(22)
+        )
+        bsr = trnsparse.BSRMatrix.from_dense(A, block_size=128)
+        x, k, rel, info = trnsparse.cg_bsr_fused(
+            bsr, b, tol=1e-10, max_iter=500, return_info=True, recurrence="chronopoulos_gear"
+        )
+        xs, ks, _ = trnsparse.cg_bsr_fused(bsr, b, tol=1e-10, max_iter=500)
+        assert info["recurrence"] == "chronopoulos_gear" and info["path"] == "pytorch"
+        assert rel < 1e-10 and abs(k - ks) <= 1
+        torch.testing.assert_close(x, torch.linalg.solve(A, b), atol=1e-8, rtol=1e-8)
+        torch.testing.assert_close(x, xs, atol=1e-8, rtol=1e-8)
+        # exact iteration cap, and several right-hand sides with their own counts
+        _, k5, _ = trnsparse.cg_bsr_fused(
+            bsr, b, tol=0.0, max_iter=5, recurrence="chronopoulos_gear"
+        )
+        assert k5 == 5
+        B = torch.stack([b, 2 * b, torch.zeros_like(b)], dim=1)
+        X, K, REL = trnsparse.cg_bsr_fused(
+            bsr, B, tol=1e-8, max_iter=500, recurrence="chronopoulos_gear"
+        )
+        assert K.tolist()[2] == 0 and abs(int(K[0]) - int(K[1])) <= 1
+        torch.testing.assert_close(X[:, 1], 2 * X[:, 0], atol=1e-6, rtol=1e-6)
+        with pytest.raises(ValueError, match="plain CG only"):
+            trnsparse.cg_bsr_fused(
+                bsr, b, preconditioner="block_jacobi", recurrence="chronopoulos_gear"
+            )
+        with pytest.raises(ValueError, match="recurrence"):
+            trnsparse.cg_bsr_fused(bsr, b, recurrence="pipelined")
+
+    def test_row_order_balances_column_groups(self):
+        from trnsparse.nki.kernels import cg_row_order
+
+        counts = [9, 1, 1, 1, 8, 1, 1, 1, 7, 1, 1, 1, 6, 2, 2]  # heavy rows all at i % 4 == 0
+        ptrs = [0]
+        for c in counts:
+            ptrs.append(ptrs[-1] + c)
+        for lo, hi in [(0, 15), (3, 11), (0, 1), (2, 4)]:
+            order = cg_row_order(ptrs, lo, hi)
+            assert sorted(order) == list(range(lo, hi))
+            n = hi - lo
+            loads = [sum(counts[order[i]] for i in range(g, n, 4)) for g in range(4)]
+            naive = [sum(counts[m] for m in range(lo + g, hi, 4)) for g in range(4)]
+            assert max(loads) <= max(naive)
+        order = cg_row_order(ptrs, 0, 15)
+        loads = [sum(counts[order[i]] for i in range(g, 15, 4)) for g in range(4)]
+        assert max(loads) <= 13 < 33  # i % 4 puts 30 + 3 blocks on group 0
+
+
+class TestFusedSolverDtypes:
+    """Complex / integer / bool inputs raise TypeError on every backend (#85).
+
+    Through 0.13.0 the fused solvers packed everything into real float tiles:
+    complex inputs lost their imaginary part and integer / bool results were
+    truncated to b's dtype.
+    """
+
+    BAD = [torch.complex64, torch.complex128, torch.int64, torch.int32, torch.bool]
+
+    @pytest.fixture(params=["auto", "pytorch", "nki"])
+    def backend(self, request):
+        prev = trnsparse.get_backend()
+        try:
+            trnsparse.set_backend(request.param)
+        except RuntimeError as e:  # nki not installed
+            pytest.skip(str(e))
+        yield request.param
+        trnsparse.set_backend(prev)
+
+    @staticmethod
+    def _A(dtype=torch.float64):
+        return trnsparse.BSRMatrix.from_dense(_block_spd(1).to(dtype), block_size=128)
+
+    @pytest.mark.parametrize("dtype", BAD, ids=str)
+    def test_cg_b(self, backend, dtype):
+        with pytest.raises(TypeError, match="b must be a real floating-point"):
+            trnsparse.cg_bsr_fused(self._A(), torch.ones(128, dtype=dtype))
+
+    @pytest.mark.parametrize("dtype", BAD, ids=str)
+    def test_cg_x0(self, backend, dtype):
+        b = torch.ones(128, dtype=torch.float64)
+        with pytest.raises(TypeError, match="x0 must be a real floating-point"):
+            trnsparse.cg_bsr_fused(self._A(), b, x0=torch.zeros(128, dtype=dtype))
+
+    @pytest.mark.parametrize("dtype", [torch.complex128, torch.int64], ids=str)
+    def test_cg_A(self, backend, dtype):
+        b = torch.ones(128, dtype=torch.float64)
+        with pytest.raises(TypeError, match="A.blocks must be a real floating-point"):
+            trnsparse.cg_bsr_fused(self._A(dtype), b)
+        with pytest.raises(TypeError, match="A.blocks must be a real floating-point"):
+            trnsparse.prepare_cg_bsr(self._A(dtype))
+
+    @pytest.mark.parametrize("dtype", BAD, ids=str)
+    def test_power_v0(self, backend, dtype):
+        with pytest.raises(TypeError, match="v0 must be a real floating-point"):
+            trnsparse.power_iteration_bsr_fused(self._A(), v0=torch.ones(128, dtype=dtype))
+
+    @pytest.mark.parametrize("dtype", [torch.complex128, torch.int64], ids=str)
+    def test_power_A(self, backend, dtype):
+        with pytest.raises(TypeError, match="A.blocks must be a real floating-point"):
+            trnsparse.power_iteration_bsr_fused(self._A(dtype))
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float64], ids=str)
+    def test_real_float_still_runs(self, dtype):
+        A = self._A(dtype)
+        x, _, _ = trnsparse.cg_bsr_fused(A, torch.ones(128, dtype=dtype), tol=1e-6)
+        assert x.dtype == dtype
+
+
+class TestPowerIterationFused:
+    def test_matches_power_iteration_bsr(self):
+        A = _block_spd(3, seed=20)
+        bsr = trnsparse.BSRMatrix.from_dense(A, block_size=128)
+        v0 = torch.randn(
+            A.shape[0], dtype=torch.float64, generator=torch.Generator().manual_seed(21)
+        )
+        lam, v, k = trnsparse.power_iteration_bsr_fused(bsr, v0=v0, tol=1e-10, max_iter=3000)
+        lam_ref, _, k_ref = trnsparse.power_iteration_bsr(bsr, v0=v0, tol=1e-10, max_iter=3000)
+        assert abs(lam - lam_ref) < 1e-8 * abs(lam_ref) and abs(k - k_ref) <= 1
+        top = float(torch.linalg.eigvalsh(A)[-1])
+        assert abs(lam - top) < 1e-4 * top
+        assert v.dtype == torch.float64 and abs(float(torch.linalg.norm(v)) - 1) < 1e-12
+
+    def test_cap_padding_and_info(self):
+        A = _block_spd(2, n=200, seed=22)
+        bsr = trnsparse.BSRMatrix.from_dense(A, block_size=128)
+        v0 = torch.ones(200, dtype=torch.float64)
+        lam, v, k, info = trnsparse.power_iteration_bsr_fused(
+            bsr, v0=v0, tol=0.0, max_iter=7, check_every=4, return_info=True
+        )
+        assert k == 7 and v.shape == (200,) and info["path"] == "pytorch"
+        assert info["matvec"] == "column" and info["trips"] == 2
+        with pytest.raises(ValueError, match="v0"):
+            trnsparse.power_iteration_bsr_fused(bsr, v0=torch.ones(10))
+        with pytest.raises(ValueError, match="column"):
+            trnsparse.power_iteration_bsr_fused(bsr, matvec="row", precision="bf16")

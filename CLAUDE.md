@@ -22,11 +22,15 @@ trnsparse/
 │   ├── formats.py       # CSRMatrix, COOMatrix, BSRMatrix, from_dense
 │   ├── ops.py           # spmv, spmm, bsr_spmm, screened_spmm, add, scale, transpose
 │   ├── screening.py     # schwarz_bounds, screen_quartets, density_screen
-│   ├── iterative.py     # cg_bsr, power_iteration_bsr, jacobi_preconditioner_bsr
+│   ├── iterative.py     # cg_bsr, cg_bsr_fused, power_iteration_bsr(_fused), jacobi_preconditioner_bsr
+│   ├── multicore.py     # ShardedBSR, ShardedAttention (logical NeuronCores of one chip)
+│   ├── kernel_matmul.py # kernel_matmul, KernelOperator: fused K(X, Y) @ V, K never formed (#93)
 │   └── nki/
 │       ├── __init__.py
-│       ├── kernels.py   # _bsr_spmm_kernel, _screened_spmm_kernel
-│       └── dispatch.py  # torch.autograd.Function wrappers + NKI/PyTorch routing
+│       ├── kernels.py       # _bsr_spmm_kernel, _screened_spmm_kernel, attention kernels
+│       ├── dispatch.py      # dispatch-path selection, _launch, autograd.Function wrappers (XLA/CPU)
+│       ├── _native.py       # TorchNeuron nki_op custom ops + register_autograd, loaded lazily
+│       └── _native_attn.py  # trnsparse::bsr_attn / bsr_attn_bwd composite ops (native path)
 ├── tests/
 ├── examples/
 │   ├── sparse_fock.py             # Schwarz-screened Fock build (3 paths + trnblas)
@@ -34,24 +38,28 @@ trnsparse/
 │   └── block_sparse_attention.py  # Block-sparse attention via bsr_spmm
 ```
 
-## NKI compute strategy (v0.4.x current)
+## NKI compute strategy
 
 **Formats:** CSR/COO are interop and PyTorch-fallback formats.
 BSR at `block_size=128` is the NKI compute format — every nonzero block
-is already a 128×128 Tensor Engine tile, zero gather overhead.
+is already a 128×128 Tensor Engine tile, zero gather overhead. Other block
+sizes go straight to the PyTorch path (raise under `TRNSPARSE_REQUIRE_NKI`).
 
 **Dispatch hierarchy:**
-1. `spmm(csr, B)` — PyTorch `torch.sparse_csr_tensor` fallback (within
-   2× of scipy; NKI overhead not worth it for CSR at current sizes).
+1. `spmm(csr, B)` — densify-then-GEMM kernel under `nki` / `auto` with NKI;
+   `torch.sparse_csr_tensor` on the PyTorch path (within 2× of scipy).
 2. `bsr_spmm(bsr, B)` — NKI kernel `_bsr_spmm_kernel`; one `nc_matmul`
    per nonzero block. `torch.autograd.Function`-wrapped; gradcheck passes.
 3. `screened_spmm(A, diag, B, threshold)` — fused Schwarz + mask + matmul
    in one NKI dispatch; avoids 4 host passes + CSR build + separate SpMM.
-4. `block_sparse_attention(Q, K, V, mask_bsr)` — `bsr_spmm` applied to
-   the attention weight matrix; no new kernel, mask is a BSRMatrix.
+4. `block_sparse_attention_tiled(Q, K, V, mask_bsr, scale=None)` — two-pass
+   attention kernels (forward + backward) over the mask's stored blocks;
+   `seq_len` must be a multiple of the block size.
+5. `cg_bsr_fused` / `power_iteration_bsr_fused` — whole solve in one launch,
+   A SBUF-resident (#22).
 
-**Open gaps (NKI capability-gated):** row-bucketing CSR (#15), sharded BSR
-across NeuronCores (#16), fused tile-level attention scores (#25).
+**Open gaps:** row-bucketing CSR (#15, NKI capability-gated), sharding
+across chips (#16; within one chip `ShardedBSR` shipped in 0.10.0).
 
 ## Dependencies
 

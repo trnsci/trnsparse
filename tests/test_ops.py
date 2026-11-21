@@ -78,6 +78,58 @@ class TestSymmetricSpMV:
         expected = A @ x
         np.testing.assert_allclose(result.numpy(), expected.numpy(), atol=1e-6)
 
+    @staticmethod
+    def _case(store, seed=3):
+        g = torch.Generator().manual_seed(seed)
+        S = torch.randn(9, 9, generator=g, dtype=torch.float64)
+        S[torch.rand(9, 9, generator=g) > 0.5] = 0
+        S.fill_diagonal_(1.5)
+        stored = {"upper": torch.triu(S), "lower": torch.tril(S), "both": S}[store]
+        x = torch.randn(9, generator=g, dtype=torch.float64)
+        return S, stored, x
+
+    @staticmethod
+    def _sym(T):
+        return T + T.T - torch.diag(torch.diagonal(T))
+
+    @pytest.mark.parametrize("dense_branch", [False, True])
+    @pytest.mark.parametrize("uplo", ["upper", "lower"])
+    @pytest.mark.parametrize("store", ["upper", "lower", "both"])
+    def test_uplo_and_storage(self, monkeypatch, store, uplo, dense_branch):
+        """Both triangles stored: only `uplo` is referenced (#52). One triangle
+        stored: that triangle is used whatever `uplo` says, as through 0.11.0,
+        with a DeprecationWarning when `uplo` names the empty triangle."""
+        import warnings
+
+        from trnsparse import ops
+
+        if dense_branch:  # the device-operand branch, on the host
+            monkeypatch.setattr(ops, "_torch_sparse_ok", lambda A, x: False)
+        S, stored, x = self._case(store)
+        tri = uplo if store == "both" else store
+        want = 0.7 * self._sym(torch.triu(S) if tri == "upper" else torch.tril(S)) @ x
+        csr = trnsparse.from_dense(stored)
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            got = trnsparse.spmv_symmetric(csr, x, alpha=0.7, uplo=uplo)
+        torch.testing.assert_close(got, want)
+        dep = [m for m in w if issubclass(m.category, DeprecationWarning)]
+        assert bool(dep) == (store != "both" and store != uplo)
+
+    def test_diagonal_only_no_warning(self):
+        import warnings
+
+        csr = trnsparse.from_dense(torch.diag(torch.arange(1.0, 6.0)))
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            got = trnsparse.spmv_symmetric(csr, torch.ones(5), uplo="lower")
+        torch.testing.assert_close(got, torch.arange(1.0, 6.0))
+
+    def test_bad_uplo(self):
+        csr = trnsparse.from_dense(torch.eye(3))
+        with pytest.raises(ValueError):
+            trnsparse.spmv_symmetric(csr, torch.ones(3), uplo="U")
+
 
 class TestSparseAdd:
     def test_basic(self):
@@ -102,3 +154,125 @@ class TestNnzPerRow:
         csr = trnsparse.from_dense(A)
         nnz = trnsparse.nnz_per_row(csr)
         np.testing.assert_array_equal(nnz.numpy(), [2, 0, 3])
+
+
+class TestEpilogueShape:
+    """y / C must broadcast *to* the product's shape (torch.addmv / addmm rule).
+
+    Through 0.12.1 a y of shape (m, 1) turned spmv's (m,) result into (m, m)
+    without an error (#67).
+    """
+
+    def setup_method(self):
+        g = torch.Generator().manual_seed(67)
+        self.D = torch.randn(12, 10, generator=g)
+        self.A = trnsparse.from_dense(self.D)
+        self.x = torch.randn(10, generator=g)
+        self.B = torch.randn(10, 4, generator=g)
+
+    def test_spmv_rejects_enlarging_y(self):
+        with pytest.raises(ValueError, match="does not broadcast"):
+            trnsparse.spmv(self.A, self.x, y=torch.ones(12, 1), beta=1.0)
+
+    def test_spmm_rejects_enlarging_c(self):
+        with pytest.raises(ValueError, match="does not broadcast"):
+            trnsparse.spmm(self.A, self.B, C=torch.ones(1, 12, 4), beta=1.0)
+        with pytest.raises(ValueError, match="does not broadcast"):
+            trnsparse.spmm(self.A, self.x, C=torch.ones(12, 1), beta=1.0)
+
+    @pytest.mark.parametrize("yshape", [(12,), (1,), ()])
+    def test_spmv_broadcasting_y_still_works(self, yshape):
+        y = torch.full(yshape, 2.0)
+        out = trnsparse.spmv(self.A, self.x, y=y, beta=0.5)
+        torch.testing.assert_close(out, torch.addmv(y.expand(12), self.D, self.x, beta=0.5))
+
+    @pytest.mark.parametrize("cshape", [(12, 4), (12, 1), (4,), ()])
+    def test_spmm_broadcasting_c_still_works(self, cshape):
+        C = torch.full(cshape, 2.0)
+        out = trnsparse.spmm(self.A, self.B, C=C, beta=0.5)
+        torch.testing.assert_close(out, torch.addmm(C, self.D, self.B, beta=0.5))
+
+
+class TestIntegerDtypeOnDensePath:
+    """The device dense path (no torch sparse CSR) keeps an integer product's
+    dtype under the default alpha=1.0 / beta=1.0 (#79). Forced on CPU here."""
+
+    @pytest.fixture
+    def dense_path(self, monkeypatch):
+        import trnsparse.ops as ops
+
+        monkeypatch.setattr(ops, "_torch_sparse_ok", lambda *a: False)
+
+    @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+    def test_spmv_spmm_keep_int_dtype(self, dense_path, dtype):
+        g = torch.Generator().manual_seed(0)
+        Ad = torch.randint(-5, 6, (37, 29), generator=g).to(dtype)
+        Ad[torch.rand(37, 29, generator=g) < 0.7] = 0
+        A = trnsparse.from_dense(Ad)
+        x = torch.randint(-5, 6, (29,), generator=g).to(dtype)
+        B = torch.randint(-5, 6, (29, 6), generator=g).to(dtype)
+        y = torch.randint(-5, 6, (37,), generator=g).to(dtype)
+        C = torch.randint(-5, 6, (37, 6), generator=g).to(dtype)
+        for got, want in [
+            (trnsparse.spmv(A, x), Ad @ x),
+            (trnsparse.spmv(A, x, y=y, beta=1.0), Ad @ x + y),
+            (trnsparse.spmm(A, B), Ad @ B),
+            (trnsparse.spmm(A, B, C=C, beta=1.0), Ad @ B + C),
+        ]:
+            assert got.dtype == dtype
+            assert torch.equal(got, want)
+
+    def test_float_alpha_still_scales(self, dense_path):
+        Ad = torch.tensor([[1.0, 0.0], [0.0, 2.0]])
+        A = trnsparse.from_dense(Ad)
+        x = torch.tensor([3.0, 4.0])
+        y = torch.tensor([1.0, 1.0])
+        torch.testing.assert_close(
+            trnsparse.spmv(A, x, alpha=0.5, y=y, beta=-2.0), 0.5 * (Ad @ x) - 2.0 * y
+        )
+
+
+class TestSpmmVectorOnNkiPath:
+    """spmm with a 1-D B on the NKI path (#105): the GEMM takes a 2-D operand,
+    so a vector raised ValueError there while the pytorch backend returns A @ b."""
+
+    @pytest.fixture
+    def nki_on(self, monkeypatch):
+        import trnsparse.nki.dispatch as d
+
+        seen = []
+
+        def gemm_2d_only(A, B):
+            seen.append(tuple(B.shape))
+            _, N = B.shape  # what _nki_spmm_impl does; raised on a 1-D B
+            return A.to_dense().to(B.dtype) @ B
+
+        monkeypatch.setattr(d, "_use_nki", lambda: True)
+        monkeypatch.setattr(d, "nki_spmm", gemm_2d_only)
+        return seen
+
+    def test_vector_b(self, nki_on):
+        g = torch.Generator().manual_seed(0)
+        Ad = torch.randn(12, 10, generator=g) * (torch.rand(12, 10, generator=g) < 0.4)
+        A = trnsparse.from_dense(Ad)
+        b = torch.randn(10, generator=g)
+        y = trnsparse.spmm(A, b)
+        assert nki_on == [(10, 1)]
+        assert y.shape == (12,)
+        torch.testing.assert_close(y, Ad @ b)
+
+    def test_vector_b_alpha_beta(self, nki_on):
+        g = torch.Generator().manual_seed(1)
+        Ad = torch.randn(6, 6, generator=g)
+        A = trnsparse.from_dense(Ad)
+        b, c = torch.randn(6, generator=g), torch.randn(6, generator=g)
+        y = trnsparse.spmm(A, b, alpha=2.0, C=c, beta=0.5)
+        torch.testing.assert_close(y, 2.0 * (Ad @ b) + 0.5 * c)
+
+    def test_matrix_b_unchanged(self, nki_on):
+        g = torch.Generator().manual_seed(2)
+        Ad = torch.randn(5, 4, generator=g)
+        B = torch.randn(4, 3, generator=g)
+        y = trnsparse.spmm(trnsparse.from_dense(Ad), B)
+        assert nki_on == [(4, 3)]
+        torch.testing.assert_close(y, Ad @ B)
