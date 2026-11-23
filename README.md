@@ -149,6 +149,7 @@ stats = trnsparse.sparsity_stats(Q)
 | `jacobi_preconditioner_bsr` | Diagonal preconditioner for `cg_bsr` |
 | `ShardedBSR` / `ShardedAttention` | BSR SpMM / attention forward split across logical NeuronCores (`trnsparse.multicore`) |
 | `bsr_diagonal` | Extract main diagonal from BSR matrix |
+| `segment_sum` / `gather` / `segment_plan` | Graph segment sum (index-add) and row gather, each the other's backward; deterministic, int64 indices, safe above 2^24 (MLIP exemplar, #139) |
 | `block_sparse_attention_tiled` | Two-pass sparse attention, no O(seq²) intermediate, autograd; `seq_len` must be a multiple of the block size |
 | `schwarz_bounds` | Schwarz screening bounds |
 | `screen_quartets` | Shell quartet significance mask |

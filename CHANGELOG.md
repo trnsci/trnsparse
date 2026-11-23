@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`segment_sum(m, idx, N)` / `gather(h, idx)`: the graph segment sum
+  (index-add) and row gather, each registered as the other's backward
+  (#139).** This is the graph block of the MLIP exemplar
+  (trnsci/trnsci#170), with MACE's `scatter_sum` semantics. Indices are
+  int64 (or int32), sorted or not. `segment_plan(idx, N)` sorts the edges by
+  segment once on the host (stable, int64) and builds the kernel layout. Pass
+  it as `plan=` for every call over that neighbour list.
+  - pytorch backend (the reference): `index_add_` / `index_select`, bitwise
+    equal to the exemplar's reference blocks on the CPU.
+  - NKI: two new kernels, `_segment_sum_kernel` and `_gather_rows_kernel`, as
+    the `trnsparse::segment_sum_tiles` / `trnsparse::gather_rows` custom ops
+    with `register_autograd`. Each 128-row output tile is a TensorEngine
+    reduction: a 0/1 incidence tile (an iota compare) times 128 message rows
+    gathered by indirect DMA. Products accumulate in fp32 PSUM over 8-slot
+    chunks, and the chunks add in fp32 SBUF in order. No atomics and no
+    scatter-add. The order is fixed by the plan, and tiles split between the
+    physical cores with one writer each, so results are bitwise identical run
+    to run and at LNC=1 / LNC=2 (to be confirmed on the device).
+  - Index safety (aws-neuron-sdk#1466, #1467, #1468): index arithmetic stays
+    on the host in int64. The device sees int32 edge and row ids, moved by
+    DMA unconverted, and fp32 row offsets in [-1, 127]. There is no
+    flattened E·F or N·F index. Mostly empty tile ranges (such as
+    N = 2^24 + 3 with six edges) use a compact layout: only occupied tiles
+    are computed, and the rest are zero-filled.
+  - Rolled loops: the traced program does not grow with E. The CPU NEFF
+    compile takes about 4 s at the 1728-atom shape, the same as at 16 atoms.
+  - Not on the host densify path: `spmm` over an incidence matrix densifies
+    on the host and is unusable at 1728 atoms.
+  - fp64 follows the suite policy (#84). Inputs above 2^31 bytes per launch
+    take the pytorch path under `auto`.
+  - Tests:
+    - CPU (`tests/test_segment.py`): a vendored slice of the exemplar's
+      MACE-MP-0b2 capture (`tests/fixtures/mlip_graph_tiny.pt`), fp64
+      gradcheck, the plan layout emulated in torch, index values above 2^24
+      and E·F above 2^24.
+    - Native ops on CPU (`tests/test_native_dispatch.py`).
+    - Simulator (`tests/test_nki_segment_sim.py`).
+    - MLIR verify and NEFF compile for every exemplar width (trn1, trn2,
+      LNC 1 / 2).
+    - Conformance cases.
+    - Neuron (`tests/test_segment_neuron.py`): the 216- and 1728-atom
+      shapes, determinism with an LNC dump / compare, more than 2^24 edges,
+      the exemplar checker, and a timing harness against aten `index_add_`
+      / `scatter_add_` / `index_select`.
+
 ## [0.16.1] — 2026-11-10
 
 Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.

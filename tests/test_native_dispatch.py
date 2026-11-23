@@ -67,6 +67,11 @@ COMPOSITE_OPS = {"bsr_attn", "bsr_attn_bwd"}
 # Fused kernel-matrix product (#93): tensors plus static `kind` / `group` ints.
 KMV_OPS = {"kmv_self", "kmv_cross", "kmv_selfblk"}
 STATIC_OPS |= KMV_OPS
+# Graph segment sum / gather (#139): value + plan tables, static rows_out / nz,
+# each registered as the other's backward.
+SEGMENT_OPS = {"segment_sum_tiles", "gather_rows"}
+STATIC_OPS |= SEGMENT_OPS
+AUTOGRAD_OPS |= SEGMENT_OPS
 P = 128
 
 
@@ -266,6 +271,29 @@ def _ref_screened_tiles_keyed(a, q_col, q_row, thr, b, key):
     return out
 
 
+def _ref_segment_sum_kernel(m, src, local, orow, zrow, rows_out, nz):
+    """`_segment_sum_kernel` semantics in torch, on the plan's tables."""
+    K = orow.shape[0] // P
+    nc = src.shape[0] // (K * P)
+    out = torch.full((rows_out, m.shape[1]), float("nan"), dtype=m.dtype)
+    iota = torch.arange(P, dtype=torch.float32)
+    for k in range(K):
+        acc = torch.zeros(P, m.shape[1], dtype=m.dtype)
+        for c in range(nc):
+            r0 = (k * nc + c) * P
+            for j in range(src.shape[1]):
+                oh = (local[r0 : r0 + P, j : j + 1] == iota).to(m.dtype)
+                acc = acc + oh.T @ m[src[r0 : r0 + P, j].long()]
+        out[orow[k * P : (k + 1) * P, 0].long()] = acc
+    for z in range(nz):
+        out[zrow[z * P : (z + 1) * P, 0].long()] = 0.0
+    return out
+
+
+def _ref_gather_rows_kernel(h, gidx):
+    return h[gidx[:, 0].long()]
+
+
 @pytest.fixture
 def cpu_native(monkeypatch):
     """Run the native path on CPU: real custom ops backed by torch references."""
@@ -291,6 +319,8 @@ def cpu_native(monkeypatch):
         ("_bsr_spmm_t_keyed_kernel", _ref_bsr_spmm_t_keyed),
         ("_attn_fwd_keyed_kernel", _ref_attn_fwd_keyed),
         ("_screened_tiles_keyed_kernel", _ref_screened_tiles_keyed),
+        ("_segment_sum_kernel", _ref_segment_sum_kernel),
+        ("_gather_rows_kernel", _ref_gather_rows_kernel),
     ):
         # `kernels` for the op bodies; `dispatch` because the host wrappers
         # name the kernel (only imported there when nki is installed).
@@ -812,7 +842,10 @@ class TestEagerKernelTable:
         not_listed = {"kmv_self", "kmv_cross", "kmv_selfblk", "screened_tiles_keyed"}
         assert not_listed <= single
         assert set(self._table(tree)) == single - not_listed
-        assert set(names) - single == {"bsr_attn", "bsr_attn_bwd"}
+        # bsr_attn*: whole drivers. segment_sum_tiles / gather_rows (#139):
+        # their kernel takes part of the op's arguments (the op carries the
+        # other direction's tables for its backward).
+        assert set(names) - single == {"bsr_attn", "bsr_attn_bwd"} | SEGMENT_OPS
 
 
 class TestEagerCallOk:
@@ -920,6 +953,11 @@ class TestLazyRegistration:
                 assert re.search(r"(Sym)?[Ii]nt key[,)]", schema), (name, schema)
             elif name.split("::")[1] in KMV_OPS:
                 assert re.search(r"(Sym)?[Ii]nt kind, (Sym)?[Ii]nt group\)", schema), (name, schema)
+            elif name.split("::")[1] in SEGMENT_OPS:
+                assert re.search(r"(Sym)?[Ii]nt rows_out, (Sym)?[Ii]nt nz\)", schema), (
+                    name,
+                    schema,
+                )
             elif name.split("::")[1] in STATIC_OPS:
                 # list[int] infers as SymInt[] (int[] on older torch).
                 assert re.search(r"(Sym)?[Ii]nt\[\] row_ptrs, (Sym)?[Ii]nt\[\] cols", schema), (
@@ -974,6 +1012,10 @@ class TestLazyRegistration:
         # fused power iteration: T = 3, one vector
         out = fake("power_bsr_keyed")(m(P, 3 * P), m(P, 2 * 3 + 2), key, 8, 160, 1, 1, 0)
         assert out.shape == (P, 3 + 4)
+        # segment sum / gather (#139): padded rows_out, padded edge count
+        tabs = (m(512, 1), m(4 * 8 * P, 8), m(4 * 8 * P, 8), m(4 * P, 1), m(P, 1))
+        assert fake("segment_sum_tiles")(m(300, 5), *tabs, 4 * P, 0).shape == (4 * P, 5)
+        assert fake("gather_rows")(m(200, 5), *tabs, 4 * P, 0).shape == (512, 5)
 
 
 class _Ctx:
@@ -1704,3 +1746,106 @@ class TestUnsupportedBlockSize:
         Q = torch.randn(256, 16)
         with pytest.raises(NotImplementedError, match="block_size 128 only, got 64"):
             trnsparse.block_sparse_attention_tiled(Q, Q, Q, mask)
+
+
+@needs_custom_op
+class TestNativeSegmentOps:
+    """Graph segment sum / gather (#139) on the native path, on CPU: the
+    `trnsparse::segment_sum_tiles` / `gather_rows` custom ops (bodies are the
+    torch references of the kernels) and their register_autograd backwards,
+    each the other op."""
+
+    @staticmethod
+    def _graph(n, e, seed=0):
+        g = torch.Generator().manual_seed(seed)
+        return torch.randint(0, n, (e,), generator=g), g
+
+    def test_forward_and_grads(self, cpu_native, monkeypatch):
+        calls = []
+        real = dispatch._get_native_ops
+
+        def ops():
+            table = real()
+            return {k: (lambda *a, k=k, f=f: calls.append(k) or f(*a)) for k, f in table.items()}
+
+        monkeypatch.setattr(dispatch, "_get_native_ops", ops)
+        idx, g = self._graph(216, 3000, seed=1)
+        plan = trnsparse.segment_plan(idx, 216)
+        m = torch.randn(3000, 5, generator=g, requires_grad=True)
+        out = trnsparse.segment_sum(m, idx, 216, plan=plan)
+        ref = torch.zeros(216, 5).index_add(0, idx, m.detach())
+        torch.testing.assert_close(out, ref, atol=1e-5, rtol=1e-5)
+        go = torch.randn(216, 5, generator=g)
+        (gm,) = torch.autograd.grad(out, m, go)
+        assert torch.equal(gm, go[idx])
+        h = torch.randn(216, 5, generator=g, requires_grad=True)
+        out = trnsparse.gather(h, idx, plan=plan)
+        assert torch.equal(out, h.detach()[idx])
+        ge = torch.randn(3000, 5, generator=g)
+        (gh,) = torch.autograd.grad(out, h, ge)
+        torch.testing.assert_close(gh, torch.zeros(216, 5).index_add(0, idx, ge))
+        # Forward launches only; the backwards call the registered ops directly.
+        assert calls == ["segment_sum_tiles", "gather_rows"]
+
+    def test_double_backward(self, cpu_native):
+        idx, g = self._graph(20, 90, seed=2)
+        m = torch.randn(90, 3, generator=g, requires_grad=True)
+        go = torch.randn(20, 3, generator=g, requires_grad=True)
+        out = trnsparse.segment_sum(m, idx, 20)
+        (gm,) = torch.autograd.grad(out, m, go, create_graph=True)
+        w = torch.randn(90, 3, generator=g)
+        (ggo,) = torch.autograd.grad((gm * w).sum(), go)
+        torch.testing.assert_close(ggo, torch.zeros(20, 3).index_add(0, idx, w))
+
+    def test_forces_compact_layout_and_bf16(self, cpu_native):
+        # Mostly empty tiles (compact layout), bf16 values (fp32 kernel, cast back).
+        n = 128 * 20
+        g = torch.Generator().manual_seed(3)
+        snd = torch.sort(torch.randint(0, 300, (700,), generator=g)).values + 128 * 15
+        rcv = torch.randint(0, 300, (700,), generator=g) + 128 * 15
+        plan_r = trnsparse.segment_plan(rcv, n)
+        assert plan_r.compact
+        ev = torch.randn(700, 3, generator=g)
+        f = trnsparse.segment_sum(ev, snd, n) - trnsparse.segment_sum(ev, rcv, n, plan=plan_r)
+        ref = torch.zeros(n, 3).index_add(0, snd, ev) - torch.zeros(n, 3).index_add(0, rcv, ev)
+        torch.testing.assert_close(f, ref, atol=1e-5, rtol=1e-5)
+        hb = torch.randn(n, 4, generator=g).to(torch.bfloat16)
+        got = trnsparse.gather(hb, rcv, plan=plan_r)
+        assert got.dtype == torch.bfloat16 and torch.equal(got, hb[rcv])
+
+    def test_plan_tables_staged_once_per_device(self, cpu_native, monkeypatch):
+        idx, g = self._graph(50, 400, seed=4)
+        plan = trnsparse.segment_plan(idx, 50)
+        moves = []
+        real = plan.tables
+
+        def tables(device=None):
+            moves.append(device)
+            return real(device)
+
+        monkeypatch.setattr(plan, "tables", tables)
+        for _ in range(3):
+            trnsparse.segment_sum(torch.randn(400, 2, generator=g), idx, 50, plan=plan)
+        assert len(moves) == 3 and all(torch.device(d).type == "cpu" for d in moves)
+
+    def test_backward_formulas(self, cpu_native):
+        from trnsparse.nki import _native
+
+        idx, g = self._graph(30, 200, seed=5)
+        plan = trnsparse.segment_plan(idx, 30)
+        tabs = plan.tables()
+
+        class Ctx:
+            saved_tensors = tabs
+            statics = plan.statics
+            needs_input_grad = (True,) + (False,) * 7
+
+        Ctx.rows = 200
+        grad = torch.randn(plan.rows_out, 6, generator=g)
+        (gm, *rest) = _native._segment_sum_backward(Ctx, grad)
+        assert torch.equal(gm, grad[idx]) and all(r is None for r in rest)
+        Ctx.rows = 30
+        ge = torch.randn(tabs[0].shape[0], 6, generator=g)
+        ge[200:] = float("nan")  # padding rows of a gather cotangent are never read
+        (gh, *rest) = _native._gather_rows_backward(Ctx, ge)
+        torch.testing.assert_close(gh, torch.zeros(30, 6).index_add(0, idx, ge[:200]))

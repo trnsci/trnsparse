@@ -689,3 +689,109 @@ def test_cg_kernel_neff_compiles(case, lnc, tmp_path):
     )
     driver._compile_bir_to_neff(bir, opts, inputs)
     assert (tmp_path / "file.neff").stat().st_size > 0
+
+
+# ── Graph segment sum / gather (#139) ────────────────────────────────────────
+#
+# Rolled loops over tiles and chunks, indirect (vector_offset) DMA on the
+# partition axis for the message rows and the output rows. Every feature
+# width of the MLIP exemplar, the dense and the compact tile layouts, and both
+# physical cores. The plan comes from `trnsparse.segment_plan`, so the
+# layout the kernels are compiled for is the one the host builds.
+
+
+def _segment_inputs(F: int, compact: bool):
+    import torch
+
+    from trnsparse import segment_plan
+
+    g = torch.Generator().manual_seed(F)
+    N = 128 * 12 if compact else 300
+    idx = torch.randint(0, 200 if compact else N, (1200,), generator=g)
+    plan = segment_plan(idx, N)
+    assert plan.compact == compact
+    gidx, src, local, orow, zrow = (t.numpy() for t in plan.tables())
+    seg = (_f32(1200, F), src, local, orow, zrow, plan.rows_out, plan.zero_tiles)
+    return seg, (_f32(N, F), gidx)
+
+
+_SEGMENT_CASES = {
+    (kernel, f"F{F}-{'compact' if compact else 'dense'}"): (kernel, F, compact)
+    for F in (1, 3, 128, 512, 2048, 5120)
+    for compact in (False, True)
+    for kernel in ("_segment_sum_kernel", "_gather_rows_kernel")
+    if not (compact and kernel == "_gather_rows_kernel")
+}
+
+
+def _segment_case_inputs(case):
+    kernel, F, compact = _SEGMENT_CASES[case]
+    seg, gat = _segment_inputs(F, compact)
+    return seg if kernel == "_segment_sum_kernel" else gat
+
+
+@pytest.mark.parametrize("target,lnc", [("trn1", 1), ("trn2", 1), ("trn2", 2)])
+@pytest.mark.parametrize("case", sorted(_SEGMENT_CASES), ids=lambda c: f"{c[0]}-{c[1]}")
+def test_segment_kernel_mlir_verifies(case, target, lnc):
+    from trnsparse.nki import kernels
+
+    kernel = getattr(kernels, case[0])
+    result = source_to_mlir(
+        kernel, *_segment_case_inputs(case), target=target, lnc=lnc, frontend=FrontendKind.TRACER
+    )
+    result.verify()
+
+
+@pytest.mark.skipif(shutil.which("neuronx-cc") is None, reason="neuronx-cc not on PATH")
+@pytest.mark.parametrize("lnc", [1, 2])
+@pytest.mark.parametrize("case", sorted(_SEGMENT_CASES), ids=lambda c: f"{c[0]}-{c[1]}")
+def test_segment_kernel_neff_compiles(case, lnc, tmp_path):
+    """Full CPU NEFF compile (trn2): ISA validation and, at LNC=2, equal per-core control flow."""
+    try:
+        from nki.compiler import driver
+        from nki.compiler.frontend import TracerFrontend
+        from nki.compiler.ncc_driver import CompileOptions
+    except ImportError as e:
+        pytest.skip(f"nki compiler driver API not available: {e}")
+    if not hasattr(driver, "_compile_bir_to_neff"):
+        pytest.skip("nki.compiler.driver._compile_bir_to_neff not available in this nki")
+
+    from trnsparse.nki import kernels
+
+    kernel = getattr(kernels, case[0])
+    fn = getattr(kernel, "func", kernel)
+    inputs = dict(zip(inspect.signature(fn).parameters, _segment_case_inputs(case), strict=True))
+    opts = CompileOptions(
+        target="trn2",
+        lnc=lnc,
+        artifacts_dir=str(tmp_path),
+        output_path=str(tmp_path / "file.neff"),
+    )
+    bir = driver.compile_to_bir(
+        fn, frontend=TracerFrontend(), inputs=inputs, compile_opts=opts, enable_cache=False
+    )
+    driver._compile_bir_to_neff(bir, opts, inputs)
+    assert (tmp_path / "file.neff").stat().st_size > 0
+
+
+def test_segment_kernel_trace_does_not_grow_with_edges():
+    # The tile and chunk loops are rolled (nl.fori_loop): the traced program
+    # is the same size from 300 to 6912 atoms (once a tile has more than one
+    # chunk), so compile time does not grow with E (unlike a compiled-in
+    # index, trnsci/trnsolver#87).
+    import torch
+
+    from trnsparse import segment_plan
+    from trnsparse.nki import kernels
+
+    sizes = []
+    for n, e in ((300, 6000), (1728, 96278), (6912, 385112)):
+        idx = torch.randint(0, n, (e,), generator=torch.Generator().manual_seed(n))
+        plan = segment_plan(idx, n)
+        _, src, local, orow, zrow = (t.numpy() for t in plan.tables())
+        args = (_f32(e, 3), src, local, orow, zrow, plan.rows_out, plan.zero_tiles)
+        r = source_to_mlir(
+            kernels._segment_sum_kernel, *args, target="trn2", frontend=FrontendKind.TRACER
+        )
+        sizes.append(len(str(r.module)))
+    assert max(sizes) < 1.1 * min(sizes), sizes
