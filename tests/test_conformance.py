@@ -1617,6 +1617,7 @@ def test_public_api_covered():
         "chebyshev_bsr", "chebyshev_coeffs", "richardson_bsr", "power_iteration_bsr",
         "power_iteration_bsr_fused", "jacobi_preconditioner_bsr", "bsr_diagonal", "HAS_NKI", "set_backend",
         "get_backend", "kernel_matmul", "kernel_matmul_reference", "KernelOperator", "KERNELS",
+        "segment_sum", "gather", "segment_plan", "SegmentPlan",
     }  # fmt: skip
     assert set(ts.__all__) == covered
 
@@ -1663,3 +1664,80 @@ def test_kernel_operator_conformance_and_determinism():
         torch.float32,
         tol=2e-5,
     )
+
+
+# ── Graph segment sum / gather (#139) ────────────────────────────────────────
+# Reference: the dense 0/1 incidence product in float64 (independent of
+# index_add). Indices go to the run's device, as a neighbour list would.
+
+
+def _incidence_ref(m, idx, n):
+    A = torch.zeros(n, idx.numel(), dtype=torch.float64)
+    A[idx, torch.arange(idx.numel())] = 1.0
+    return A @ m.to(torch.float64).reshape(idx.numel(), -1)
+
+
+@pytest.mark.parametrize("F", [1, 3, 128, 512, 2048, 5120])
+@pytest.mark.parametrize("order", ["sorted", "unsorted"])
+def test_segment_sum_gather_conformance(F, order):
+    g = torch.Generator().manual_seed(F)
+    n, e = 216, 1500
+    idx = torch.randint(0, n, (e,), generator=g)
+    if order == "sorted":
+        idx = torch.sort(idx).values
+    m = rand_vec((e, F), torch.float32, F)
+    got = ts.segment_sum(D(m), D(idx), n)
+    assert got.device == D(m).device and got.dtype == torch.float32
+    assert_close(got, _incidence_ref(m, idx, n), torch.float32, tol=2e-5)
+    assert torch.equal(H(got), H(ts.segment_sum(D(m), D(idx), n)))  # bitwise rerun
+    h = rand_vec((n, F), torch.float32, F + 1)
+    out = ts.gather(D(h), D(idx))
+    assert out.device == D(h).device and torch.equal(H(out), h[idx])
+
+
+def test_segment_sum_gather_grads_conformance():
+    g = torch.Generator().manual_seed(5)
+    n, e = 64, 2156  # the Cu(111) slab's shape
+    idx = torch.randint(0, n, (e,), generator=g)
+    plan = ts.segment_plan(idx, n)
+    m = D(rand_vec((e, 16), torch.float32, 6)).requires_grad_(True)
+    go = rand_vec((n, 16), torch.float32, 7)
+    (gm,) = torch.autograd.grad(ts.segment_sum(m, D(idx), n, plan=plan), m, D(go))
+    assert torch.equal(H(gm), go[idx])
+    h = D(rand_vec((n, 16), torch.float32, 8)).requires_grad_(True)
+    ge = rand_vec((e, 16), torch.float32, 9)
+    (gh,) = torch.autograd.grad(ts.gather(h, D(idx), plan=plan), h, D(ge))
+    assert_close(gh, _incidence_ref(ge, idx, n), torch.float32, tol=2e-5)
+
+
+def test_segment_sum_edge_cases_conformance():
+    # Empty rows, zero edges, one heavy row, a value dtype per policy.
+    g = torch.Generator().manual_seed(9)
+    idx = torch.randint(1, 30, (200,), generator=g)
+    idx[idx == 5] = 6
+    m = rand_vec((200, 64), torch.float32, 10)
+    out = ts.segment_sum(D(m), D(idx), 31)
+    assert_close(out, _incidence_ref(m, idx, 31), torch.float32, tol=2e-5)
+    assert H(out)[[0, 5, 30]].abs().max() == 0
+    z = ts.segment_sum(D(torch.zeros(0, 64)), D(torch.zeros(0, dtype=torch.long)), 7)
+    assert tuple(z.shape) == (7, 64) and H(z).abs().max() == 0
+    heavy = rand_vec((4096, 64), torch.float32, 11)
+    one = torch.zeros(4096, dtype=torch.long)
+    assert_close(ts.segment_sum(D(heavy), D(one), 3), _incidence_ref(heavy, one, 3), torch.float32)
+    for dt in (torch.float64, torch.bfloat16):
+        v = rand_vec((200, 8), dt, 12)
+        got = ts.segment_sum(D(v), D(idx), 31)
+        assert got.dtype == dt
+        assert_close(got, _incidence_ref(v, idx, 31), dt)
+
+
+def test_segment_sum_gather_gradcheck_fp64():
+    if on_device():
+        pytest.skip("fp64 gradcheck runs on the host (host-only placement)")
+    g = torch.Generator().manual_seed(13)
+    idx = torch.randint(0, 7, (25,), generator=g)
+    m = torch.randn(25, 3, dtype=torch.float64, generator=g, requires_grad=True)
+    h = torch.randn(7, 3, dtype=torch.float64, generator=g, requires_grad=True)
+    assert gradcheck(lambda x: ts.segment_sum(x, idx, 7), (m,))
+    assert gradgradcheck(lambda x: ts.segment_sum(x, idx, 7), (m,))
+    assert gradcheck(lambda x: ts.gather(x, idx), (h,))

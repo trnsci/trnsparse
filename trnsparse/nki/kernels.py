@@ -3054,3 +3054,276 @@ if HAS_NKI:
         row-blocked square product is bit-identical to the one-launch one.
         """
         return _kmv_body(x, y, v, params, int(kind), int(group), False, vn)
+
+
+# ── Graph segment sum / gather (#139) ─────────────────────────────────────────
+#
+# The MLIP exemplar's (trnsci/trnsci#170) graph block: `gather(h, idx)`, out[e]
+# = h[idx[e]], and `segment_sum(m, idx, N)`, out[i] = sum of m[e] over the
+# edges e with idx[e] == i. Each is the other's backward.
+#
+# Segment sum is a TensorEngine reduction, with no atomics and no scatter-add.
+# The host plan (`trnsparse.segment.SegmentPlan`, once per neighbour list)
+# sorts the edges by segment (stable) and cuts the segments into tiles of 128
+# rows. A tile's edges fill `S` slots of 128 edges each (padding at the end).
+# For each slot the kernel gathers the slot's 128 message rows by edge id (an
+# indirect DMA on the partition axis) and builds the 0/1 incidence tile
+# onehot[p, i] = (local[p] == i) from an iota on the GpSimd engine. Then
+#
+#     out_tile[i, f] += sum_p onehot[p, i] * m[edge(p), f]
+#
+# is one `nc_matmul` per 512 columns, accumulated in fp32 PSUM over the 8
+# slots of a chunk. Each chunk's PSUM partial is added to an fp32 SBUF running
+# sum, in chunk order. Every operation's order is fixed by the plan, so a
+# rerun is bitwise identical. Output tiles are split between the physical
+# cores in contiguous, equal ranges (one writer per tile, the same
+# instructions per tile on either core), so LNC=1 and LNC=2 give the same
+# bits.
+#
+# Index safety (aws-neuron-sdk#1466, #1467, #1468): no index is computed on the
+# device and none passes through fp32. The device sees int32 edge ids
+# (< E) and int32 output-row ids (< rows_out), moved by DMA without any
+# conversion, and fp32 local offsets in [-1, 127], which are exact. A DMA
+# descriptor adds row index x row stride in integer arithmetic. No flattened
+# E*F or N*F index exists anywhere. Every index the kernels hand the DMA
+# is a valid row, so the result never depends on out-of-bounds handling.
+# Padding slots point at a real edge of the same tile with local = -1. They
+# add exactly 0 * m = 0 (a non-finite message turns its whole 128-row tile
+# NaN, since 0 * inf = NaN; the pytorch path keeps IEEE per-row semantics).
+
+_SEG_P = 128  # rows per output tile = edges per slot = partitions
+_SEG_CHUNK = 8  # slots per rolled-loop body (PSUM partial, then one SBUF add)
+_SEG_GROUP = 2048  # output columns per pass over a tile's slots (4 PSUM banks)
+_SEG_PSUM_N = 512  # fp32 columns per PSUM bank (moving free size)
+_SEG_PROGRAMS = 2  # tile and zero-tile counts are padded to a multiple of this
+_GATHER_GROUP = 4096  # columns per gather DMA (16 KiB per partition in fp32)
+_GATHER_SBUF_BYTES = 64 * 1024  # live gather row buffers per partition, at most
+_GATHER_LEVELS = (32, 16, 8, 4, 2, 1)  # 128-edge index columns per gather block
+
+
+def _gather_split(ep: int) -> tuple[tuple[int, int, int], ...]:
+    """Gather blocks over `ep` padded edges: ((t0, M, nb), ...) per level.
+
+    Level M holds nb blocks of M x 128 edges from tile t0 on, nb a multiple of
+    `_SEG_PROGRAMS` (so the cores run equal trip counts). Levels take the
+    largest M first; ep is a multiple of 128 * `_SEG_PROGRAMS`, so the M = 1
+    level always finishes it, and each level below 32 has at most one block
+    per core. Shared by the kernel and the host layout
+    (`trnsparse.segment._gather_layout`)."""
+    rest, t0, out = ep // _SEG_P, 0, []
+    for M in _GATHER_LEVELS:
+        nb = rest // (M * _SEG_PROGRAMS) * _SEG_PROGRAMS
+        if nb:
+            out.append((t0, M, nb))
+            t0 += nb * M
+            rest -= nb * M
+    assert rest == 0, (ep, rest)
+    return tuple(out)
+
+
+if HAS_NKI:
+
+    def _seg_split(count: int, n_prog: int, pid: int):
+        """(lo, hi) of program `pid`'s contiguous share of `count` units.
+
+        The host pads `count` to a multiple of `_SEG_PROGRAMS`, so at LNC=1
+        and LNC=2 every core runs the same trip count (the same control
+        flow, which LNC=2 requires)."""
+        per = count // n_prog
+        return pid * per, (pid + 1) * per
+
+    @nki.jit
+    def _segment_sum_kernel(m, src, local, orow, zrow, rows_out, nz):
+        """out[orow[k, p]] = sum over slots of the incidence-weighted message rows.
+
+        Shapes:
+            m:      (E, F)          fp32 messages, edge order as given
+            src:    (K * NC * 128, 8)  int32 edge id of slot s = c * 8 + j of
+                                    tile k, partition p: row (k * NC + c) * 128 + p,
+                                    column j (NC chunks of 8 slots per tile)
+            local:  (K * NC * 128, 8)  fp32 segment row within tile k, -1 = pad
+            orow:   (K * 128, 1)    int32 output row of partition p of tile k
+            zrow:   (max(nz, 1) * 128, 1)  int32 output rows of the zero tiles
+            rows_out, nz: static ints (output rows, zero tiles)
+        Returns:
+            out:    (rows_out, F)   fp32; every row is written exactly once
+
+        K and nz are multiples of `_SEG_PROGRAMS`. See the section comment
+        for the summation order.
+        """
+        E, F = m.shape
+        K = orow.shape[0] // _SEG_P
+        n_chunks = src.shape[0] // (K * _SEG_P)
+        nz = int(nz)
+        n_prog, pid = _program_split()
+        out = nl.ndarray((int(rows_out), F), dtype=nl.float32, buffer=nl.shared_hbm)
+
+        io = nl.ndarray((_SEG_P, _SEG_P), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.iota(io, [[1, _SEG_P]], offset=0, channel_multiplier=0)
+
+        def chunk(k, c, g0, gw, acc, init):
+            # Slots c * CHUNK .. + CHUNK of tile k, columns g0 .. g0 + gw.
+            r0 = (k * n_chunks + c) * _SEG_P
+            ix = nl.ndarray((_SEG_P, _SEG_CHUNK), dtype=nl.int32, buffer=nl.sbuf)
+            nisa.dma_copy(dst=ix, src=src[nl.ds(r0, _SEG_P), 0:_SEG_CHUNK])
+            lc = nl.ndarray((_SEG_P, _SEG_CHUNK), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.dma_copy(dst=lc, src=local[nl.ds(r0, _SEG_P), 0:_SEG_CHUNK])
+            cols = [(f0, min(_SEG_PSUM_N, gw - f0)) for f0 in range(0, gw, _SEG_PSUM_N)]
+            ps = [
+                nl.ndarray((_SEG_P, _SEG_PSUM_N), dtype=nl.float32, buffer=nl.psum)[:, 0:w]
+                for _, w in cols
+            ]
+            for j in range(_SEG_CHUNK):
+                rows = nl.ndarray((_SEG_P, gw), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.dma_copy(
+                    dst=rows,
+                    src=m.ap(
+                        pattern=[[F, _SEG_P], [1, gw]],
+                        offset=g0,
+                        vector_offset=ix[:, j : j + 1],
+                        indirect_dim=0,
+                    ),
+                )
+                oh = nl.ndarray((_SEG_P, _SEG_P), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.tensor_scalar(dst=oh, data=io, op0=nl.equal, operand0=lc[:, j : j + 1])
+                for t, (f0, w) in enumerate(cols):
+                    nisa.nc_matmul(
+                        ps[t], stationary=oh, moving=rows[:, f0 : f0 + w], accumulate=j > 0
+                    )
+            for t, (f0, w) in enumerate(cols):
+                if init:
+                    nisa.tensor_copy(dst=acc[:, f0 : f0 + w], src=ps[t])
+                else:
+                    nisa.tensor_tensor(
+                        dst=acc[:, f0 : f0 + w], data1=acc[:, f0 : f0 + w], data2=ps[t], op=nl.add
+                    )
+
+        def tile(k):
+            orw = nl.ndarray((_SEG_P, 1), dtype=nl.int32, buffer=nl.sbuf)
+            nisa.dma_copy(dst=orw, src=orow[nl.ds(k * _SEG_P, _SEG_P), 0:1])
+            for g0 in range(0, F, _SEG_GROUP):
+                gw = min(_SEG_GROUP, F - g0)
+
+                def group(_, g0=g0, gw=gw):
+                    acc = nl.ndarray((_SEG_P, gw), dtype=nl.float32, buffer=nl.sbuf)
+                    # Chunk 0 opens the running sum; the rest add to it, in order.
+                    nl.fori_loop(0, 1, lambda _: chunk(k, 0, g0, gw, acc, True))
+                    if n_chunks > 1:
+                        nl.fori_loop(1, n_chunks, lambda c: chunk(k, c, g0, gw, acc, False))
+                    nisa.dma_copy(
+                        dst=out.ap(
+                            pattern=[[F, _SEG_P], [1, gw]],
+                            offset=g0,
+                            vector_offset=orw,
+                            indirect_dim=0,
+                        ),
+                        src=acc,
+                    )
+
+                nl.fori_loop(0, 1, group)
+
+        k_lo, k_hi = _seg_split(K, n_prog, pid)
+        nl.fori_loop(k_lo, k_hi, tile)
+
+        if nz:
+
+            def zero_tile(z):
+                zrw = nl.ndarray((_SEG_P, 1), dtype=nl.int32, buffer=nl.sbuf)
+                nisa.dma_copy(dst=zrw, src=zrow[nl.ds(z * _SEG_P, _SEG_P), 0:1])
+                for g0 in range(0, F, _SEG_GROUP):
+                    gw = min(_SEG_GROUP, F - g0)
+                    zt = nl.ndarray((_SEG_P, gw), dtype=nl.float32, buffer=nl.sbuf)
+                    nisa.memset(zt, 0.0)
+                    nisa.dma_copy(
+                        dst=out.ap(
+                            pattern=[[F, _SEG_P], [1, gw]],
+                            offset=g0,
+                            vector_offset=zrw,
+                            indirect_dim=0,
+                        ),
+                        src=zt,
+                    )
+
+            z_lo, z_hi = _seg_split(nz, n_prog, pid)
+            nl.fori_loop(z_lo, z_hi, zero_tile)
+        return out
+
+    @nki.jit
+    def _gather_rows_kernel(h, gidx):
+        """out[e] = h[gidx[e]]: batched indirect DMAs of up to 32 x 128 rows.
+
+        Shapes:
+            h:     (N, F)     fp32
+            gidx:  (Ep, 1)    int32 row ids in the plan's gather layout (see
+                              `trnsparse.segment._gather_layout`): Ep a multiple
+                              of 128 * `_SEG_PROGRAMS`, padding entries 0 (a
+                              valid row). Each block of M x 128 edges (levels
+                              from `_gather_split`) is stored so that its
+                              (128, M) index tile, read column-major, is the
+                              block's edges in order.
+        Returns:
+            out:   (Ep, F)    fp32, in edge order
+
+        A block is one (128, M) index load, then M / mk DMAs that each gather
+        mk x 128 rows (a 2-D `vector_offset`: DMA batching) into SBUF,
+        partition p holding mk consecutive edges, and one contiguous store
+        each. mk is the largest power of two up to M with mk * F fp32 values
+        in `_GATHER_SBUF_BYTES`. One 128-row DMA per tile costs about 7 us on
+        trn2 (descriptor generation bound); a batched DMA moves 4096 rows in
+        about the same time (#140).
+        """
+        N, F = h.shape
+        Ep = gidx.shape[0]
+        n_prog, pid = _program_split()
+        out = nl.ndarray((Ep, F), dtype=h.dtype, buffer=nl.shared_hbm)
+        mk_f = 1
+        while 2 * mk_f * F * 4 <= _GATHER_SBUF_BYTES and mk_f < _GATHER_LEVELS[0]:
+            mk_f *= 2
+
+        def level(t0, M, nb):
+            mk = min(M, mk_f)
+            gv = gidx.reshape((Ep // M, M))
+            ov = out.reshape((Ep // mk, mk * F))
+
+            def block(b):
+                ixb = nl.ndarray((_SEG_P, M), dtype=nl.int32, buffer=nl.sbuf)
+                nisa.dma_copy(dst=ixb, src=gv[nl.ds((t0 // M + b) * _SEG_P, _SEG_P), 0:M])
+                for j0 in range(0, M, mk):
+                    # Edges (t0 + b*M + j0) * 128 + p*mk + m land in rows[p, m*F:(m+1)*F].
+                    t = t0 + b * M + j0
+                    if mk > 1:
+                        rows = nl.ndarray((_SEG_P, mk * F), dtype=h.dtype, buffer=nl.sbuf)
+                        nisa.dma_copy(
+                            dst=rows,
+                            src=h.ap(
+                                pattern=[[F, _SEG_P * mk], [1, F]],
+                                offset=0,
+                                vector_offset=ixb[:, j0 : j0 + mk],
+                                indirect_dim=0,
+                            ),
+                        )
+                        nisa.dma_copy(
+                            dst=ov[nl.ds(t * (_SEG_P // mk), _SEG_P), 0 : mk * F], src=rows
+                        )
+                        continue
+                    # Rows too wide to batch: one 128-row DMA per column group.
+                    for g0 in range(0, F, _GATHER_GROUP):
+                        gw = min(_GATHER_GROUP, F - g0)
+                        rows = nl.ndarray((_SEG_P, gw), dtype=h.dtype, buffer=nl.sbuf)
+                        nisa.dma_copy(
+                            dst=rows,
+                            src=h.ap(
+                                pattern=[[F, _SEG_P], [1, gw]],
+                                offset=g0,
+                                vector_offset=ixb[:, j0 : j0 + 1],
+                                indirect_dim=0,
+                            ),
+                        )
+                        nisa.dma_copy(dst=out[nl.ds(t * _SEG_P, _SEG_P), g0 : g0 + gw], src=rows)
+
+            b_lo, b_hi = _seg_split(nb, n_prog, pid)
+            nl.fori_loop(b_lo, b_hi, block)
+
+        for t0, M, nb in _gather_split(Ep):
+            level(t0, M, nb)
+        return out

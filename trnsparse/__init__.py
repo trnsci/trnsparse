@@ -36,6 +36,7 @@ from .ops import (
     spmv_symmetric,
 )
 from .screening import density_screen, schwarz_bounds, screen_quartets, sparsity_stats
+from .segment import SegmentPlan, gather, segment_plan, segment_sum
 
 __all__ = [
     "CSRMatrix",
@@ -73,6 +74,10 @@ __all__ = [
     "kernel_matmul_reference",
     "KernelOperator",
     "KERNELS",
+    "segment_sum",
+    "gather",
+    "segment_plan",
+    "SegmentPlan",
     "HAS_NKI",
     "set_backend",
     "get_backend",

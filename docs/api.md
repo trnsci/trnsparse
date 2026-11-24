@@ -46,6 +46,32 @@
 `jacobi_preconditioner_bsr`, `bsr_diagonal`. See
 [Iterative solvers](iterative_solvers.md).
 
+## Graph segment sum and gather (`segment_sum`, `gather`, #139)
+
+The graph block of a message-passing interatomic potential (the MLIP
+exemplar, trnsci/trnsci#170), with MACE's `scatter_sum` semantics.
+
+- `segment_sum(m, idx, num_segments, *, plan=None)` — `out[i] = Σ m[e]` over
+  the edges with `idx[e] == i`; rows with no edge are 0. `m` is `[E, ...]`,
+  `idx` is `[E]` int64 / int32, sorted or not. Backward: `gather`.
+- `gather(h, idx, *, plan=None)` — `out[e] = h[idx[e]]`. Backward:
+  `segment_sum`.
+- `segment_plan(idx, num_segments)` → `SegmentPlan` — sorts the edges by
+  segment once on the host (stable, int64) and builds the kernel's tile
+  layout. Build one per neighbour list (senders and receivers each) and pass
+  it as `plan=`; `.to(device)` stages its tables.
+
+Backends: `pytorch` is the reference (`index_add_` / `index_select`;
+deterministic on the CPU). On NKI, the `trnsparse::segment_sum_tiles` and
+`trnsparse::gather_rows` ops (each registered as the other's backward)
+reduce each 128-row tile on the TensorEngine: a 0/1 incidence tile times
+128 gathered message rows per `nc_matmul`, fp32 PSUM accumulation, in an
+order fixed by the plan. Results are bitwise identical run to run and at
+LNC=1 and LNC=2. No index is computed on the device or passes through fp32,
+and there is no flattened `E·F` / `N·F` index (aws-neuron-sdk#1466, #1467,
+#1468). fp64 follows the suite policy (host torch under `auto`). See the
+`trnsparse.segment` module docstring for the summation order and limits.
+
 ## Kernel-matrix products (`kernel_matmul`, #93)
 
 `K(X, Y) @ V` without forming `K`, for stationary kernels of the distance:

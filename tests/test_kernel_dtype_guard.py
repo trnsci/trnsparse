@@ -45,6 +45,7 @@ MM = {torch.float32, torch.bfloat16}
 MM16 = MM | {torch.float16}
 ANYF = MM16 | {torch.float64}
 IDX = {torch.int32, torch.int64}
+I32 = {torch.int32}
 
 # What each kernel takes, per tensor operand (non-tensor arguments skipped).
 KERNEL_TAKES = {
@@ -68,6 +69,15 @@ KERNEL_TAKES = {
     "kmv_self": (F32,) * 3,
     "kmv_cross": (F32,) * 4,
     "kmv_selfblk": (F32,) * 5,
+    # Graph segment sum / gather (#139): values, then the plan tables.
+    "segment_sum_tiles": (F32, I32, I32, F32, I32, I32),
+    "gather_rows": (F32, I32, I32, F32, I32, I32),
+}
+# The kernels behind those two ops take part of the op's operands (the XLA
+# path calls them directly).
+SEGMENT_KERNEL_TAKES = {
+    "_segment_sum_kernel": ("segment_sum_tiles", (F32, I32, F32, I32, I32)),
+    "_gather_rows_kernel": ("gather_rows", (F32, I32)),
 }
 # Composite ops (not kernels; each inner launch is checked by its own stub).
 COMPOSITE = {"bsr_attn", "bsr_attn_bwd"}
@@ -122,6 +132,25 @@ class _StubOp:
 
     def register_autograd(self, *a, **k):
         pass
+
+
+class _SegmentKernelStub:
+    """An XLA-path segment kernel: checks its own operands, returns the op's fake."""
+
+    def __init__(self, name, takes, log):
+        self.name, self.takes, self.log = name, takes, log
+
+    def __call__(self, *args):
+        dts = [a.dtype for a in args if isinstance(a, torch.Tensor)]
+        self.log.calls.append((self.name, tuple(dts)))
+        if len(dts) != len(self.takes) or any(
+            d not in ok for d, ok in zip(dts, self.takes, strict=False)
+        ):
+            self.log.violations.append((self.name, dts))
+        x = args[0]
+        if self.name == "segment_sum_tiles":
+            return torch.ones(int(args[5]), x.shape[1], dtype=x.dtype)
+        return torch.ones(args[1].shape[0], x.shape[1], dtype=x.dtype)
 
 
 def _stub_torch_neuronx(log):
@@ -203,6 +232,9 @@ def _install_stubs(monkeypatch, path, backend, require):
 
     for name in ("kmv_self", "kmv_cross", "kmv_selfblk"):
         monkeypatch.setattr(_kernels, f"_{name}_kernel", _native.OPS[name], raising=False)
+    # `nki_segment_op` (#139) names its kernels in `nki.kernels` on the XLA path.
+    for attr, (name, takes) in SEGMENT_KERNEL_TAKES.items():
+        monkeypatch.setattr(_kernels, attr, _SegmentKernelStub(name, takes, log), raising=False)
     if path == "xla":
         monkeypatch.setattr(dispatch, "_dispatch_path", "xla")
         monkeypatch.setattr(dispatch, "_to_xla", lambda *t: (list(t), t[0].device))
@@ -314,6 +346,15 @@ def _case(api, dtype):
             return lambda: trnsparse.kernel_matmul(X, None, V, noise=0.1)
         Y = _rnd((30, 3), pdt, g)
         return lambda: trnsparse.kernel_matmul(Y, X, V)
+    if api in ("segment_sum", "gather"):
+        # (Gradients are covered by test_native_dispatch.py: the stub ops here
+        # do not register autograd.)
+        idx = torch.randint(0, 20, (60,), generator=g)
+        if api == "gather":
+            h = _rnd((20, 5), dtype, g)
+            return lambda: trnsparse.gather(h, idx)
+        m = _rnd((60, 5), dtype, g)
+        return lambda: trnsparse.segment_sum(m, idx, 20)
     raise AssertionError(api)
 
 
@@ -322,6 +363,7 @@ def _case(api, dtype):
 # state on every backend (see the needs-decision issue in the PR).
 ROUTED_APIS = {"spmm", "spmm_f32_rhs", "bsr_spmm", "screened_spmm", "attention", "attention_grad"}
 ROUTED_APIS |= {"kernel_matmul", "kernel_matmul_cross"}
+ROUTED_APIS |= {"segment_sum", "gather"}
 APIS = sorted(ROUTED_APIS | {"cg_bsr", "cg_bsr_fused", "power_fused"})
 
 
@@ -734,6 +776,11 @@ def _device_case(api, dtype):
     if api == "kernel_matmul":
         X, V = _rnd((40, 3), dtype, g), _rnd((40, 2), dtype, g)
         return (lambda X, V: trnsparse.kernel_matmul(X, None, V, noise=0.1)), (X, V)
+    if api in ("segment_sum", "gather"):
+        idx = torch.randint(0, 20, (60,), generator=g)
+        if api == "gather":
+            return (lambda h, i: trnsparse.gather(h, i)), (_rnd((20, 5), dtype, g), idx)
+        return (lambda m, i: trnsparse.segment_sum(m, i, 20)), (_rnd((60, 5), dtype, g), idx)
     raise AssertionError(api)
 
 
@@ -751,6 +798,8 @@ DEVICE_APIS = [
     "power_iteration_bsr",
     "jacobi_preconditioner_bsr",
     "kernel_matmul",
+    "segment_sum",
+    "gather",
 ]
 DEVICE_CASES = [(a, torch.float64) for a in DEVICE_APIS] + [
     (a, torch.complex128) for a in ("spmv", "spmm", "bsr_spmm", "cg_bsr")

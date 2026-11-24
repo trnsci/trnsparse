@@ -16,6 +16,8 @@ also holds under `torch.compile`:
 - `trnsparse::bsr_spmm`      C[m] = Σ_k A[m,k] B[m,k]  (per k-slot adjoints)
 - `trnsparse::screened_spmm` C = (A ⊙ mask) @ B   dA = (dC Bᵀ) ⊙ mask, dB = (A ⊙ mask)ᵀ dC
   (no gradient to the Schwarz bounds or the threshold: the mask is discrete)
+- `trnsparse::segment_sum_tiles` / `trnsparse::gather_rows` (#139): each the
+  other's backward (no gradient to the plan's index tables)
 
 Gradients reach `CSRMatrix.values`, `BSRMatrix.blocks` and the dense
 operands through the (differentiable) host-side densify / pad / gather.
@@ -550,6 +552,84 @@ def kmv_selfblk(
     return _k._kmv_selfblk_kernel(x, y, v, vn, params, int(kind), int(group))
 
 
+# Graph segment sum / gather (#139). Both ops take the value tensor plus the
+# whole plan table set (gidx, src, local, orow, zrow) and the plan's static
+# (rows_out, nz), so each one's backward can launch the other:
+#
+# - `trnsparse::segment_sum_tiles`  out = segsum(m)   dm = gather_rows(dout)[:E]
+# - `trnsparse::gather_rows`        out = gather(h)   dh = segment_sum_tiles(dout)[:N]
+#
+# Outputs are padded (rows_out rows, the padded edge count); the wrappers in
+# `trnsparse.segment` slice them, and the slice's backward pads the
+# cotangent with zeros. Padding rows of a gather cotangent are never read
+# (the sum reads edges < E only).
+
+
+def _fake_segment_sum(m, gidx, src, local, orow, zrow, rows_out, nz):
+    return m.new_empty((rows_out, m.shape[1]))
+
+
+@nki_op("trnsparse::segment_sum_tiles", mutates_args={}, fake_fn=_fake_segment_sum)
+def segment_sum_tiles(
+    m: torch.Tensor,
+    gidx: torch.Tensor,
+    src: torch.Tensor,
+    local: torch.Tensor,
+    orow: torch.Tensor,
+    zrow: torch.Tensor,
+    rows_out: int,
+    nz: int,
+) -> torch.Tensor:
+    return _k._segment_sum_kernel(m, src, local, orow, zrow, int(rows_out), int(nz))
+
+
+def _fake_gather_rows(h, gidx, src, local, orow, zrow, rows_out, nz):
+    return h.new_empty((gidx.shape[0], h.shape[1]))
+
+
+@nki_op("trnsparse::gather_rows", mutates_args={}, fake_fn=_fake_gather_rows)
+def gather_rows(
+    h: torch.Tensor,
+    gidx: torch.Tensor,
+    src: torch.Tensor,
+    local: torch.Tensor,
+    orow: torch.Tensor,
+    zrow: torch.Tensor,
+    rows_out: int,
+    nz: int,
+) -> torch.Tensor:
+    return _k._gather_rows_kernel(h, gidx)
+
+
+def _save_segment(ctx, inputs, output):
+    x, *tables, rows_out, nz = inputs
+    ctx.save_for_backward(*tables)
+    ctx.statics = (rows_out, nz)
+    ctx.rows = x.shape[0]
+
+
+def _segment_sum_backward(ctx, grad):
+    # d m[e] = dout[idx[e]]: the gather over the same plan.
+    tables = ctx.saved_tensors
+    grad_m = None
+    if ctx.needs_input_grad[0]:
+        grad_m = gather_rows(grad.contiguous(), *tables, *ctx.statics)[: ctx.rows]
+    return grad_m, None, None, None, None, None, None, None
+
+
+def _gather_rows_backward(ctx, grad):
+    # d h[i] = sum of dout[e] over idx[e] == i: the segment sum over the same plan.
+    tables = ctx.saved_tensors
+    grad_h = None
+    if ctx.needs_input_grad[0]:
+        grad_h = segment_sum_tiles(grad.contiguous(), *tables, *ctx.statics)[: ctx.rows]
+    return grad_h, None, None, None, None, None, None, None
+
+
+segment_sum_tiles.register_autograd(_segment_sum_backward, setup_context=_save_segment)
+gather_rows.register_autograd(_gather_rows_backward, setup_context=_save_segment)
+
+
 # Composite attention ops (forward/backward over Q, K, V with host mask
 # structure). Registered once per process; see `_native_attn.py`.
 from . import _native_attn  # noqa: E402
@@ -565,7 +645,8 @@ from . import _native_attn  # noqa: E402
 # `kmv_selfblk`, whose launches (`dispatch._kmv_launch`) take a handle from the
 # same cache keyed by operand shapes, and `screened_tiles_keyed` (#61), which
 # `dispatch` still calls through the custom op (its handle path has not been
-# validated on the device yet).
+# validated on the device yet). `segment_sum_tiles` / `gather_rows` (#139) pass
+# their kernel part of their arguments, and always run as the custom op.
 KERNELS = {
     "spmm_dense": (_k, "_spmm_dense_kernel"),
     "bsr_spmm": (_k, "_bsr_spmm_kernel"),
@@ -635,4 +716,6 @@ OPS = {
     "kmv_self": kmv_self,
     "kmv_cross": kmv_cross,
     "kmv_selfblk": kmv_selfblk,
+    "segment_sum_tiles": segment_sum_tiles,
+    "gather_rows": gather_rows,
 }

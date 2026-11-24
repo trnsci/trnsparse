@@ -25,6 +25,7 @@ trnsparse/
 │   ├── iterative.py     # cg_bsr, cg_bsr_fused, power_iteration_bsr(_fused), jacobi_preconditioner_bsr
 │   ├── multicore.py     # ShardedBSR, ShardedAttention (logical NeuronCores of one chip)
 │   ├── kernel_matmul.py # kernel_matmul, KernelOperator: fused K(X, Y) @ V, K never formed (#93)
+│   ├── segment.py       # segment_sum / gather / SegmentPlan: graph scatter-gather pair (#139)
 │   └── nki/
 │       ├── __init__.py
 │       ├── kernels.py       # _bsr_spmm_kernel, _screened_spmm_kernel, attention kernels
@@ -57,6 +58,10 @@ sizes go straight to the PyTorch path (raise under `TRNSPARSE_REQUIRE_NKI`).
    `seq_len` must be a multiple of the block size.
 5. `cg_bsr_fused` / `power_iteration_bsr_fused` — whole solve in one launch,
    A SBUF-resident (#22).
+6. `segment_sum(m, idx, N)` / `gather(h, idx)` — graph segment sum and gather
+   (MLIP exemplar, #139). Host plan (stable sort, int64) per neighbour list;
+   one-hot incidence tile x gathered rows on TensorE, fp32 PSUM, fixed order.
+   Device sees only int32 ids and fp32 offsets in [-1, 127].
 
 **Open gaps:** row-bucketing CSR (#15, NKI capability-gated), sharding
 across chips (#16; within one chip `ShardedBSR` shipped in 0.10.0).

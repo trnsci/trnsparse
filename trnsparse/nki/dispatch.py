@@ -180,6 +180,7 @@ _MM = frozenset({torch.float32, torch.bfloat16})  # static / attention matmul op
 _MM16 = _MM | {torch.float16}  # the gather GEMM kernels also take fp16 (as before)
 _ANYF = _MM16 | {torch.float64}  # composite ops: cast internally per kernel
 _IDX = frozenset({torch.int32, torch.int64})
+_I32 = frozenset({torch.int32})  # device index tables (#139): never int64
 
 # Allowed dtypes per tensor operand, in argument order (non-tensor arguments
 # such as structure lists, keys and flags are skipped). Keyed by the short op
@@ -206,6 +207,10 @@ _KERNEL_OPERAND_DTYPES: dict[str, tuple[frozenset, ...]] = {
     "kmv_self": (_F32,) * 3,
     "kmv_cross": (_F32,) * 4,
     "kmv_selfblk": (_F32,) * 5,
+    # Graph segment sum / gather (#139): values, then the plan tables
+    # (gidx, src, local, orow, zrow); every id int32, local offsets fp32.
+    "segment_sum_tiles": (_F32, _I32, _I32, _F32, _I32, _I32),
+    "gather_rows": (_F32, _I32, _I32, _F32, _I32, _I32),
     # Composite ops (several kernel launches; each launch is checked again).
     "bsr_attn": (_ANYF, _ANYF, _ANYF, _IDX, _IDX),
     "bsr_attn_bwd": (_ANYF,) * 5 + (_IDX, _IDX) + (_ANYF, _ANYF),
@@ -2588,3 +2593,53 @@ def nki_kernel_matmul(
         ob = _kmv_block(xs, ys, vs, ps, i0, rows, n, kind, group, sim)
         out[i0 : i0 + nb] = ob[:nb].to(out.device)
     return out.to(orig)
+
+
+# ── Graph segment sum / gather (#139) ─────────────────────────────────────────
+#
+# `trnsparse.segment` builds the plan (host int64 math) and owns the autograd
+# pair. These launch one kernel on a value tensor plus the plan's int32 / fp32
+# tables. On the native path the op is the `trnsparse::` custom op, whose
+# backward is the other op (`register_autograd`, `_native.py`). The tables
+# are staged on the device once per plan and device (`SegmentPlan.tables`).
+# The ops are not in `_native.KERNELS`: each takes the plan's full table set
+# (its backward needs the other kernel's tables), and its kernel only part of
+# it.
+
+_SEGMENT_KERNELS = {
+    "segment_sum_tiles": "_segment_sum_kernel",
+    "gather_rows": "_gather_rows_kernel",
+}
+
+
+def _segment_kernel_args(op_name: str, x, tables, statics):
+    """The kernel's own arguments from the op's (x, tables, statics)."""
+    gidx, src, local, orow, zrow = tables
+    if op_name == "segment_sum_tiles":
+        return (x, src, local, orow, zrow), tuple(int(s) for s in statics)
+    return (x, gidx), ()
+
+
+def nki_segment_op(op_name: str, x: torch.Tensor, plan) -> torch.Tensor:
+    """One `segment_sum_tiles` / `gather_rows` launch: fp32 `x` (2-D, contiguous)
+    and `plan`'s tables. Returns the kernel's padded output on `x`'s device
+    (`plan.rows_out` rows for the sum, the padded edge count for the gather);
+    the caller slices it. Raises on any kernel-path failure."""
+    kernel = getattr(_kernels, _SEGMENT_KERNELS[op_name])
+    statics = plan.statics
+    if _use_simulator():
+        tables = plan.tables(None)
+        _check_kernel_operands(op_name, (x, *tables))
+        targs, kstat = _segment_kernel_args(op_name, x, tables, statics)
+        out = nki.simulate(kernel)(*(_sim_np(t) for t in targs), *kstat)
+        return _sim_torch(out, x.device)
+    if _get_dispatch_path() == "native":
+        orig = x.device
+        dev = _kernel_device(x)
+        args = (x.to(dev), *plan.tables(dev))
+        out = _get_native_ops()[op_name](*args, *statics)
+        return out.to(orig)
+    xs, orig = _to_xla(x, *plan.tables(None))
+    _check_kernel_operands(op_name, xs)
+    targs, kstat = _segment_kernel_args(op_name, xs[0], xs[1:], statics)
+    return kernel(*targs, *kstat).to(orig)
