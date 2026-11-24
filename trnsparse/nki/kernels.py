@@ -3097,20 +3097,28 @@ _SEG_GROUP = 2048  # output columns per pass over a tile's slots (4 PSUM banks)
 _SEG_PSUM_N = 512  # fp32 columns per PSUM bank (moving free size)
 _SEG_PROGRAMS = 2  # tile and zero-tile counts are padded to a multiple of this
 _GATHER_GROUP = 4096  # columns per gather DMA (16 KiB per partition in fp32)
-_GATHER_UNROLL = 8  # 128-edge tail tiles per gather loop body (their DMAs overlap)
 _GATHER_SBUF_BYTES = 64 * 1024  # live gather row buffers per partition, at most
-_GATHER_BLOCK = 32  # 128-edge index columns per gather block (DMA batching)
+_GATHER_LEVELS = (32, 16, 8, 4, 2, 1)  # 128-edge index columns per gather block
 
 
-def _gather_split(ep: int) -> tuple[int, int]:
-    """(blocks, tail tiles) of a gather over `ep` padded edges.
+def _gather_split(ep: int) -> tuple[tuple[int, int, int], ...]:
+    """Gather blocks over `ep` padded edges: ((t0, M, nb), ...) per level.
 
-    Blocks hold 128 * `_GATHER_BLOCK` edges and come in multiples of
-    `_SEG_PROGRAMS`; the 128-edge tail tiles then also split evenly (ep is a
-    multiple of 128 * `_SEG_PROGRAMS`). Shared by the kernel and the host
-    layout (`trnsparse.segment._gather_layout`)."""
-    nb = ep // (_SEG_P * _GATHER_BLOCK * _SEG_PROGRAMS) * _SEG_PROGRAMS
-    return nb, (ep - nb * _SEG_P * _GATHER_BLOCK) // _SEG_P
+    Level M holds nb blocks of M x 128 edges from tile t0 on, nb a multiple of
+    `_SEG_PROGRAMS` (so the cores run equal trip counts). Levels take the
+    largest M first; ep is a multiple of 128 * `_SEG_PROGRAMS`, so the M = 1
+    level always finishes it, and each level below 32 has at most one block
+    per core. Shared by the kernel and the host layout
+    (`trnsparse.segment._gather_layout`)."""
+    rest, t0, out = ep // _SEG_P, 0, []
+    for M in _GATHER_LEVELS:
+        nb = rest // (M * _SEG_PROGRAMS) * _SEG_PROGRAMS
+        if nb:
+            out.append((t0, M, nb))
+            t0 += nb * M
+            rest -= nb * M
+    assert rest == 0, (ep, rest)
+    return tuple(out)
 
 
 if HAS_NKI:
@@ -3249,74 +3257,56 @@ if HAS_NKI:
             gidx:  (Ep, 1)    int32 row ids in the plan's gather layout (see
                               `trnsparse.segment._gather_layout`): Ep a multiple
                               of 128 * `_SEG_PROGRAMS`, padding entries 0 (a
-                              valid row). The first `nb` blocks of
-                              128 * `_GATHER_BLOCK` edges are stored so that block
-                              b's (128, 32) index tile, read column-major, is
-                              the block's edges in order; the tail is in edge
-                              order.
+                              valid row). Each block of M x 128 edges (levels
+                              from `_gather_split`) is stored so that its
+                              (128, M) index tile, read column-major, is the
+                              block's edges in order.
         Returns:
             out:   (Ep, F)    fp32, in edge order
 
-        A block is one (128, 32) index load, then `_GATHER_BLOCK / mk` DMAs that
-        each gather mk x 128 rows (a 2-D `vector_offset`: DMA batching) into
-        SBUF, partition p holding mk consecutive edges, and one contiguous
-        store per DMA. mk is the largest power of two with mk * F fp32 values
-        in `_GATHER_SBUF_BYTES`. One 128-row DMA per tile, as in the tail,
-        is about 7 us per 128 edges on trn2 (descriptor generation bound);
-        the batched DMA moves 4096 rows in about the same time (#140).
+        A block is one (128, M) index load, then M / mk DMAs that each gather
+        mk x 128 rows (a 2-D `vector_offset`: DMA batching) into SBUF,
+        partition p holding mk consecutive edges, and one contiguous store
+        each. mk is the largest power of two up to M with mk * F fp32 values
+        in `_GATHER_SBUF_BYTES`. One 128-row DMA per tile costs about 7 us on
+        trn2 (descriptor generation bound); a batched DMA moves 4096 rows in
+        about the same time (#140).
         """
         N, F = h.shape
         Ep = gidx.shape[0]
         n_prog, pid = _program_split()
         out = nl.ndarray((Ep, F), dtype=h.dtype, buffer=nl.shared_hbm)
-        MB = _GATHER_BLOCK
-        nb, tail_tiles = _gather_split(Ep)
+        mk_f = 1
+        while 2 * mk_f * F * 4 <= _GATHER_SBUF_BYTES and mk_f < _GATHER_LEVELS[0]:
+            mk_f *= 2
 
-        def tile(t):
-            # Tail: one 128-row DMA per column group, edges t*128 .. + 128.
-            ix = nl.ndarray((_SEG_P, 1), dtype=nl.int32, buffer=nl.sbuf)
-            nisa.dma_copy(dst=ix, src=gidx[nl.ds(t * _SEG_P, _SEG_P), 0:1])
-            for g0 in range(0, F, _GATHER_GROUP):
-                gw = min(_GATHER_GROUP, F - g0)
-                rows = nl.ndarray((_SEG_P, gw), dtype=h.dtype, buffer=nl.sbuf)
-                nisa.dma_copy(
-                    dst=rows,
-                    src=h.ap(
-                        pattern=[[F, _SEG_P], [1, gw]],
-                        offset=g0,
-                        vector_offset=ix,
-                        indirect_dim=0,
-                    ),
-                )
-                nisa.dma_copy(dst=out[nl.ds(t * _SEG_P, _SEG_P), g0 : g0 + gw], src=rows)
+        def level(t0, M, nb):
+            mk = min(M, mk_f)
+            gv = gidx.reshape((Ep // M, M))
+            ov = out.reshape((Ep // mk, mk * F))
 
-        mk = 1
-        while mk < MB and 2 * mk * F * 4 <= _GATHER_SBUF_BYTES:
-            mk *= 2
-        # mk == 1 (rows too wide to batch): a block runs as 32 128-row tiles,
-        # tile j being index column j.
-        gv = gidx.reshape((Ep // MB, MB))
-        ov = out.reshape((Ep // mk, mk * F))
-
-        def block(b):
-            ixb = nl.ndarray((_SEG_P, MB), dtype=nl.int32, buffer=nl.sbuf)
-            nisa.dma_copy(dst=ixb, src=gv[nl.ds(b * _SEG_P, _SEG_P), 0:MB])
-            for j0 in range(0, MB, mk):
-                # Edges b*MB*128 + j0*128 + p*mk + m land in rows[p, m*F:(m+1)*F].
-                r0 = (b * MB + j0) * (_SEG_P // mk)
-                if mk > 1:
-                    rows = nl.ndarray((_SEG_P, mk * F), dtype=h.dtype, buffer=nl.sbuf)
-                    nisa.dma_copy(
-                        dst=rows,
-                        src=h.ap(
-                            pattern=[[F, _SEG_P * mk], [1, F]],
-                            offset=0,
-                            vector_offset=ixb[:, j0 : j0 + mk],
-                            indirect_dim=0,
-                        ),
-                    )
-                    nisa.dma_copy(dst=ov[nl.ds(r0, _SEG_P), 0 : mk * F], src=rows)
-                else:
+            def block(b):
+                ixb = nl.ndarray((_SEG_P, M), dtype=nl.int32, buffer=nl.sbuf)
+                nisa.dma_copy(dst=ixb, src=gv[nl.ds((t0 // M + b) * _SEG_P, _SEG_P), 0:M])
+                for j0 in range(0, M, mk):
+                    # Edges (t0 + b*M + j0) * 128 + p*mk + m land in rows[p, m*F:(m+1)*F].
+                    t = t0 + b * M + j0
+                    if mk > 1:
+                        rows = nl.ndarray((_SEG_P, mk * F), dtype=h.dtype, buffer=nl.sbuf)
+                        nisa.dma_copy(
+                            dst=rows,
+                            src=h.ap(
+                                pattern=[[F, _SEG_P * mk], [1, F]],
+                                offset=0,
+                                vector_offset=ixb[:, j0 : j0 + mk],
+                                indirect_dim=0,
+                            ),
+                        )
+                        nisa.dma_copy(
+                            dst=ov[nl.ds(t * (_SEG_P // mk), _SEG_P), 0 : mk * F], src=rows
+                        )
+                        continue
+                    # Rows too wide to batch: one 128-row DMA per column group.
                     for g0 in range(0, F, _GATHER_GROUP):
                         gw = min(_GATHER_GROUP, F - g0)
                         rows = nl.ndarray((_SEG_P, gw), dtype=h.dtype, buffer=nl.sbuf)
@@ -3329,25 +3319,11 @@ if HAS_NKI:
                                 indirect_dim=0,
                             ),
                         )
-                        nisa.dma_copy(dst=out[nl.ds(r0, _SEG_P), g0 : g0 + gw], src=rows)
+                        nisa.dma_copy(dst=out[nl.ds(t * _SEG_P, _SEG_P), g0 : g0 + gw], src=rows)
 
-        if nb:
             b_lo, b_hi = _seg_split(nb, n_prog, pid)
             nl.fori_loop(b_lo, b_hi, block)
-        if tail_tiles:
-            # Tail tiles follow the blocks; several per loop body so that
-            # their DMAs overlap.
-            t0 = nb * MB
-            u = max(1, min(_GATHER_UNROLL, _GATHER_SBUF_BYTES // (4 * F)))
-            t_lo, t_hi = _seg_split(tail_tiles, n_prog, pid)
-            n_body, rest = divmod(t_hi - t_lo, u)
 
-            def body(i):
-                for j in range(u):
-                    tile(t0 + t_lo + i * u + j)
-
-            if n_body:
-                nl.fori_loop(0, n_body, body)
-            if rest:
-                nl.fori_loop(t0 + t_lo + n_body * u, t0 + t_hi, tile)
+        for t0, M, nb in _gather_split(Ep):
+            level(t0, M, nb)
         return out

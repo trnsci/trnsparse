@@ -78,7 +78,7 @@ import math
 import torch
 
 from .nki import dispatch as _d
-from .nki.kernels import _GATHER_BLOCK, _SEG_CHUNK, _SEG_P, _SEG_PROGRAMS, _gather_split
+from .nki.kernels import _SEG_CHUNK, _SEG_P, _SEG_PROGRAMS, _gather_split
 
 _INT32_MAX = 2**31 - 1
 # Largest indexed tensor (bytes) one kernel launch addresses: the DMA adds
@@ -97,43 +97,27 @@ def _host_index(idx: torch.Tensor) -> torch.Tensor:
     return idx.detach().to("cpu", torch.int64).contiguous()
 
 
-def _gather_padded_edges(e: int) -> int:
-    """Rows of the gather kernel's output (and its index table) for E edges.
-
-    A multiple of 128 * `_SEG_PROGRAMS`. From one block pair (8192 edges) up,
-    a multiple of the block pair: the 128-edge tail tiles cost about 7 us each
-    on trn2, a whole padded block about 35 us, so padding beats a tail."""
-    pair = _SEG_P * _GATHER_BLOCK * _SEG_PROGRAMS
-    if e >= pair:
-        return -(-e // pair) * pair
-    return -(-max(e, 1) // (_SEG_P * _SEG_PROGRAMS)) * (_SEG_P * _SEG_PROGRAMS)
-
-
 def _gather_layout(gidx: torch.Tensor) -> torch.Tensor:
     """The gather kernel's index table from edge-order ids ``[Ep, 1]``.
 
-    The first blocks of 128 * `_GATHER_BLOCK` edges are stored so that the
-    kernel's contiguous (128, `_GATHER_BLOCK`) load of block b, read
-    column-major (the DMA batching order), gives the block's edges in order:
-    entry ``(b * 128 + p) * M + j`` holds edge ``b * 128 * M + j * 128 + p``.
-    The tail stays in edge order. `_gather_natural` is the inverse."""
-    nb, _ = _gather_split(gidx.shape[0])
-    if not nb:
-        return gidx
-    n = nb * _SEG_P * _GATHER_BLOCK
+    Each block of M x 128 edges (the levels of `_gather_split`) is stored so
+    that the kernel's contiguous (128, M) load of it, read column-major (the
+    DMA batching order), gives the block's edges in order: entry
+    ``(b * 128 + p) * M + j`` of the block region holds its edge
+    ``j * 128 + p``. `_gather_natural` is the inverse."""
     out = gidx.clone()
-    out[:n] = gidx[:n].reshape(nb, _GATHER_BLOCK, _SEG_P).transpose(1, 2).reshape(n, 1)
+    for t0, M, nb in _gather_split(gidx.shape[0]):
+        r = slice(t0 * _SEG_P, (t0 + nb * M) * _SEG_P)
+        out[r] = gidx[r].reshape(nb, M, _SEG_P).transpose(1, 2).reshape(-1, 1)
     return out
 
 
 def _gather_natural(table: torch.Tensor) -> torch.Tensor:
     """Edge-order ids ``[Ep, 1]`` from a gather index table (inverse of `_gather_layout`)."""
-    nb, _ = _gather_split(table.shape[0])
-    if not nb:
-        return table
-    n = nb * _SEG_P * _GATHER_BLOCK
     out = table.clone()
-    out[:n] = table[:n].reshape(nb, _SEG_P, _GATHER_BLOCK).transpose(1, 2).reshape(n, 1)
+    for t0, M, nb in _gather_split(table.shape[0]):
+        r = slice(t0 * _SEG_P, (t0 + nb * M) * _SEG_P)
+        out[r] = table[r].reshape(nb, _SEG_P, M).transpose(1, 2).reshape(-1, 1)
     return out
 
 
@@ -241,7 +225,7 @@ class SegmentPlan:
         nz = int(zeros.numel())
         zt = zeros if nz else torch.tensor([T - 1 if T else 0], dtype=torch.int64)
         zrow = (zt.unsqueeze(1) * P + p).reshape(-1, 1)
-        ep = _gather_padded_edges(e)
+        ep = -(-max(e, 1) // (P * _SEG_PROGRAMS)) * (P * _SEG_PROGRAMS)
         gidx = torch.zeros(ep, 1, dtype=torch.int64)
         gidx[:e, 0] = self.index
         gidx = _gather_layout(gidx)
@@ -394,7 +378,7 @@ def _kernel_ok(what: str, x: torch.Tensor, e: int, n: int, f: int) -> bool:
         return False
     if not _d._kernel_route(what, x):
         return False
-    rows = max(_gather_padded_edges(e), n + 2 * _SEG_P)
+    rows = max(e, n + 2 * _SEG_P)
     if rows * f * 4 >= _SEG_MAX_BYTES:
         if _d._REQUIRE_NKI:
             raise NotImplementedError(

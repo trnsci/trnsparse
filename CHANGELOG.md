@@ -29,11 +29,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     to run and at LNC=1 / LNC=2 (confirmed on trn2, #140).
   - The gather kernel batches its indirect DMAs (a 2-D `vector_offset`):
     each DMA moves up to 32 × 128 rows, and the plan stores the gather index
-    table in that block order. With one DMA per 128 rows, the gather took
-    about 6.5 ms at the 1728-atom shape on trn2, 6× slower than aten
-    `index_select`, because descriptor generation bounds it at about 7 µs per
-    DMA. Batched, it takes about 0.8 ms (#140). From 8192 edges up, the
-    padded edge count is a multiple of 8192, so no 128-row tail is left.
+    table in that block order. Blocks of 32, 16, 8, 4, 2 and 1 columns of 128
+    edges cover the padded edge count, with no extra padding. With one DMA per
+    128 rows, the gather took about 6.5 ms at the 1728-atom shape (F = 1) on
+    trn2, 6× slower than aten `index_select`, because descriptor generation
+    bounds it at about 7 µs per DMA. Batched, it takes 0.49 ms, against
+    1.07 ms for `index_select` (#140).
   - Index safety (aws-neuron-sdk#1466, #1467, #1468): index arithmetic stays
     on the host in int64. The device sees int32 edge and row ids, moved by
     DMA unconverted, and fp32 row offsets in [-1, 127]. There is no

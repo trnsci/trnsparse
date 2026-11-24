@@ -408,18 +408,19 @@ def _emulate_segment_sum(m: torch.Tensor, plan) -> torch.Tensor:
 
 
 def _emulate_gather(h: torch.Tensor, plan) -> torch.Tensor:
-    """The gather kernel's reads: per block, the (128, 32) index tile in
-    column-major (DMA batching) order, then the 128-edge tail tiles."""
-    from trnsparse.nki.kernels import _GATHER_BLOCK, _gather_split
+    """The gather kernel's reads: per block of each level, the (128, M) index
+    tile in column-major (DMA batching) order."""
+    from trnsparse.nki.kernels import _gather_split
 
     gidx = plan.tables()[0]
     ep = gidx.shape[0]
     assert ep % (P * 2) == 0
-    nb, tail = _gather_split(ep)
-    assert nb % 2 == 0 and tail % 2 == 0
-    gv = gidx.reshape(ep // _GATHER_BLOCK, _GATHER_BLOCK)
-    order = [gv[b * P : (b + 1) * P].T.flatten() for b in range(nb)]
-    order += [gidx[nb * P * _GATHER_BLOCK :, 0]]
+    order, t = [], 0
+    for t0, M, nb in _gather_split(ep):
+        assert t0 == t and nb % 2 == 0
+        gv = gidx.reshape(ep // M, M)
+        order += [gv[(t0 // M + b) * P : (t0 // M + b + 1) * P].T.flatten() for b in range(nb)]
+        t += nb * M
     rows = torch.cat(order).long()
     assert rows.numel() == ep
     return h.reshape(h.shape[0], -1)[rows][: plan.num_edges]
@@ -436,7 +437,8 @@ def _emulate_gather(h: torch.Tensor, plan) -> torch.Tensor:
         (128 * 40, 500, 128 * 30, False),  # mostly empty tiles: compact layout
         (128 * 41, 500, 128 * 39, True),  # compact, odd occupied count
         (3, 4096, 0, True),  # one row, 32 slots: four chunks
-        (1728, 16384, 0, False),  # gather: two whole blocks, no tail tiles
+        (1728, 16384, 0, False),  # gather: two 32-column blocks only
+        (1728, 128 * 126, 0, False),  # gather: one block pair at every level
     ],
 )
 def test_plan_layout_reproduces_segment_sum(n, e, lo, sorted_):

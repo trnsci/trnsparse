@@ -99,12 +99,12 @@ def test_segment_sum_and_gather(monkeypatch, n, e, F, lo, hi):
     assert calls == ["segment_sum_tiles", "gather_rows", "gather_rows", "segment_sum_tiles"]
 
 
-@pytest.mark.parametrize("e", [1300, 8192 + 300])
+@pytest.mark.parametrize("e", [1300, 8192 + 300, 128 * 126])
 @pytest.mark.parametrize("F", [1, 512, 5120])
 def test_gather_blocks_and_tail(F, e):
-    # 1300 edges: tail tiles only (unrolled bodies of 8 or 3, and a rest).
-    # 8492 edges: two batched blocks of 32 x 128 edges (32, 16 or 1 index
-    # columns per DMA as F grows) and two tail tiles.
+    # Gather levels (`_gather_split`): 1300 edges -> 4- and 2-column blocks;
+    # 8492 -> 32- and 2-column blocks; 16128 -> a block pair at every level.
+    # F = 1 and 512 batch 32 / 16 rows per DMA, F = 5120 one 128-row DMA.
     g = torch.Generator().manual_seed(e + F)
     n = 50
     idx = torch.randint(0, n, (e,), generator=g)
