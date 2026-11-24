@@ -99,6 +99,23 @@ def test_segment_sum_and_gather(monkeypatch, n, e, F, lo, hi):
     assert calls == ["segment_sum_tiles", "gather_rows", "gather_rows", "segment_sum_tiles"]
 
 
+@pytest.mark.parametrize("e", [1300, 8192 + 300])
+@pytest.mark.parametrize("F", [1, 512, 5120])
+def test_gather_blocks_and_tail(F, e):
+    # 1300 edges: tail tiles only (unrolled bodies of 8 or 3, and a rest).
+    # 8492 edges: two batched blocks of 32 x 128 edges (32, 16 or 1 index
+    # columns per DMA as F grows) and two tail tiles.
+    g = torch.Generator().manual_seed(e + F)
+    n = 50
+    idx = torch.randint(0, n, (e,), generator=g)
+    h = torch.randn(n, F, generator=g, requires_grad=True)
+    got = trnsparse.gather(h, idx)
+    assert torch.equal(got, h.detach()[idx])
+    ge = torch.randn(e, F, generator=g)
+    (gh,) = torch.autograd.grad(got, h, ge)
+    assert _rel(gh, _ref(ge, idx, n)) <= 1e-6
+
+
 @pytest.mark.parametrize("F", [1, 3, 128, 512, 2048, 5120])
 def test_every_exemplar_width(F):
     g = torch.Generator().manual_seed(F)

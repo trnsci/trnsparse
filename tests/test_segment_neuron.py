@@ -223,9 +223,16 @@ def _time(fn, reps=10):
     out = fn()
     _sync()
     first = time.perf_counter() - t0
-    for _ in range(2):
-        fn()
+    t0 = time.perf_counter()
+    fn()
     _sync()
+    if time.perf_counter() - t0 > 0.25:
+        # aten scatter_add_ with an expanded index takes seconds per call at
+        # E * F ~ 1e8 on trn2 (#140); two timed calls are enough.
+        reps = 2
+    else:
+        fn()
+        _sync()
     t0 = time.perf_counter()
     for _ in range(reps):
         out = fn()

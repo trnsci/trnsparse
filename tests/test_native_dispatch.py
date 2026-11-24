@@ -291,7 +291,9 @@ def _ref_segment_sum_kernel(m, src, local, orow, zrow, rows_out, nz):
 
 
 def _ref_gather_rows_kernel(h, gidx):
-    return h[gidx[:, 0].long()]
+    from trnsparse.segment import _gather_natural
+
+    return h[_gather_natural(gidx)[:, 0].long()]
 
 
 @pytest.fixture

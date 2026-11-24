@@ -700,18 +700,18 @@ def test_cg_kernel_neff_compiles(case, lnc, tmp_path):
 # layout the kernels are compiled for is the one the host builds.
 
 
-def _segment_inputs(F: int, compact: bool):
+def _segment_inputs(F: int, compact: bool, E: int = 1200):
     import torch
 
     from trnsparse import segment_plan
 
     g = torch.Generator().manual_seed(F)
     N = 128 * 12 if compact else 300
-    idx = torch.randint(0, 200 if compact else N, (1200,), generator=g)
+    idx = torch.randint(0, 200 if compact else N, (E,), generator=g)
     plan = segment_plan(idx, N)
     assert plan.compact == compact
     gidx, src, local, orow, zrow = (t.numpy() for t in plan.tables())
-    seg = (_f32(1200, F), src, local, orow, zrow, plan.rows_out, plan.zero_tiles)
+    seg = (_f32(E, F), src, local, orow, zrow, plan.rows_out, plan.zero_tiles)
     return seg, (_f32(N, F), gidx)
 
 
@@ -722,11 +722,19 @@ _SEGMENT_CASES = {
     for kernel in ("_segment_sum_kernel", "_gather_rows_kernel")
     if not (compact and kernel == "_gather_rows_kernel")
 }
+# E = 9000: two batched gather blocks and 8 tail tiles (4 per core), at a
+# batched width, a mid width and an unbatched width.
+_SEGMENT_CASES.update(
+    {
+        ("_gather_rows_kernel", f"F{F}-long"): ("_gather_rows_kernel", F, False)
+        for F in (1, 512, 5120)
+    }
+)
 
 
 def _segment_case_inputs(case):
     kernel, F, compact = _SEGMENT_CASES[case]
-    seg, gat = _segment_inputs(F, compact)
+    seg, gat = _segment_inputs(F, compact, 9000 if case[1].endswith("-long") else 1200)
     return seg if kernel == "_segment_sum_kernel" else gat
 
 

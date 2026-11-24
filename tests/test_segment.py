@@ -278,7 +278,7 @@ def test_index_values_above_2_24():
     assert plan.compact and plan.computed_tiles == 2
     gidx, src, local, orow, zrow = plan.tables()
     assert gidx.dtype == src.dtype == orow.dtype == zrow.dtype == torch.int32
-    assert torch.equal(gidx[: len(idx), 0].long(), idx)
+    assert torch.equal(seg._gather_natural(gidx)[: len(idx), 0].long(), idx)
     rows = torch.cat([orow, zrow[: plan.zero_tiles * P]]).flatten().long()
     assert torch.equal(torch.sort(rows).values, torch.arange(plan.rows_out))
     got = _emulate_segment_sum(m, plan)
@@ -408,9 +408,21 @@ def _emulate_segment_sum(m: torch.Tensor, plan) -> torch.Tensor:
 
 
 def _emulate_gather(h: torch.Tensor, plan) -> torch.Tensor:
+    """The gather kernel's reads: per block, the (128, 32) index tile in
+    column-major (DMA batching) order, then the 128-edge tail tiles."""
+    from trnsparse.nki.kernels import _GATHER_BLOCK, _gather_split
+
     gidx = plan.tables()[0]
-    assert gidx.shape[0] % (P * 2) == 0
-    return h.reshape(h.shape[0], -1)[gidx[:, 0].long()][: plan.num_edges]
+    ep = gidx.shape[0]
+    assert ep % (P * 2) == 0
+    nb, tail = _gather_split(ep)
+    assert nb % 2 == 0 and tail % 2 == 0
+    gv = gidx.reshape(ep // _GATHER_BLOCK, _GATHER_BLOCK)
+    order = [gv[b * P : (b + 1) * P].T.flatten() for b in range(nb)]
+    order += [gidx[nb * P * _GATHER_BLOCK :, 0]]
+    rows = torch.cat(order).long()
+    assert rows.numel() == ep
+    return h.reshape(h.shape[0], -1)[rows][: plan.num_edges]
 
 
 @pytest.mark.parametrize(
@@ -424,6 +436,7 @@ def _emulate_gather(h: torch.Tensor, plan) -> torch.Tensor:
         (128 * 40, 500, 128 * 30, False),  # mostly empty tiles: compact layout
         (128 * 41, 500, 128 * 39, True),  # compact, odd occupied count
         (3, 4096, 0, True),  # one row, 32 slots: four chunks
+        (1728, 16384, 0, False),  # gather: two whole blocks, no tail tiles
     ],
 )
 def test_plan_layout_reproduces_segment_sum(n, e, lo, sorted_):
@@ -559,7 +572,7 @@ def test_kernel_route_through_emulated_launch(monkeypatch, no_env_flags):
             full = torch.zeros(plan.rows_out, x.shape[1])
             full[: plan.num_segments] = _emulate_segment_sum(x, plan).float()
             return full
-        gidx = plan.tables()[0]
+        gidx = seg._gather_natural(plan.tables()[0])
         return x[gidx[:, 0].long()]
 
     monkeypatch.setattr(dispatch, "nki_segment_op", launch)
