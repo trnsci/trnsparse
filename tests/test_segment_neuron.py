@@ -217,6 +217,12 @@ def test_exemplar_checker():
 
 # ── timing harness ───────────────────────────────────────────────────────────
 
+# aten scatter_add_ with an expanded index on trn2 (SDK 2.33): at the 216-atom
+# shape the first call (compile) took 46 s at F = 512, 108 s at F = 2048 and
+# 267 s at F = 5120, and each later call 1.0 s, 3.9 s and 9.9 s (#140).
+# Larger E * F would take most of a timing window.
+_SCATTER_ADD_MAX_EF = 6 * 10**7
+
 
 def _time(fn, reps=10):
     t0 = time.perf_counter()
@@ -278,6 +284,10 @@ def test_timing_vs_aten(E):
         }
         for name, fn in {**cands, **gcands}.items():
             row = {"E": E, "F": F, "op": name}
+            if name.startswith("aten.scatter_add_") and E * F > _SCATTER_ADD_MAX_EF:
+                row["note"] = "not run: E*F above the size where its compile takes minutes"
+                rows.append(row)
+                continue
             try:
                 first, per, out = _time(fn)
                 again = fn()

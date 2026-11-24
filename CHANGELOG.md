@@ -26,7 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     chunks, and the chunks add in fp32 SBUF in order. No atomics and no
     scatter-add. The order is fixed by the plan, and tiles split between the
     physical cores with one writer each, so results are bitwise identical run
-    to run and at LNC=1 / LNC=2 (to be confirmed on the device).
+    to run and at LNC=1 / LNC=2 (confirmed on trn2, #140).
   - The gather kernel batches its indirect DMAs (a 2-D `vector_offset`):
     each DMA moves up to 32 × 128 rows, and the plan stores the gather index
     table in that block order. With one DMA per 128 rows, the gather took
