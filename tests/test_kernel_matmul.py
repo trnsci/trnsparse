@@ -30,10 +30,14 @@ def _pytorch_backend():
     trnsparse.set_backend(old)
 
 
-# Matern-1/2 has a cusp at r = 0, so the fp32 expansion's error at
-# near-coincident points enters as sqrt(u |x|^2) / l (see kernel_matmul's
-# docstring); the smooth kernels see it at first order only.
-_TOL = {"rbf": 2e-5, "matern12": 3e-3, "matern32": 2e-5, "matern52": 2e-5}
+# fp32-class for every kernel on separated points (trnsci/trnsci#173).
+_TOL = {"rbf": 2e-5, "matern12": 2e-5, "matern32": 2e-5, "matern52": 2e-5}
+# The square operator has the diagonal, D_ii = 0 computed as the rounding
+# error of |x|^2 + |x|^2 - 2 x.x (about u |x|^2). Matern-1/2 has a cusp at
+# r = 0, so that error enters as sqrt(u |x|^2) / l (see kernel_matmul's
+# docstring): 1.3e-4 to 4.2e-4 here on the fp32 expansion, independent of
+# how the square root is evaluated. The smooth kernels see it at first order.
+_TOL_SELF = {**_TOL, "matern12": 1e-3}
 
 
 @pytest.mark.parametrize("kernel", KERNELS)
@@ -68,7 +72,7 @@ def test_square_operator_with_noise(kernel, n):
     V = torch.randn(n, 5, generator=g)
     out = kernel_matmul(X, None, V, kernel, 0.3, 1.3, noise=1e-2)
     ref = kernel_matmul_reference(X, None, V, kernel, 0.3, 1.3, noise=1e-2)
-    assert _rel(out, ref) < _TOL[kernel]
+    assert _rel(out, ref) < _TOL_SELF[kernel]
 
 
 def test_vector_rhs_and_ard_lengthscale():

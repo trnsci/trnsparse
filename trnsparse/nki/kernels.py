@@ -2294,12 +2294,14 @@ if HAS_NKI:
             nisa.scalar_tensor_tensor(
                 dst=rr, data=rr, op0=nl.multiply, operand0=keep, op1=nl.add, operand1=d
             )
-            # s = act / sqrt(max(qq, tiny)); v = keep * v + s * q (own rows)
+            # s = act / sqrt(max(qq, tiny)); v = keep * v + s * q (own rows).
+            # rsqrt on GpSimd (<= 1 ulp measured on Trn2; the ScalarE sqrt
+            # table is 6.2e-3 relative, trnsci/trnsci#173). One scalar per
+            # step, so the slower engine costs nothing measurable.
             sq = scal()
             nisa.tensor_scalar(sq, qq, op0=nl.maximum, operand0=_CG_TINY)
-            nisa.activation(dst=sq, op=nl.sqrt, data=sq)
             sc = scal()
-            nisa.reciprocal(sc, sq)
+            nisa.tensor_scalar(sc, sq, op0=nl.rsqrt, operand0=0.0, engine=nisa.gpsimd_engine)
             nisa.tensor_tensor(sc, sc, act, op=nl.multiply)
             jw = junk[:, 0:W]
             nisa.tensor_scalar(jw, q, op0=nl.multiply, operand0=sc)
@@ -2671,7 +2673,9 @@ _KMV_MAX_GROUP = 32  # cap on the body size (SBUF for the body's K^T and V tiles
 _KMV_AUTO_GROUP_MAX = 32  # largest body `kmv_group` picks (#108)
 _KMV_V_BATCH_BYTES = 64 * 1024  # SBUF per partition for one body's V rows in one DMA
 _KMV_PSUM_BANKS = 8  # 16 KiB of PSUM per partition in 2 KiB banks
-_KMV_SCRATCH = (0, 1, 2, 3)  # SBUF intermediates per kernel tile, by kind (rbf, matern12/32/52)
+_KMV_SQRT = __import__("os").environ.get("TRNSPARSE_KMV_SQRT", "heron")  # L1 MEASUREMENT BUILD
+_KMV_SQRT_EXTRA = {"lut": 0, "heron": 2, "power": 0, "powertt": 1, "rsqrt": 1}[_KMV_SQRT]
+_KMV_SCRATCH = tuple(k + _KMV_SQRT_EXTRA if k else 0 for k in (0, 1, 2, 3))
 _KMV_SCRATCH_RING = 2  # slots of them per loop body, shared round-robin by its Y tiles
 
 
@@ -2830,6 +2834,33 @@ if HAS_NKI:
         if rem:
             tile(r_lo + n_full * _TILE_M, rem)
 
+    def _kmv_sqrt(t, scratch):
+        """t <- sqrt(t) in place, t > 0 (trnsci/trnsci#173). L1 MEASUREMENT BUILD."""
+        jr, ni = t.shape
+        if _KMV_SQRT == "lut":
+            nisa.activation(t, nl.sqrt, t)
+        elif _KMV_SQRT == "heron":
+            u = scratch[-2][0:jr, 0:ni]
+            r = scratch[-1][0:jr, 0:ni]
+            nisa.activation(u, nl.sqrt, t, scale=0.25)
+            nisa.reciprocal(r, u)
+            nisa.tensor_tensor(r, t, r, op=nl.multiply)
+            nisa.scalar_tensor_tensor(
+                dst=t, data=r, op0=nl.multiply, operand0=0.25, op1=nl.add, operand1=u
+            )
+        elif _KMV_SQRT == "power":
+            nisa.tensor_scalar(t, t, op0=nl.power, operand0=0.5, engine=nisa.gpsimd_engine)
+        elif _KMV_SQRT == "powertt":
+            h = scratch[-1][0:jr, 0:ni]
+            nisa.memset(h, 0.5)
+            nisa.tensor_tensor(dst=t, data1=t, data2=h, op=nl.power, engine=nisa.gpsimd_engine)
+        elif _KMV_SQRT == "rsqrt":
+            r = scratch[-1][0:jr, 0:ni]
+            nisa.tensor_scalar(r, t, op0=nl.rsqrt, operand0=0, engine=nisa.gpsimd_engine)
+            nisa.tensor_tensor(t, t, r, op=nl.multiply)
+        else:
+            raise ValueError(_KMV_SQRT)
+
     def _kmv_entries(d_ps, prm, kind, jr, ni, scratch):
         """Kernel tile (jr, ni) in SBUF from the squared-distance tile in PSUM.
 
@@ -2854,7 +2885,7 @@ if HAS_NKI:
         # non-negative input, and ScalarE sqrt is accurate only above 2^-116
         # (sqrt(2^-110) = 2^-55 stands in for an exact zero distance).
         nisa.tensor_scalar(t, d_ps, op0=nl.multiply, operand0=a, op1=nl.maximum, operand1=2.0**-110)
-        nisa.activation(t, nl.sqrt, t)
+        _kmv_sqrt(t, scratch)
         if kind == 1:
             e = nl.ndarray((jr, ni), dtype=nl.float32, buffer=nl.sbuf)
             nisa.activation(e, nl.exp, t, bias=log_s, scale=-1.0)

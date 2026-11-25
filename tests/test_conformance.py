@@ -1643,9 +1643,7 @@ def test_kernel_matmul_conformance(kernel, n, m, d, R):
         Vs = rand_vec((n, R), torch.float32, 7 * n)
         ref_s = ts.kernel_matmul_reference(X, None, Vs, kernel, ell, 1.5, noise=1e-2)
         got_s = ts.kernel_matmul(D(X), None, D(Vs), kernel, ell, 1.5, noise=1e-2)
-        # Matern-1/2 has a cusp at r = 0: near-coincident points see the
-        # fp32 expansion error under a square root (see kernel_matmul).
-        assert_close(got_s, ref_s, torch.float32, tol=5e-3 if kernel == "matern12" else 2e-5)
+        assert_close(got_s, ref_s, torch.float32, tol=2e-5)
 
 
 def test_kernel_operator_conformance_and_determinism():
