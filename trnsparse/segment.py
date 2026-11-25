@@ -100,9 +100,10 @@ _INT32_MAX = 2**31 - 1
 # feature axis (`_feature_chunk`). #140 set this to 2^31 on the assumption
 # that the indirect DMA forms row x stride as a signed 32-bit byte offset.
 # On trn2 (SDK 2.33.1) one launch is bitwise equal to the 2^31-byte chunks
-# at 4.7e9 bytes and matches the fp64 sum at 9.4e9 and 1.7e10 bytes, past
-# 2^32 bytes and 2^32 fp32 elements (#141), so the bound is 2^34 bytes,
-# about the largest operand a 24 GB logical core holds with its outputs.
+# at 4.7e9 bytes and matches the fp64 sum (gather exact) at 9.4e9 bytes:
+# past 2^32 bytes and 2^31 fp32 elements (#141). The bound is the next
+# power-of-two boundary, 2^34 bytes (2^32 fp32 elements); a 1.7e10-byte
+# operand no longer fits one logical core at LNC=2.
 _SEG_MAX_BYTES = 2**34
 # Column chunks are cut from row blocks of at most this many bytes: device
 # aten copies a column slice of a view spanning more than 2^32 bytes about
