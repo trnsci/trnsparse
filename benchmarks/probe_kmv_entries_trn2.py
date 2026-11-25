@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 
 import numpy as np
 import torch
@@ -57,9 +56,8 @@ def main():
     V = torch.eye(m, dtype=torch.float32)
     dev = "cpu" if args.sim else "neuron"
     xd, yd, vd = (torch.from_numpy(X).to(dev), torch.from_numpy(Y).to(dev), V.to(dev))
-    variant = os.environ.get("TRNSPARSE_KMV_SQRT", "default")
     rows = []
-    print(f"sqrt variant={variant} n={args.n} m={m} d={args.d}")
+    print(f"n={args.n} m={m} d={args.d}")
     print(f"{'kernel':>9} {'a':>5} {'max_rel':>9} {'p99.9':>9} {'median':>9} {'k>=1e-3 max':>11}")
     for name in args.kinds.split(","):
         kind = _KMV_KINDS.index(name)
@@ -74,7 +72,6 @@ def main():
             big = ref >= 1e-3
             rel_big = np.abs(got - ref)[big] / ref[big]
             rec = {
-                "variant": variant,
                 "kernel": name,
                 "a": a,
                 "max_rel": float(rel.max()),

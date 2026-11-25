@@ -2295,9 +2295,11 @@ if HAS_NKI:
                 dst=rr, data=rr, op0=nl.multiply, operand0=keep, op1=nl.add, operand1=d
             )
             # s = act / sqrt(max(qq, tiny)); v = keep * v + s * q (own rows).
-            # rsqrt on GpSimd (<= 1 ulp measured on Trn2; the ScalarE sqrt
-            # table is 6.2e-3 relative, trnsci/trnsci#173). One scalar per
-            # step, so the slower engine costs nothing measurable.
+            # rsqrt on GpSimd: 1.1e-7 relative over the whole fp32 range on
+            # Trn2. ScalarE sqrt is 8.4e-7 only for inputs in [2^-52, 2^52]
+            # and up to 6.2e-3 outside it (trnsci/trnsci#173), and qq is a
+            # squared norm of any size. One scalar per step, so the slower
+            # engine costs nothing measurable.
             sq = scal()
             nisa.tensor_scalar(sq, qq, op0=nl.maximum, operand0=_CG_TINY)
             sc = scal()
@@ -2634,7 +2636,7 @@ if HAS_NKI:
 #   matern52  k = s * (1 + t + t^2 / 3) exp(-t)   a = 5 / l^2
 #
 # The kernel family is a compile-time argument (`kind`). Every per-call
-# constant (a, log s, noise) arrives in a `params` tensor (aws-neuron-sdk#1454:
+# constant (a, log s, noise, s) arrives in a `params` tensor (aws-neuron-sdk#1454:
 # a Python float would be a trace constant, one compile per value).
 #
 # Per 128 x NI tile (Y points j on partitions, X points i on the free axis):
@@ -2673,9 +2675,7 @@ _KMV_MAX_GROUP = 32  # cap on the body size (SBUF for the body's K^T and V tiles
 _KMV_AUTO_GROUP_MAX = 32  # largest body `kmv_group` picks (#108)
 _KMV_V_BATCH_BYTES = 64 * 1024  # SBUF per partition for one body's V rows in one DMA
 _KMV_PSUM_BANKS = 8  # 16 KiB of PSUM per partition in 2 KiB banks
-_KMV_SQRT = __import__("os").environ.get("TRNSPARSE_KMV_SQRT", "heron")  # L1 MEASUREMENT BUILD
-_KMV_SQRT_EXTRA = {"lut": 0, "heron": 2, "power": 0, "powertt": 1, "rsqrt": 1}[_KMV_SQRT]
-_KMV_SCRATCH = tuple(k + _KMV_SQRT_EXTRA if k else 0 for k in (0, 1, 2, 3))
+_KMV_SCRATCH = (0, 1, 2, 3)  # SBUF intermediates per kernel tile, by kind (rbf, matern12/32/52)
 _KMV_SCRATCH_RING = 2  # slots of them per loop body, shared round-robin by its Y tiles
 
 
@@ -2834,33 +2834,6 @@ if HAS_NKI:
         if rem:
             tile(r_lo + n_full * _TILE_M, rem)
 
-    def _kmv_sqrt(t, scratch):
-        """t <- sqrt(t) in place, t > 0 (trnsci/trnsci#173). L1 MEASUREMENT BUILD."""
-        jr, ni = t.shape
-        if _KMV_SQRT == "lut":
-            nisa.activation(t, nl.sqrt, t)
-        elif _KMV_SQRT == "heron":
-            u = scratch[-2][0:jr, 0:ni]
-            r = scratch[-1][0:jr, 0:ni]
-            nisa.activation(u, nl.sqrt, t, scale=0.25)
-            nisa.reciprocal(r, u)
-            nisa.tensor_tensor(r, t, r, op=nl.multiply)
-            nisa.scalar_tensor_tensor(
-                dst=t, data=r, op0=nl.multiply, operand0=0.25, op1=nl.add, operand1=u
-            )
-        elif _KMV_SQRT == "power":
-            nisa.tensor_scalar(t, t, op0=nl.power, operand0=0.5, engine=nisa.gpsimd_engine)
-        elif _KMV_SQRT == "powertt":
-            h = scratch[-1][0:jr, 0:ni]
-            nisa.memset(h, 0.5)
-            nisa.tensor_tensor(dst=t, data1=t, data2=h, op=nl.power, engine=nisa.gpsimd_engine)
-        elif _KMV_SQRT == "rsqrt":
-            r = scratch[-1][0:jr, 0:ni]
-            nisa.tensor_scalar(r, t, op0=nl.rsqrt, operand0=0, engine=nisa.gpsimd_engine)
-            nisa.tensor_tensor(t, t, r, op=nl.multiply)
-        else:
-            raise ValueError(_KMV_SQRT)
-
     def _kmv_entries(d_ps, prm, kind, jr, ni, scratch):
         """Kernel tile (jr, ni) in SBUF from the squared-distance tile in PSUM.
 
@@ -2885,7 +2858,15 @@ if HAS_NKI:
         # non-negative input, and ScalarE sqrt is accurate only above 2^-116
         # (sqrt(2^-110) = 2^-55 stands in for an exact zero distance).
         nisa.tensor_scalar(t, d_ps, op0=nl.multiply, operand0=a, op1=nl.maximum, operand1=2.0**-110)
-        _kmv_sqrt(t, scratch)
+        # ScalarE sqrt, measured on Trn2 (trnsci/trnsci#173): 8.4e-7 relative
+        # for inputs in [2^-52, 2^52], 2.2e-5 down to 2^-84 and 2.6e-3 below;
+        # its 6.2e-3 worst case is above 2^92. Here t errs by at most
+        # 8.4e-7 t where k is not ~s (and by <= 2.6e-3 t <= 2^-31 below
+        # 2^-52), so a kernel entry errs by ~t * 8.4e-7 plus exp's 1.4e-6:
+        # <= 8e-6 measured to t = 12 (benchmarks/probe_kmv_entries_trn2.py).
+        # GpSimd rsqrt * t (1.1e-7) measured the same at the entry level and
+        # cost 12% (Matern-1/2) to 30% (Matern-5/2) of the throughput.
+        nisa.activation(t, nl.sqrt, t)
         if kind == 1:
             e = nl.ndarray((jr, ni), dtype=nl.float32, buffer=nl.sbuf)
             nisa.activation(e, nl.exp, t, bias=log_s, scale=-1.0)
@@ -2902,6 +2883,53 @@ if HAS_NKI:
         nisa.scalar_tensor_tensor(k, q, nl.add, 1.0, nl.multiply, e)
         return k
 
+    def _kmv_diag_coef(ya, xa, prm, kind, cr):
+        """(cr, 1) column noise + s - K~_ii for the square operator's rows i of one chunk (#143).
+
+        ya, xa: (d + 2, cr) Y-side and X-side augmented coordinates of the
+        same cr points. The main loop's D_ii is the cancellation
+        |x|^2 + |x|^2 - 2 x.x (about u * 2 |x|^2, not 0), and K~_ii = k(D_ii)
+        is off by sqrt(u * a * 2 |x|^2) relative for Matern-1/2 (the cusp).
+        This recomputes the same D_ii (the same augmented coordinates
+        through the TensorEngine, entry by entry the same dot product) and
+        K~_ii (the same `_kmv_entries` instructions, elementwise), takes the
+        diagonal (`affine_select` on p == q, then a row sum of one nonzero),
+        and returns the column the finish step multiplies V_i by: the row's
+        K~_ii V_i from the main loop cancels and s V_i takes its place.
+        """
+        d_ps = nl.ndarray((_TILE_M, _TILE_M), dtype=nl.float32, buffer=nl.psum)[0:cr, 0:cr]
+        nisa.nc_matmul(d_ps, ya, xa, accumulate=False)
+        scr = [
+            nl.ndarray((_TILE_M, _TILE_M), dtype=nl.float32, buffer=nl.sbuf)
+            for _ in range(_KMV_SCRATCH[kind])
+        ]
+        kt = _kmv_entries(d_ps, prm, kind, cr, cr, scr or None)
+        sel = nl.ndarray((cr, cr), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.affine_select(
+            sel,
+            pattern=[[-1, cr]],
+            channel_multiplier=1,
+            on_true_tile=kt,
+            on_false_value=0.0,
+            cmp_op=nl.equal,
+            offset=0,
+        )
+        kd = nl.ndarray((cr, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_reduce(kd, op=nl.add, data=sel, axis=1)
+        coef = nl.ndarray((cr, 1), dtype=nl.float32, buffer=nl.sbuf)
+        # (s - K~_ii) + noise: s - K~_ii is exact (Sterbenz) whenever K~_ii
+        # is within a factor 2 of s.
+        nisa.tensor_scalar(
+            coef,
+            kd,
+            op0=nl.subtract,
+            operand0=prm[0:cr, 3:4],
+            reverse0=True,
+            op1=nl.add,
+            operand1=prm[0:cr, 2:3],
+        )
+        return coef
+
     def _kmv_body(x, y, v, params, kind, group, self_op, vn=None):
         """out = K(X, Y) @ V (+ noise * V if self_op, + noise * vn if vn given), K never materialised.
 
@@ -2911,7 +2939,7 @@ if HAS_NKI:
             v:      (m, R)
             vn:     (n, R)  rows of V for the noise term of a row block of the
                     square operator (x = rows of y, #100); None otherwise
-            params: (128, 4) per-partition replicated [a, log s, noise, 0]
+            params: (128, 4) per-partition replicated [a, log s, noise, s]
             kind:   0 rbf, 1 matern12, 2 matern32, 3 matern52 (static)
             group:  Y tiles per rolled-loop body (static, 1 to `_KMV_MAX_GROUP`)
         Returns:
@@ -2943,6 +2971,14 @@ if HAS_NKI:
         _kmv_aug_t(x if self_op else y, yt, 0, m, 1)
         xt = nl.ndarray((da, n), dtype=nl.float32, buffer=nl.shared_hbm)
         _kmv_aug_t(x, xt, 0, n, 0)
+        # Y-side coordinates of the output rows, for the diagonal correction
+        # (#143): yt itself for the square operator; for a row block of it
+        # the same instructions on the same rows (x is a slice of y), so the
+        # same bits as the rows' columns of yt.
+        xyt = yt
+        if noisy and not self_op:
+            xyt = nl.ndarray((da, n), dtype=nl.float32, buffer=nl.shared_hbm)
+            _kmv_aug_t(x, xyt, 0, n, 1)
         prm = nl.load(params)
 
         # Y tiles: `nt` full ones and a ragged one of `jt` rows.
@@ -3040,18 +3076,22 @@ if HAS_NKI:
                     nl.ndarray((_TILE_M, _TILE_M), dtype=nl.float32, buffer=nl.psum)
                     for _ in range(2)
                 ]
+                # Square operator: noise + s - K~_ii per output row (#143).
+                coefs = []
+                if noisy:
+                    for c, cr in chunks:
+                        ya = nl.load(xyt[:, nl.ds(i0 + c, cr)])
+                        coefs.append(_kmv_diag_coef(ya, xb[:, c : c + cr], prm, kind, cr))
                 t = 0
                 for ri, (r0, rr) in enumerate(rg):
-                    for c, cr in chunks:
+                    for ci, (c, cr) in enumerate(chunks):
                         t_ps = t_ring[t % 2][0:cr, 0:rr]
                         t += 1
                         nisa.nc_transpose(t_ps, acc[ri][:, c : c + cr], engine=nisa.engine.tensor)
                         o = nl.ndarray((cr, rr), dtype=nl.float32, buffer=nl.sbuf)
                         if noisy:
                             vi = nl.load(v_noise[nl.ds(i0 + c, cr), r0 : r0 + rr])
-                            nisa.scalar_tensor_tensor(
-                                o, vi, nl.multiply, prm[0:cr, 2:3], nl.add, t_ps
-                            )
+                            nisa.scalar_tensor_tensor(o, vi, nl.multiply, coefs[ci], nl.add, t_ps)
                         else:
                             nisa.tensor_copy(o, t_ps)
                         nl.store(out[nl.ds(i0 + c, cr), r0 : r0 + rr], value=o)

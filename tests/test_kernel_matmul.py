@@ -30,14 +30,8 @@ def _pytorch_backend():
     trnsparse.set_backend(old)
 
 
-# fp32-class for every kernel on separated points (trnsci/trnsci#173).
+# fp32-class for every kernel (trnsci/trnsci#173, #143).
 _TOL = {"rbf": 2e-5, "matern12": 2e-5, "matern32": 2e-5, "matern52": 2e-5}
-# The square operator has the diagonal, D_ii = 0 computed as the rounding
-# error of |x|^2 + |x|^2 - 2 x.x (about u |x|^2). Matern-1/2 has a cusp at
-# r = 0, so that error enters as sqrt(u |x|^2) / l (see kernel_matmul's
-# docstring): 1.3e-4 to 4.2e-4 here on the fp32 expansion, independent of
-# how the square root is evaluated. The smooth kernels see it at first order.
-_TOL_SELF = {**_TOL, "matern12": 1e-3}
 
 
 @pytest.mark.parametrize("kernel", KERNELS)
@@ -72,7 +66,42 @@ def test_square_operator_with_noise(kernel, n):
     V = torch.randn(n, 5, generator=g)
     out = kernel_matmul(X, None, V, kernel, 0.3, 1.3, noise=1e-2)
     ref = kernel_matmul_reference(X, None, V, kernel, 0.3, 1.3, noise=1e-2)
-    assert _rel(out, ref) < _TOL_SELF[kernel]
+    assert _rel(out, ref) < _TOL[kernel]
+
+
+@pytest.mark.parametrize("kernel", KERNELS)
+@pytest.mark.parametrize("n", [300, 2049])
+def test_square_operator_diagonal_is_exact(kernel, n, monkeypatch):
+    """K_ii = s exactly, not k(u |x|^2): Matern-1/2's cusp at r = 0 (#143).
+
+    V = I reads K + noise I column by column. At l = 0.05 (the bench) and
+    |x| up to 3.5 after centring, the expansion's D_ii ~ u |x|^2 put up to
+    ~5e-3 relative error on K_ii. Small row blocks check the block offset.
+    Off the diagonal the square operator is the cross product K(X, X)
+    bit for bit (near-duplicate pairs keep the expansion's error there).
+    """
+    import importlib
+
+    km = importlib.import_module("trnsparse.kernel_matmul")
+    monkeypatch.setattr(km, "_TORCH_BLOCK_ELEMS", 512 * n)
+    g = torch.Generator().manual_seed(n)
+    X = 4.0 * torch.rand(n, 3, generator=g)
+    V = torch.eye(n)
+    out = kernel_matmul(X, None, V, kernel, 0.05, 1.3, noise=1e-2)
+    torch.testing.assert_close(out.diagonal(), torch.full((n,), 1.3 + 1e-2), rtol=2.5e-7, atol=0)
+    cross = kernel_matmul(X, X, V, kernel, 0.05, 1.3)
+    off = ~torch.eye(n, dtype=torch.bool)
+    assert torch.equal(out[off], cross[off])
+    ref = kernel_matmul_reference(X, None, V, kernel, 0.05, 1.3, noise=1e-2)
+    assert float(ref.diagonal().sub(1.3 + 1e-2).abs().max()) < 1e-15
+
+
+def test_operator_rows_diagonal_is_exact():
+    X = 4.0 * torch.rand(100, 3, generator=torch.Generator().manual_seed(3))
+    op = trnsparse.KernelOperator(X, "matern12", 0.05, 1.3)
+    idx = torch.tensor([0, 17, 99])
+    rows = op.rows(idx)
+    assert torch.equal(rows[torch.arange(3), idx], torch.full((3,), 1.3, dtype=torch.float64))
 
 
 def test_vector_rhs_and_ard_lengthscale():
@@ -224,7 +253,7 @@ def test_params_are_tensor_arguments(monkeypatch):
     assert (k1, g1) == (k2, g2)  # same static arguments: one compile
     assert p1.shape == (128, 4)
     torch.testing.assert_close(
-        p1[0], torch.tensor([-0.5 / 0.25, torch.log(torch.tensor(2.0)), 0.1, 0.0])
+        p1[0], torch.tensor([-0.5 / 0.25, torch.log(torch.tensor(2.0)), 0.1, 2.0])
     )
     assert not torch.equal(p1, p2)
 
