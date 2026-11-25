@@ -129,7 +129,7 @@ def test_simulate_matches_reference_lnc1_lnc2(case, self_op):
         pytest.skip("square operator needs m = n")
     x, y, v, params, ref = _inputs(n, m, d, R, kernel, self_op)
     kind = _KINDS.index(kernel)
-    tol = 5e-3 if kernel == "matern12" and self_op else 5e-6  # Matern-1/2 cusp, see kernel_matmul
+    tol = 5e-6  # the square operator's diagonal is exact, Matern-1/2 included (#143)
     outs = []
     with warnings.catch_warnings():
         warnings.simplefilter("error", UserWarning)  # e.g. PSUM accumulate / ScalarE range warnings
@@ -219,6 +219,38 @@ def _assert_blocked_matches(one, blocked):
 
 
 _TILE = 128
+
+
+@pytest.mark.parametrize("kernel", _KINDS)
+def test_simulate_square_diagonal_is_exact(kernel):
+    """K_ii = s on the square operator, one launch and row-blocked (#143).
+
+    Far-from-centre points (|x| ~ 4) and l = 0.05 put the expansion's
+    D_ii ~ u |x|^2 under Matern-1/2's cusp: 3e-3 relative in K_ii before
+    the correction. V = I reads K + noise I.
+    """
+    n = 300
+    rng = np.random.default_rng(1)
+    x = (4.0 * rng.random((n, 3))).astype(np.float32)
+    v = np.eye(n, dtype=np.float32)
+    ell, s, noise = 0.05, 1.3, 1e-2
+    params = _params(_scale_coeff(kernel) / ell**2, s, noise, "cpu").numpy()
+    ref = kernel_matmul_reference(
+        torch.from_numpy(x), None, torch.from_numpy(v), kernel, ell, s, noise
+    ).numpy()
+    kind = _KINDS.index(kernel)
+    # Off the diagonal: the cross kernel on (X, X) bit for bit (the
+    # expansion's error at near-duplicate pairs stays there, uncentred).
+    p0 = _params(_scale_coeff(kernel) / ell**2, s, 0.0, "cpu").numpy()
+    cross = _run(x, x, v, p0, kind, 2, False)
+    off = ~np.eye(n, dtype=bool)
+    for out in (
+        _run(x, None, v, params, kind, 2, True),
+        _run_blocked(x, None, v, params, kind, 1, True, 128),
+    ):
+        np.testing.assert_allclose(np.diagonal(out), s + noise, rtol=3e-7, atol=0)
+        assert np.array_equal(out[off], cross[off])
+    assert np.abs(np.diagonal(ref) - (s + noise)).max() < 1e-12
 
 
 @pytest.mark.parametrize("lnc", [1, 2])

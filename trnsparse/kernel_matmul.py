@@ -32,7 +32,13 @@ u * (|x|^2 + |y|^2) with u = 2^-24, so the relative error of a distance is
 about u * (|x|^2 + |y|^2) / |x - y|^2: small for well-separated points and
 large only for near-duplicates, where the kernel value is ~s anyway (the
 error in k is then about u * (|x|^2 + |y|^2) / (2 l^2), relative). Centring
-keeps |x|^2 small. float64 inputs follow the suite float64 policy (#84),
+keeps |x|^2 small. The square operator's diagonal is exact, K_ii = s,
+on every path (#143): the expansion leaves D_ii at about u * 2 |x|^2
+instead of 0, which Matern-1/2's cusp at r = 0 would turn into a relative
+error of sqrt(u * 2 |x|^2) / l in K_ii (3e-3 at l = 0.05). The PyTorch
+path zeroes D_ii; the NKI kernel adds (s - K~_ii) * V_i to each row, with
+K~_ii recomputed by the same instructions as in the main loop (see
+`kernels._kmv_diag_coef`). float64 inputs follow the suite float64 policy (#84),
 as every other trnsparse kernel route (`dispatch._fp64_route`): backend
 "auto" computes them with torch in float64 (on the host when they are on
 the neuron device, whose arithmetic is fp32; one warning), explicit "nki"
@@ -162,8 +168,9 @@ def kernel_matmul_reference(
     _real_points("X", X)
     _real_points("Y", Y)
     vec = V.dim() == 1
+    square = Y is None
     X = X.detach().to("cpu", torch.float64)
-    Y = X if Y is None else Y.detach().to("cpu", torch.float64)
+    Y = X if square else Y.detach().to("cpu", torch.float64)
     V = V.detach().to("cpu")
     V, R = _split_complex(V[:, None] if vec else V)
     V64 = V.to(torch.float64)
@@ -175,6 +182,9 @@ def kernel_matmul_reference(
     out = torch.empty(X.shape[0], V64.shape[1], dtype=torch.float64)
     for i0 in range(0, X.shape[0], block_rows):
         D = torch.cdist(X[i0 : i0 + block_rows], Y).square_()
+        if square:
+            # Exact zero self-distance (cdist's mm path leaves ~u |x|^2, #143).
+            D.diagonal(offset=i0).zero_()
         out[i0 : i0 + block_rows] = _kernel_of_sqdist(kind, D, a, float(outputscale)) @ V64
     if noise:
         out += float(noise) * V64
@@ -200,6 +210,11 @@ def _torch_kernel_matmul(Xc, Yc, V, kind, a, s, noise):
         xb = Xc[i0 : i0 + block]
         D = torch.addmm(yn[None, :], xb, Y.T, alpha=-2.0).add_(xn[i0 : i0 + block, None])
         D.clamp_(min=0.0)
+        if self_op:
+            # D_ii is the cancellation |x|^2 + |x|^2 - 2 x.x, about u |x|^2
+            # rather than 0, and Matern-1/2's cusp at 0 turns that into
+            # sqrt(u a |x|^2) relative error in K_ii (#143): zero it exactly.
+            D.diagonal(offset=i0).zero_()
         out[i0 : i0 + block] = _kernel_of_sqdist(kind, D, a, s) @ V
     if self_op and noise:
         out += noise * V
@@ -207,8 +222,8 @@ def _torch_kernel_matmul(Xc, Yc, V, kind, a, s, noise):
 
 
 def _params(a: float, s: float, noise: float, device) -> torch.Tensor:
-    """(128, 4) fp32 [a, log s, noise, 0], replicated per partition (kernel argument)."""
-    row = torch.tensor([a, math.log(s), noise, 0.0], dtype=torch.float32)
+    """(128, 4) fp32 [a, log s, noise, s], replicated per partition (kernel argument)."""
+    row = torch.tensor([a, math.log(s), noise, s], dtype=torch.float32)
     return row.expand(128, 4).contiguous().to(device)
 
 
@@ -387,6 +402,7 @@ class KernelOperator:
             self._Xh = self.X.detach().to("cpu", torch.float64)
         Xh = self._Xh
         D = torch.cdist(Xh[idx], Xh).square_()
+        D[torch.arange(idx.numel()), idx] = 0.0  # exact K_ii = s (#143)
         return _kernel_of_sqdist(self.kind, D, self._a, self.outputscale)
 
 

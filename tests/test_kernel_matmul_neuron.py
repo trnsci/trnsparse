@@ -80,7 +80,7 @@ def test_cross_on_device(kernel, n, m, d, R):
     assert _rel(out, ref) < 2e-5
 
 
-@pytest.mark.parametrize("kernel", ["rbf", "matern52"])
+@pytest.mark.parametrize("kernel", ["rbf", "matern12", "matern52"])
 @pytest.mark.parametrize("n", [1, 129, 1000, 4097, 20000])
 def test_square_operator_on_device(kernel, n):
     g = torch.Generator().manual_seed(n)
@@ -88,7 +88,35 @@ def test_square_operator_on_device(kernel, n):
     op = trnsparse.KernelOperator(X, kernel, 0.1, 1.0, noise=1e-4, device=DEV)
     assert op.route == "nki"
     ref = trnsparse.kernel_matmul_reference(X, None, V, kernel, 0.1, 1.0, noise=1e-4)
-    assert _rel(op(V.to(DEV)), ref) < 2e-5
+    # Matern-1/2 has a cusp at D = 0: near-duplicate off-diagonal pairs keep the
+    # augmented-GEMM cancellation error (~u|x|^2 in D, amplified by sqrt). The
+    # diagonal is exact (#143); the off-diagonal residue is #119's recentring item.
+    # Measured on trn2: 2.9e-5 at n=4097, l=0.1 (window 7).
+    tol = 5e-5 if kernel == "matern12" else 2e-5
+    assert _rel(op(V.to(DEV)), ref) < tol
+
+
+@pytest.mark.parametrize("blocked", [False, True], ids=["one-launch", "row-blocked"])
+@pytest.mark.parametrize("kernel", ["rbf", "matern12", "matern32", "matern52"])
+def test_square_operator_diagonal_exact_on_device(monkeypatch, kernel, blocked):
+    """K_ii = s on the device (#143), one launch and in row blocks (`_kmv_selfblk_kernel`).
+
+    l = 0.05 and |x| up to 3.5 after centring: the expansion's D_ii ~ u |x|^2
+    put up to ~5e-3 relative error on K_ii for Matern-1/2 before the
+    correction. V = I reads K + noise I. Off the diagonal the square
+    operator is the cross kernel on (X, X) bit for bit.
+    """
+    n = 1000 + 37
+    if blocked:
+        monkeypatch.setenv("TRNSPARSE_KMV_BLOCK_WORK", str(256 * n))
+    g = torch.Generator().manual_seed(7)
+    X, V = 4.0 * torch.rand(n, 3, generator=g), torch.eye(n)
+    op = trnsparse.KernelOperator(X, kernel, 0.05, 1.3, noise=1e-2, device=DEV)
+    out = op(V.to(DEV)).cpu()
+    torch.testing.assert_close(out.diagonal(), torch.full((n,), 1.3 + 1e-2), rtol=3e-7, atol=0)
+    cross = op.cross(X, V.to(DEV)).cpu()
+    off = ~torch.eye(n, dtype=torch.bool)
+    assert torch.equal(out[off], cross[off])
 
 
 @pytest.mark.parametrize("R", [1, 33, 130])

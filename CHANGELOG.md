@@ -81,6 +81,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
       the exemplar checker, and a timing harness against aten `index_add_`
       / `scatter_add_` / `index_select`.
 
+### Fixed
+
+- **`kernel_matmul` / `KernelOperator`: the square operator's diagonal is
+  exact, K_ii = s, on every path (#143).** The distance expansion leaves
+  D_ii = |x|² + |x|² − 2 x·x at about u·2|x|² instead of 0. Matérn-1/2's
+  cusp at r = 0 turned that into sqrt(u·a·2|x|²) relative error in K_ii:
+  6.5e-4 relative on the trn2 bench (n = 131072, ℓ = 0.05), and about
+  3e-3 on single entries. The PyTorch path, the float64 reference and
+  `KernelOperator.rows` now zero D_ii. The NKI kernel adds
+  (s − K̃_ii)·V_i to each output row. It recomputes K̃_ii with the main
+  loop's instructions, then takes the diagonal with `affine_select`, so the
+  off-diagonal entries are unchanged bit for bit. The Matérn-1/2 bench error
+  drops to 1.4e-5, and the cost is under 0.5% of throughput. `params`
+  column 3 now carries s. Matérn-1/2 square-operator tolerances are
+  fp32-class again (2e-5 on the PyTorch path, 5e-6 in the simulator).
+- **Fused CG power-iteration normaliser: GpSimd rsqrt instead of ScalarE
+  sqrt + reciprocal (trnsci/trnsci#173).** ScalarE sqrt is accurate (8.4e-7)
+  only for inputs in [2^-52, 2^52], and reaches 6.2e-3 above 2^92. The
+  normaliser's input is a squared norm of any size. GpSimd rsqrt is 1.1e-7
+  over the whole fp32 range.
+- The Matérn tiles keep ScalarE sqrt (trnsci/trnsci#173, measured on trn2).
+  Their arguments sit in its accurate range, so per-entry error is ≤ 8e-6,
+  the same as the GpSimd alternatives at the entry level. The alternatives
+  cost 12–30% (rsqrt) to 96% (`power`) of the throughput. New probes:
+  `benchmarks/probe_kmv_entries_trn2.py` (per-entry kernel accuracy) and
+  `benchmarks/probe_scalare_sqrt_range_trn2.py` (sqrt error by input range).
+
 ## [0.16.1] — 2026-11-10
 
 Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.0, native TorchNeuron) — see trnsci/trnsci#35.
