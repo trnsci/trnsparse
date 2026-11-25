@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`segment_sum` / `gather`: calls above one launch's 2^31-byte range split
+  the feature axis (#141).** Each launch covers a chunk of columns (a
+  multiple of the kernel's 2048-column group, or of a 512-column PSUM bank,
+  when that wide) over the same plan. Columns are independent, so the result
+  is bitwise equal to one launch. This keeps the MLIP layer-1 width
+  (F = 5120) on the kernel from about 4096 atoms up, where it used to fall
+  back to device aten `index_add_` / `index_select`. The pytorch path is now
+  taken only when a single column is too wide (E or N near 2^29).
+- **`segment_plan(idx, N, padding=mask)` (#141).** Edges marked in the mask
+  (padding to a compile bucket) take no slots and are skipped by every sum
+  over the plan. The slot count and the sums are those of the real edges
+  alone, bitwise, wherever the padding points; NaN padding messages are never
+  read. Before, padding piled on one segment raised every tile's slot count
+  (56 to 72 at 1728 atoms, 2.9x at 8000).
+
 - **`segment_sum(m, idx, N)` / `gather(h, idx)`: the graph segment sum
   (index-add) and row gather, each registered as the other's backward
   (#139).** This is the graph block of the MLIP exemplar
@@ -46,7 +61,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Not on the host densify path: `spmm` over an incidence matrix densifies
     on the host and is unusable at 1728 atoms.
   - fp64 follows the suite policy (#84). Inputs above 2^31 bytes per launch
-    take the pytorch path under `auto`.
+    split the feature axis (#141).
   - Tests:
     - CPU (`tests/test_segment.py`): a vendored slice of the exemplar's
       MACE-MP-0b2 capture (`tests/fixtures/mlip_graph_tiny.pt`), fp64

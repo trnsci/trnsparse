@@ -48,18 +48,30 @@ rounding.
 **Static shapes.** Indices are runtime data (the plan's tables), never
 compiled in. A kernel compiles per (E, F, tiles, slots): the slot count is
 rounded up to a multiple of 8 (1024 edges per tile), so small changes in
-connectivity between MD steps usually keep it. Pad E to buckets with zero
-messages on the last segment: no other row's edges move, so their sums are
-bitwise unchanged. (Padding an earlier segment moves later rows to other
-slots, which regroups their sums: equal to fp32 rounding, not bitwise.)
+connectivity between MD steps usually keep it.
+
+**Padding E to a compile bucket.** Mark the padding edges:
+``segment_plan(idx, N, padding=mask)``. The plan gives them no slots, so
+the slot count and every real row's summation order are those of the real
+edges alone, and the sums are bitwise equal to the plan over the real edges,
+whichever segments the padding points at. The contract: the sums ignore
+``m`` (and the gather cotangent) at padded edges; `gather` and the backward
+of `segment_sum` still fill padded rows (see `segment_plan`). Without a
+mask, padding edges are ordinary edges: they must carry zero messages, and
+piling them onto one segment makes that segment's tile set the slot count
+for every tile (56 -> 72 slots at 1728 atoms, 2.9x at 8000, #141). Spread
+them over segments 0, 1, 2, ... instead.
 
 **Index safety.** Index arithmetic stays on the host in int64. The device
 sees only int32 edge and row ids, moved by DMA without conversion, and fp32
 row offsets in [-1, 127] (exact). There is no flattened E*F or N*F index
 and no int64 transpose, mask or ``index_select`` on the device
 (aws-neuron-sdk#1466, #1467, #1468). Range limits are checked on the host:
-E and N below 2^31, and the indexed tensor below 2^31 bytes per launch
-(beyond that, ``auto`` uses the pytorch path).
+E and N below 2^31, and every tensor a launch addresses below 2^31 bytes. A
+call wider than that splits the feature axis into chunks, one launch per
+chunk over the same plan (#141): columns are independent, so the result is
+bitwise equal to one launch. Only when a single column is too wide (E or N
+near 2^29) does ``auto`` use the pytorch path.
 
 **dtypes.** The kernels compute in fp32 with fp32 accumulation: bf16 / fp16
 inputs are upcast exactly, and the result comes back in the input dtype.
@@ -78,12 +90,39 @@ import math
 import torch
 
 from .nki import dispatch as _d
-from .nki.kernels import _SEG_CHUNK, _SEG_P, _SEG_PROGRAMS, _gather_split
+from .nki.kernels import _SEG_CHUNK, _SEG_GROUP, _SEG_P, _SEG_PROGRAMS, _SEG_PSUM_N, _gather_split
 
 _INT32_MAX = 2**31 - 1
-# Largest indexed tensor (bytes) one kernel launch addresses: the DMA adds
-# int32 row index x row stride, kept within a signed 32-bit byte offset.
+# Largest tensor (bytes) one kernel launch addresses: the DMA adds int32 row
+# index x row stride, kept within a signed 32-bit byte offset. Wider calls
+# split the feature axis (`_feature_chunk`).
 _SEG_MAX_BYTES = 2**31
+
+
+def _launch_rows(e: int, n: int) -> int:
+    """Rows of the largest tensor a launch over (E, N) addresses, either op or
+    its backward: the padded edge count (messages, gather output) or the padded
+    output tiles (sum output, gather input), whichever is larger."""
+    ep = -(-max(e, 1) // (_SEG_P * _SEG_PROGRAMS)) * (_SEG_P * _SEG_PROGRAMS)
+    return max(ep, n + 2 * _SEG_P)
+
+
+def _feature_chunk(e: int, n: int, f: int) -> int:
+    """Columns per launch for an (E, N, F) call: F when one launch fits, else
+    the widest chunk that does (a multiple of the kernel's 2048-column group,
+    or of a 512-column PSUM bank, when that wide), 0 when one column does not.
+
+    Columns are independent in both kernels (the incidence tiles and the slot
+    order depend on the plan only), so a split call is bitwise equal to one
+    launch. Aligned chunks also keep each column in the same group and bank
+    position as in the unsplit kernel."""
+    w = (_SEG_MAX_BYTES - 1) // (_launch_rows(e, n) * 4)
+    if w >= f:
+        return f
+    for align in (_SEG_GROUP, _SEG_PSUM_N):
+        if w >= align:
+            return w // align * align
+    return w
 
 
 def _host_index(idx: torch.Tensor) -> torch.Tensor:
@@ -142,12 +181,25 @@ class SegmentPlan:
             zero-fills the rest (more than a quarter of the tiles empty).
         slot_fill: E / (computed slots x 128), the useful fraction of the
             kernel's work.
+        num_padding: edges marked in ``padding`` (0 without a mask).
     """
 
-    def __init__(self, idx: torch.Tensor, num_segments: int):
+    def __init__(self, idx: torch.Tensor, num_segments: int, padding: torch.Tensor | None = None):
         index = _host_index(idx)
         n = int(num_segments)
         e = int(index.numel())
+        pad = None
+        if padding is not None:
+            if not isinstance(padding, torch.Tensor):
+                padding = torch.as_tensor(padding)
+            if padding.dtype != torch.bool or padding.shape != (e,):
+                raise ValueError(
+                    f"padding must be a bool [E] = [{e}] mask, got {padding.dtype} "
+                    f"{tuple(padding.shape)}"
+                )
+            pad = padding.detach().to("cpu").contiguous()
+            if not bool(pad.any()):
+                pad = None
         if n < 0:
             raise ValueError(f"num_segments must be >= 0, got {n}")
         if e > _INT32_MAX or n > _INT32_MAX - 2 * _SEG_P:
@@ -159,6 +211,8 @@ class SegmentPlan:
         self.num_segments = n
         self.num_edges = e
         self.index = index
+        self.padding = pad
+        self.num_padding = int(pad.sum()) if pad is not None else 0
         self.is_sorted = e < 2 or bool((index[1:] >= index[:-1]).all())
         if self.is_sorted:
             self.perm = torch.arange(e, dtype=torch.int64)
@@ -166,12 +220,17 @@ class SegmentPlan:
             self.perm = torch.argsort(index, stable=True)
         self._build_layout()
         self._device_tables: dict[str, tuple[torch.Tensor, ...]] = {}
+        self._device_keep: dict[str, torch.Tensor] = {}
 
     def _build_layout(self) -> None:
         """Tile / slot tables for the kernels (host int64 math, int32 / fp32 results)."""
-        P, e, n = _SEG_P, self.num_edges, self.num_segments
+        P, n = _SEG_P, self.num_segments
+        e_all = self.num_edges
+        # The summed edges in stable sorted order: every edge but the padding.
+        summed = self.perm if self.padding is None else self.perm[~self.padding[self.perm]]
+        e = int(summed.numel())
         T = max(1, -(-n // P))
-        srt = self.index[self.perm]  # segment ids in sorted order
+        srt = self.index[summed]  # segment ids in sorted order
         tile_of = torch.div(srt, P, rounding_mode="floor")
         tcount = torch.bincount(tile_of, minlength=T) if e else torch.zeros(T, dtype=torch.int64)
         tstart = torch.cumsum(tcount, 0) - tcount
@@ -179,7 +238,7 @@ class SegmentPlan:
         empty = torch.nonzero(tcount == 0, as_tuple=False).flatten()
         S = max(1, -(-int(tcount.max()) // P)) if e else 1
         S = -(-S // _SEG_CHUNK) * _SEG_CHUNK
-        compact = 4 * int(empty.numel()) > T
+        compact = e > 0 and 4 * int(empty.numel()) > T
         if not compact:
             # Every tile computed (empty ones give zeros), padded to an even count.
             K = -(-T // _SEG_PROGRAMS) * _SEG_PROGRAMS
@@ -210,7 +269,7 @@ class SegmentPlan:
         if e:
             has = torch.zeros(K, dtype=torch.bool)
             has[real] = tcount[tiles[real]] > 0
-            first[has] = self.perm[tstart[tiles[has]]]
+            first[has] = summed[tstart[tiles[has]]]
         src = first.repeat_interleave(P).unsqueeze(1).expand(K * P, S).clone()
         local = torch.full((K * P, S), -1.0, dtype=torch.float32)
         if e:
@@ -218,23 +277,23 @@ class SegmentPlan:
             k = kpos[tile_of]
             rows = k * P + torch.remainder(q, P)
             cols = torch.div(q, P, rounding_mode="floor")
-            src[rows, cols] = self.perm
+            src[rows, cols] = summed
             local[rows, cols] = (srt - tile_of * P).to(torch.float32)  # in [0, 127]: exact
         p = torch.arange(P, dtype=torch.int64)
         orow = (tiles.unsqueeze(1) * P + p).reshape(-1, 1)
         nz = int(zeros.numel())
         zt = zeros if nz else torch.tensor([T - 1 if T else 0], dtype=torch.int64)
         zrow = (zt.unsqueeze(1) * P + p).reshape(-1, 1)
-        ep = -(-max(e, 1) // (P * _SEG_PROGRAMS)) * (P * _SEG_PROGRAMS)
+        ep = -(-max(e_all, 1) // (P * _SEG_PROGRAMS)) * (P * _SEG_PROGRAMS)
         gidx = torch.zeros(ep, 1, dtype=torch.int64)
-        gidx[:e, 0] = self.index
+        gidx[:e_all, 0] = self.index
         gidx = _gather_layout(gidx)
         for name, t in (("src", src), ("orow", orow), ("zrow", zrow), ("gidx", gidx)):
             if t.numel() and (int(t.min()) < 0 or int(t.max()) > _INT32_MAX):
                 raise AssertionError(f"segment plan table {name} out of int32 range")
         self.tiles, self.slots, self.compact = T, S, compact
         self.computed_tiles, self.zero_tiles, self.rows_out = K, nz, rows_out
-        self.slot_fill = e / float(K * S * P)
+        self.slot_fill = e / float(K * S * P)  # summed (non-padding) edges
         # int64 -> int32 casts of values checked above: exact.
         # Kernel layout: tile k, chunk c (8 slots), partition p is row
         # (k * NC + c) * P + p, slot j of the chunk is column j.
@@ -260,6 +319,15 @@ class SegmentPlan:
             self._device_tables[key] = tuple(t.to(device) for t in self._tables)
         return self._device_tables[key]
 
+    def keep(self, device=None) -> torch.Tensor | None:
+        """``[E, 1]`` bool, False at the padding edges (None without padding), on `device`."""
+        if self.padding is None:
+            return None
+        key = str(torch.device(device)) if device is not None else "cpu"
+        if key not in self._device_keep:
+            self._device_keep[key] = (~self.padding).unsqueeze(1).to(device or "cpu")
+        return self._device_keep[key]
+
     def to(self, device) -> SegmentPlan:
         """Stage the kernel tables on `device` now (otherwise on the first call)."""
         self.tables(device)
@@ -273,19 +341,37 @@ class SegmentPlan:
     def __repr__(self) -> str:
         return (
             f"SegmentPlan(N={self.num_segments}, E={self.num_edges}, sorted={self.is_sorted}, "
+            f"padding={self.num_padding}, "
             f"tiles={self.tiles}, slots={self.slots}, compact={self.compact}, "
             f"slot_fill={self.slot_fill:.2f})"
         )
 
 
-def segment_plan(idx: torch.Tensor, num_segments: int) -> SegmentPlan:
+def segment_plan(
+    idx: torch.Tensor, num_segments: int, *, padding: torch.Tensor | None = None
+) -> SegmentPlan:
     """Plan for `segment_sum(m, idx, num_segments)` and `gather(h, idx)`.
 
     ``idx`` is ``[E]`` int64 (or int32), on any device (copied to the host
     once), values in ``[0, num_segments)``. Build it once per neighbour
     list and pass it as ``plan=``.
+
+    ``padding`` is an optional ``[E]`` bool mask of edges that pad E to a
+    compile bucket. The plan leaves them out of every sum it computes, on
+    every backend: `segment_sum` ignores ``m`` at padded edges (as if it were
+    zero, so a NaN there does not spread), and so does the backward of
+    `gather` (the segment sum of the cotangent). `gather` itself still returns
+    ``h[idx[e]]`` at padded edges, and the backward of `segment_sum` still
+    returns ``grad[idx[e]]`` there: both are rows the caller discards or
+    multiplies by zero. Exact whenever the padded messages and gather
+    cotangents are zero, which is what bucket padding means. Padded edges
+    take no slots, so the kernel shape, the slot count and every real row's
+    summation order are those of the plan over the real edges alone: the sums
+    are bitwise equal to it, whichever segments the padding points at. (Without
+    a mask, padding edges are summed like any other: put them all on one
+    segment and that segment's tile sets the slot count for every tile.)
     """
-    return SegmentPlan(idx, num_segments)
+    return SegmentPlan(idx, num_segments, padding)
 
 
 _PLAN_CACHE: collections.OrderedDict = collections.OrderedDict()
@@ -310,10 +396,13 @@ def _plan_for(idx: torch.Tensor, n: int) -> SegmentPlan:
 # ── pytorch reference and the autograd pair (non-native routes) ─────────────
 
 
-def _torch_segment_sum(m: torch.Tensor, idx: torch.Tensor, n: int) -> torch.Tensor:
+def _torch_segment_sum(m: torch.Tensor, idx: torch.Tensor, n: int, plan=None) -> torch.Tensor:
     out = m.new_zeros((n, m.shape[1]))
     if m.shape[0] == 0:
         return out
+    keep = plan.keep(m.device) if plan is not None else None
+    if keep is not None:
+        m = torch.where(keep, m, m.new_zeros(()))  # padding edges add +0
     return out.index_add_(0, idx.to(m.device), m)
 
 
@@ -323,14 +412,27 @@ def _torch_gather(h: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
     return h.index_select(0, idx.to(h.device))
 
 
+def _kernel_launches(op_name: str, x: torch.Tensor, plan: SegmentPlan, rows: int) -> torch.Tensor:
+    """`op_name` over `x`, one launch per feature chunk (`_feature_chunk`), all
+    with the same plan; the first `rows` rows of each, joined on the feature
+    axis. `split` and `cat` differentiate to each other, so on the native path
+    each chunk's backward is the other op on that chunk."""
+    f = int(x.shape[1])
+    w = _feature_chunk(plan.num_edges, plan.num_segments, f)
+    if w < 1:
+        raise NotImplementedError(f"trnsparse {op_name}: one feature column exceeds a launch")
+    if w >= f:
+        return _d.nki_segment_op(op_name, x, plan)[:rows]
+    parts = [_d.nki_segment_op(op_name, c.contiguous(), plan)[:rows] for c in x.split(w, dim=1)]
+    return torch.cat(parts, dim=1)
+
+
 def _kernel_segment_sum(m: torch.Tensor, plan: SegmentPlan) -> torch.Tensor:
-    out = _d.nki_segment_op("segment_sum_tiles", m, plan)
-    return out[: plan.num_segments]
+    return _kernel_launches("segment_sum_tiles", m, plan, plan.num_segments)
 
 
 def _kernel_gather(h: torch.Tensor, plan: SegmentPlan) -> torch.Tensor:
-    out = _d.nki_segment_op("gather_rows", h, plan)
-    return out[: plan.num_edges]
+    return _kernel_launches("gather_rows", h, plan, plan.num_edges)
 
 
 class _SegmentSumFn(torch.autograd.Function):
@@ -341,7 +443,7 @@ class _SegmentSumFn(torch.autograd.Function):
         ctx.idx, ctx.plan, ctx.kernel = idx, plan, kernel
         if kernel:
             return _kernel_segment_sum(m, plan)
-        return _torch_segment_sum(m, idx, n)
+        return _torch_segment_sum(m, idx, n, plan)
 
     @staticmethod
     def backward(ctx, grad):
@@ -378,13 +480,15 @@ def _kernel_ok(what: str, x: torch.Tensor, e: int, n: int, f: int) -> bool:
         return False
     if not _d._kernel_route(what, x):
         return False
-    rows = max(e, n + 2 * _SEG_P)
-    if rows * f * 4 >= _SEG_MAX_BYTES:
+    if _feature_chunk(e, n, f) < 1:
+        # Even a one-column launch over these rows exceeds the range (E or N
+        # around 2^29); wider calls split the feature axis instead.
         if _d._REQUIRE_NKI:
             raise NotImplementedError(
-                f"trnsparse {what}: {rows} x {f} fp32 rows exceed one kernel launch's "
-                f"{_SEG_MAX_BYTES} byte addressing range. Unset TRNSPARSE_REQUIRE_NKI to "
-                "use the pytorch path, or split the call over edge blocks."
+                f"trnsparse {what}: {_launch_rows(e, n)} fp32 rows of one column exceed one "
+                f"kernel launch's {_SEG_MAX_BYTES} byte addressing range. Unset "
+                "TRNSPARSE_REQUIRE_NKI to use the pytorch path, or split the call over "
+                "edge blocks."
             )
         return False
     return True
@@ -451,7 +555,7 @@ def segment_sum(
                 raise
     if plan is not None:
         _check_plan(plan, e, n)
-    return _SegmentSumFn.apply(m2, idx, n, None, False).reshape((n,) + rest)
+    return _SegmentSumFn.apply(m2, idx, n, plan, False).reshape((n,) + rest)
 
 
 @_d._fp64_host_guard("gather")
@@ -497,4 +601,4 @@ def gather(
                 raise
     if plan is not None:
         _check_plan(plan, e, n)
-    return _GatherFn.apply(h2, idx, None, False).reshape((e,) + rest)
+    return _GatherFn.apply(h2, idx, plan, False).reshape((e,) + rest)
