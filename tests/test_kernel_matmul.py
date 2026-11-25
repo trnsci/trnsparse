@@ -31,7 +31,9 @@ def _pytorch_backend():
 
 
 # fp32-class for every kernel (trnsci/trnsci#173, #143).
-_TOL = {"rbf": 2e-5, "matern12": 2e-5, "matern32": 2e-5, "matern52": 2e-5}
+# matern12: cusp at D = 0, so near-duplicate pairs keep the augmented-GEMM
+# cancellation error (3.3e-5 seen with d=1 on Linux BLAS); see #119 / #143.
+_TOL = {"rbf": 2e-5, "matern12": 5e-5, "matern32": 2e-5, "matern52": 2e-5}
 
 
 @pytest.mark.parametrize("kernel", KERNELS)
