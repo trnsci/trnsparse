@@ -164,6 +164,13 @@ def test_feature_chunks_bitwise(monkeypatch):
     # #141: a call above one launch's byte range splits F into chunks over the
     # same plan. Forced here with a small budget: 2048 + 2048 + 1024 columns,
     # and unaligned 700-column chunks, each bitwise equal to one launch.
+    #
+    # The simulator's nc_matmul is np.matmul. Its fp32 sum order for an output
+    # column depends on the moving width and on the OpenBLAS kernel the host
+    # CPU selects (#146). Aligned chunks run the same 512-column matmuls as one
+    # launch, so random messages are bitwise equal on any host. A 700-column
+    # chunk runs 512 + 188-column matmuls, so that case uses integer messages:
+    # their sums are exact in fp32, in any order.
     from trnsparse import segment as seg
 
     calls = _launches(monkeypatch)
@@ -173,22 +180,26 @@ def test_feature_chunks_bitwise(monkeypatch):
     plan = trnsparse.segment_plan(idx, n)
     m = torch.randn(e, F, generator=g)
     h = torch.randn(n, F, generator=g)
+    mi = torch.randint(-64, 65, (e, F), generator=g).float()
     one = (trnsparse.segment_sum(m, idx, n, plan=plan), trnsparse.gather(h, idx, plan=plan))
-    assert len(calls) == 2
-    for patch in (
-        ("_SEG_MAX_BYTES", seg._launch_rows(e, n) * 4 * 3000),
-        ("_feature_chunk", lambda e, n, f: 700),
+    one_int = trnsparse.segment_sum(mi, idx, n, plan=plan)
+    assert len(calls) == 3
+    for patch, msg, ref in (
+        (("_SEG_MAX_BYTES", seg._launch_rows(e, n) * 4 * 3000), m, one[0]),
+        (("_feature_chunk", lambda e, n, f: 700), mi, one_int),
     ):
         calls.clear()
         with monkeypatch.context() as mp:
             mp.setattr(seg, *patch)
             split = (
-                trnsparse.segment_sum(m, idx, n, plan=plan),
+                trnsparse.segment_sum(msg, idx, n, plan=plan),
                 trnsparse.gather(h, idx, plan=plan),
             )
         assert len(calls) == (6 if patch[0] == "_SEG_MAX_BYTES" else 16)
-        assert all(torch.equal(a, b) for a, b in zip(one, split, strict=True))
+        assert torch.equal(split[0], ref)
+        assert torch.equal(split[1], one[1])
     assert _rel(one[0], _ref(m, idx, n)) <= 1e-6
+    assert torch.equal(one_int.double(), _ref(mi, idx, n))
 
 
 def test_padding_mask_plan(monkeypatch):

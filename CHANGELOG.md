@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`test_feature_chunks_bitwise` no longer depends on the CI host's CPU
+  (#146).** The simulator runs `nc_matmul` as `np.matmul`, and OpenBLAS
+  picks its sgemm kernel by CPU. On some kernels the fp32 sum order for a
+  column changes with the matrix width, so the unaligned 700-column chunks
+  (512 + 188-column matmuls) were not bitwise equal to one launch. The test
+  then failed on some runners only. The unaligned case now uses integer
+  messages, whose fp32 sums are exact in any order. The aligned case still
+  uses random messages, since its matmul shapes match one launch's. Library
+  code and hardware results are unchanged.
+
 ## [0.17.0] — 2026-11-25
 
 Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.1, native TorchNeuron) — see trnsci/trnsci#35.
