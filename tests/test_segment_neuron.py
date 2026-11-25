@@ -24,6 +24,7 @@ The MLIP exemplar's graph block (trnsci/trnsci#170) on the device:
 
 from __future__ import annotations
 
+import gc
 import json
 import os
 import sys
@@ -208,11 +209,14 @@ def _run_pair(idx, n, F, plan, g):
     (gm,) = torch.autograd.grad(out, md, go.to(DEV))
     res = {"sum": out.detach().cpu(), "gm": gm.cpu()}
     del md, out, gm
+    gc.collect()  # the 4096-atom case needs the device memory back
     h, ge = torch.randn(n, F, generator=g), torch.randn(e, F, generator=g)
     hd = h.to(DEV).requires_grad_(True)
     got = trnsparse.gather(hd, idx_d, plan=plan)
     (gh,) = torch.autograd.grad(got, hd, ge.to(DEV))
     res.update(got=got.detach().cpu(), gh=gh.cpu())
+    del hd, got, gh
+    gc.collect()
     return res, (m, go, h, ge)
 
 
