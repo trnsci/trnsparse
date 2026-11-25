@@ -595,3 +595,221 @@ def test_kernel_route_through_emulated_launch(monkeypatch, no_env_flags):
         ge = torch.randn(3000, 7, generator=g).to(dt)
         (gh,) = torch.autograd.grad(out, h, ge)
         assert rel(gh, onehot_fp64(ge, idx, 216)) <= (1e-6 if dt == torch.float32 else 1e-2)
+
+
+# ── feature-axis chunks (#141) ───────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "e,n,f,w",
+    [
+        (96278, 1728, 5120, 5120),  # 1728 atoms, layer 1: one launch (just)
+        (229376, 4096, 5120, 2048),  # 4096 atoms: 2048 + 2048 + 1024
+        (458752, 8000, 5120, 1024),  # 8000 atoms: five 1024-column launches
+        (1_000_000, 17857, 2048, 512),  # E = 1e6: 512-column launches
+        (1_000_000, 17857, 512, 512),  # fits
+        (10_000_000, 178_571, 128, 53),  # narrower than a PSUM bank: unaligned
+        (2**29, 10, 1, 0),  # one column exceeds a launch
+    ],
+)
+def test_feature_chunk_widths_at_2_31(monkeypatch, e, n, f, w):
+    # The chunk rule under #140's 2^31-byte budget.
+    monkeypatch.setattr(seg, "_SEG_MAX_BYTES", 2**31)
+    assert seg._feature_chunk(e, n, f) == w
+    if w:
+        assert seg._launch_rows(e, n) * w * 4 < seg._SEG_MAX_BYTES
+
+
+@pytest.mark.parametrize(
+    "e,n,f,w",
+    [
+        (229376, 4096, 5120, 5120),  # 4096 atoms: one launch (4.7e9 bytes)
+        (458752, 8000, 5120, 5120),  # 8000 atoms: one launch (9.4e9 bytes)
+        (1_000_000, 17857, 5120, 4096),  # 2.0e10 bytes: 4096 + 1024
+        (2**31 - 1, 10, 1, 1),  # one column always fits
+    ],
+)
+def test_feature_chunk_widths_default(e, n, f, w):
+    assert seg._feature_chunk(e, n, f) == w
+
+
+def _reference_launch(calls):
+    """`nki_segment_op` replaced by an exact column-independent reference that
+    honours the plan's padding (index_add_ in edge order), recording widths."""
+
+    def launch(op_name, x, plan):
+        assert x.dtype == torch.float32 and x.is_contiguous()
+        calls.append((op_name, int(x.shape[1])))
+        if op_name == "segment_sum_tiles":
+            full = torch.zeros(plan.rows_out, x.shape[1])
+            full[: plan.num_segments] = seg._torch_segment_sum(
+                x, plan.index, plan.num_segments, plan
+            )
+            return full
+        gidx = seg._gather_natural(plan.tables()[0])
+        return x[gidx[:, 0].long()]
+
+    return launch
+
+
+@pytest.fixture
+def kernel_route(monkeypatch, no_env_flags):
+    """The non-native kernel route with a recording reference launch."""
+    monkeypatch.setattr(dispatch, "HAS_NKI", True)
+    monkeypatch.setattr(dispatch, "_backend", "nki")
+    monkeypatch.setattr(dispatch, "_REQUIRE_NKI", True)
+    monkeypatch.setattr(dispatch, "_dispatch_path", "cpu")
+    calls = []
+    monkeypatch.setattr(dispatch, "nki_segment_op", _reference_launch(calls))
+    return calls
+
+
+def _sum_gather_and_grads(idx, n, F, plan, seed):
+    g = torch.Generator().manual_seed(seed)
+    e = idx.numel()
+    m = torch.randn(e, F, generator=g, requires_grad=True)
+    out = ts.segment_sum(m, idx, n, plan=plan)
+    (gm,) = torch.autograd.grad(out, m, torch.randn(n, F, generator=g))
+    h = torch.randn(n, F, generator=g, requires_grad=True)
+    got = ts.gather(h, idx, plan=plan)
+    (gh,) = torch.autograd.grad(got, h, torch.randn(e, F, generator=g))
+    return out.detach(), gm, got.detach(), gh
+
+
+def test_wide_call_splits_features_bitwise(monkeypatch, kernel_route):
+    idx, _ = _graph(216, 3000, seed=21)
+    plan = ts.segment_plan(idx, 216)
+    one = _sum_gather_and_grads(idx, 216, 5120, plan, seed=4)
+    assert {w for _, w in kernel_route} == {5120} and len(kernel_route) == 4
+    # A launch budget of 2999 columns at 3072 rows: 2048 + 2048 + 1024.
+    monkeypatch.setattr(seg, "_SEG_MAX_BYTES", seg._launch_rows(3000, 216) * 4 * 3000)
+    kernel_route.clear()
+    split = _sum_gather_and_grads(idx, 216, 5120, plan, seed=4)
+    assert [w for _, w in kernel_route] == [2048, 2048, 1024] * 4
+    assert all(torch.equal(a, b) for a, b in zip(one, split, strict=True))
+    # Unaligned chunks (narrower than a PSUM bank) are bitwise too.
+    monkeypatch.setattr(seg, "_SEG_MAX_BYTES", seg._launch_rows(3000, 216) * 4 * 300)
+    kernel_route.clear()
+    narrow = _sum_gather_and_grads(idx, 216, 1000, plan, seed=5)
+    assert [w for _, w in kernel_route[:4]] == [299, 299, 299, 103]
+    monkeypatch.setattr(seg, "_SEG_MAX_BYTES", 2**31)
+    assert all(
+        torch.equal(a, b)
+        for a, b in zip(narrow, _sum_gather_and_grads(idx, 216, 1000, plan, seed=5), strict=True)
+    )
+
+
+def test_split_cuts_row_blocks_bitwise(monkeypatch, kernel_route):
+    # Column chunks of a tall operand are assembled from row blocks (device
+    # aten slices views spanning > 2^32 bytes slowly); same values, same grads.
+    idx, _ = _graph(216, 3000, seed=23)
+    plan = ts.segment_plan(idx, 216)
+    monkeypatch.setattr(seg, "_SEG_MAX_BYTES", seg._launch_rows(3000, 216) * 4 * 600)
+    one = _sum_gather_and_grads(idx, 216, 1500, plan, seed=6)
+    monkeypatch.setattr(seg, "_SEG_SLICE_BYTES", 1500 * 4 * 700)  # 700-row blocks
+    kernel_route.clear()
+    blocked = _sum_gather_and_grads(idx, 216, 1500, plan, seed=6)
+    assert [w for _, w in kernel_route[:3]] == [512, 512, 476]
+    assert all(torch.equal(a, b) for a, b in zip(one, blocked, strict=True))
+
+
+def test_split_call_matches_independent_reference(monkeypatch, kernel_route):
+    idx, g = _graph(300, 2000, seed=22)
+    monkeypatch.setattr(seg, "_SEG_MAX_BYTES", seg._launch_rows(2000, 300) * 4 * 700)
+    m = torch.randn(2000, 1500, generator=g)
+    out = ts.segment_sum(m, idx, 300)
+    assert [w for _, w in kernel_route] == [512, 512, 476]
+    assert rel(out, onehot_fp64(m, idx, 300)) <= 1e-6
+    h = torch.randn(300, 1500, generator=g)
+    assert torch.equal(ts.gather(h, idx), h[idx])
+
+
+# ── padding mask (#141) ──────────────────────────────────────────────────────
+
+
+def _padded_graph(n=1728, e=20000, pad=4000, seed=5):
+    idx, g = _graph(n, e, seed=seed)
+    pidx = torch.cat([idx, torch.zeros(pad, dtype=torch.long)])  # all on node 0
+    mask = torch.cat([torch.zeros(e, dtype=torch.bool), torch.ones(pad, dtype=torch.bool)])
+    return idx, pidx, mask, g
+
+
+def test_padding_mask_takes_no_slots():
+    idx, pidx, mask, _ = _padded_graph()
+    real = ts.segment_plan(idx, 1728)
+    piled = ts.segment_plan(pidx, 1728)
+    masked = ts.segment_plan(pidx, 1728, padding=mask)
+    assert piled.slots > real.slots  # node-0 padding inflates every tile
+    assert (masked.slots, masked.rows_out, masked.compact) == (
+        real.slots,
+        real.rows_out,
+        real.compact,
+    )
+    assert masked.num_padding == 4000 and masked.num_edges == 24000
+    # Trailing padding: the summing tables are those of the real edges alone.
+    for a, b in zip(real.tables()[1:], masked.tables()[1:], strict=True):
+        assert torch.equal(a, b)
+    assert masked.tables()[0].shape[0] >= 24000  # the gather covers every edge
+    spread = ts.segment_plan(torch.cat([idx, torch.arange(4000) % 1728]), 1728)
+    assert spread.slots < piled.slots  # the no-mask alternative
+
+
+def test_padding_mask_interleaved_matches_real_edges():
+    # Padding anywhere (not only trailing): the kernel layout sums the real
+    # edges in their stable order, bitwise equal to the plan over them alone.
+    idx, g = _graph(400, 5000, seed=9)
+    mask = torch.rand(5000, generator=g) < 0.2
+    plan = ts.segment_plan(idx, 400, padding=mask)
+    m = torch.randn(5000, 6, generator=g)
+    m[mask] = float("nan")  # never read by a sum
+    got = _emulate_segment_sum(m, plan)
+    ref = _emulate_segment_sum(m[~mask], ts.segment_plan(idx[~mask], 400))
+    assert torch.equal(got, ref)
+    assert rel(got, onehot_fp64(m[~mask], idx[~mask], 400)) <= 1e-12
+    h = torch.randn(400, 6, generator=g)
+    assert torch.equal(_emulate_gather(h, plan), h[idx])
+
+
+def test_padding_contract_pytorch_path():
+    idx, pidx, mask, g = _padded_graph(n=300, e=3000, pad=500)
+    plan = ts.segment_plan(pidx, 300, padding=mask)
+    m = torch.randn(3500, 4, generator=g, requires_grad=True)
+    with torch.no_grad():
+        m[3000:] = float("nan")
+    out = ts.segment_sum(m, pidx, 300, plan=plan)
+    assert torch.equal(out, ref_segment_sum(m.detach()[:3000], idx, 300))
+    go = torch.randn(300, 4, generator=g)
+    (gm,) = torch.autograd.grad(out, m, go)
+    assert torch.equal(gm, go[pidx])  # padded rows are filled, as documented
+    h = torch.randn(300, 4, generator=g, requires_grad=True)
+    got = ts.gather(h, pidx, plan=plan)
+    assert torch.equal(got, h.detach()[pidx])
+    ge = torch.randn(3500, 4, generator=g)
+    (gh,) = torch.autograd.grad(got, h, ge)
+    assert torch.equal(gh, ref_segment_sum(ge[:3000], idx, 300))  # padded cotangent ignored
+
+
+def test_padding_contract_kernel_route(kernel_route):
+    idx, pidx, mask, g = _padded_graph(n=300, e=3000, pad=500)
+    plan = ts.segment_plan(pidx, 300, padding=mask)
+    m = torch.randn(3500, 4, generator=g)
+    m[3000:] = float("nan")
+    assert torch.equal(ts.segment_sum(m, pidx, 300, plan=plan), ref_segment_sum(m[:3000], idx, 300))
+    h = torch.randn(300, 4, generator=g, requires_grad=True)
+    ge = torch.randn(3500, 4, generator=g)
+    (gh,) = torch.autograd.grad(ts.gather(h, pidx, plan=plan), h, ge)
+    assert torch.equal(gh, ref_segment_sum(ge[:3000], idx, 300))
+
+
+def test_padding_mask_validation():
+    idx, _ = _graph(10, 40)
+    with pytest.raises(ValueError, match="bool"):
+        ts.segment_plan(idx, 10, padding=torch.zeros(40, dtype=torch.long))
+    with pytest.raises(ValueError, match="bool"):
+        ts.segment_plan(idx, 10, padding=torch.zeros(39, dtype=torch.bool))
+    plan = ts.segment_plan(idx, 10, padding=torch.zeros(40, dtype=torch.bool))
+    assert plan.padding is None and plan.keep() is None
+    every = ts.segment_plan(idx, 10, padding=torch.ones(40, dtype=torch.bool))
+    assert every.num_padding == 40 and not every.compact
+    m = torch.randn(40, 3)
+    assert torch.equal(_emulate_segment_sum(m, every), torch.zeros(10, 3, dtype=torch.float64))

@@ -717,7 +717,7 @@ def _segment_inputs(F: int, compact: bool, E: int = 1200):
 
 _SEGMENT_CASES = {
     (kernel, f"F{F}-{'compact' if compact else 'dense'}"): (kernel, F, compact)
-    for F in (1, 3, 128, 512, 2048, 5120)
+    for F in (1, 3, 128, 512, 1024, 2048, 5120)  # 1024: a #141 feature chunk
     for compact in (False, True)
     for kernel in ("_segment_sum_kernel", "_gather_rows_kernel")
     if not (compact and kernel == "_gather_rows_kernel")
