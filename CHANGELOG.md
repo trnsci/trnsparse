@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.0] — 2026-11-25
+
+Validated on Trn2 (trn2.3xlarge, Neuron SDK 2.33.1, native TorchNeuron) — see trnsci/trnsci#35.
+
+Headline: the graph segment sum and row gather, `segment_sum` / `gather` / `segment_plan`, as deterministic TensorEngine kernels with registered backwards for the MLIP exemplar (#139, #140); they stay on the kernel past 2^31 bytes per call, with a padding mask for compile buckets (#141, #144). `kernel_matmul` / `KernelOperator` make the square operator's diagonal exact (#143), and the fused CG normaliser uses GpSimd rsqrt (trnsci/trnsci#173).
+
 ### Added
 
 - **`segment_sum` / `gather`: the MLIP layer-1 width stays on the kernel
