@@ -612,10 +612,25 @@ def test_kernel_route_through_emulated_launch(monkeypatch, no_env_flags):
         (2**29, 10, 1, 0),  # one column exceeds a launch
     ],
 )
-def test_feature_chunk_widths(e, n, f, w):
+def test_feature_chunk_widths_at_2_31(monkeypatch, e, n, f, w):
+    # The chunk rule under #140's 2^31-byte budget.
+    monkeypatch.setattr(seg, "_SEG_MAX_BYTES", 2**31)
     assert seg._feature_chunk(e, n, f) == w
     if w:
         assert seg._launch_rows(e, n) * w * 4 < seg._SEG_MAX_BYTES
+
+
+@pytest.mark.parametrize(
+    "e,n,f,w",
+    [
+        (229376, 4096, 5120, 5120),  # 4096 atoms: one launch (4.7e9 bytes)
+        (458752, 8000, 5120, 5120),  # 8000 atoms: one launch (9.4e9 bytes)
+        (1_000_000, 17857, 5120, 4096),  # 2.0e10 bytes: 4096 + 1024
+        (2**31 - 1, 10, 1, 1),  # one column always fits
+    ],
+)
+def test_feature_chunk_widths_default(e, n, f, w):
+    assert seg._feature_chunk(e, n, f) == w
 
 
 def _reference_launch(calls):
@@ -682,6 +697,20 @@ def test_wide_call_splits_features_bitwise(monkeypatch, kernel_route):
         torch.equal(a, b)
         for a, b in zip(narrow, _sum_gather_and_grads(idx, 216, 1000, plan, seed=5), strict=True)
     )
+
+
+def test_split_cuts_row_blocks_bitwise(monkeypatch, kernel_route):
+    # Column chunks of a tall operand are assembled from row blocks (device
+    # aten slices views spanning > 2^32 bytes slowly); same values, same grads.
+    idx, _ = _graph(216, 3000, seed=23)
+    plan = ts.segment_plan(idx, 216)
+    monkeypatch.setattr(seg, "_SEG_MAX_BYTES", seg._launch_rows(3000, 216) * 4 * 600)
+    one = _sum_gather_and_grads(idx, 216, 1500, plan, seed=6)
+    monkeypatch.setattr(seg, "_SEG_SLICE_BYTES", 1500 * 4 * 700)  # 700-row blocks
+    kernel_route.clear()
+    blocked = _sum_gather_and_grads(idx, 216, 1500, plan, seed=6)
+    assert [w for _, w in kernel_route[:3]] == [512, 512, 476]
+    assert all(torch.equal(a, b) for a, b in zip(one, blocked, strict=True))
 
 
 def test_split_call_matches_independent_reference(monkeypatch, kernel_route):

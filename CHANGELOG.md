@@ -9,14 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **`segment_sum` / `gather`: calls above one launch's 2^31-byte range split
-  the feature axis (#141).** Each launch covers a chunk of columns (a
-  multiple of the kernel's 2048-column group, or of a 512-column PSUM bank,
-  when that wide) over the same plan. Columns are independent, so the result
-  is bitwise equal to one launch. This keeps the MLIP layer-1 width
-  (F = 5120) on the kernel from about 4096 atoms up, where it used to fall
-  back to device aten `index_add_` / `index_select`. The pytorch path is now
-  taken only when a single column is too wide (E or N near 2^29).
+- **`segment_sum` / `gather`: the MLIP layer-1 width stays on the kernel
+  from 4096 atoms up (#141).** #140 sent any operand above 2^31 bytes to
+  device aten `index_add_` / `index_select`, which fail on trn2 at the
+  4096-atom shape (E = 229376, F = 5120: 4.7e9 bytes). On trn2 one kernel
+  launch is correct far past 2^31 bytes: bitwise equal to 2^31-byte chunks at
+  4.7e9 bytes, and equal to the fp64 sum at 9.4e9 bytes (8000 atoms). The
+  per-launch bound is now 2^34 bytes. Wider calls split the feature axis,
+  one launch per chunk (a multiple of the kernel's 2048-column group, or of a
+  512-column PSUM bank, when that wide) over the same plan. Columns are
+  independent, so a split call is bitwise equal to one launch. Chunks are cut
+  from row blocks of at most 2^31 bytes, because device aten copies a column
+  slice of a larger view about 170x slower.
 - **`segment_plan(idx, N, padding=mask)` (#141).** Edges marked in the mask
   (padding to a compile bucket) take no slots and are skipped by every sum
   over the plan. The slot count and the sums are those of the real edges

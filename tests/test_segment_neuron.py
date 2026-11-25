@@ -12,8 +12,9 @@ The MLIP exemplar's graph block (trnsci/trnsci#170) on the device:
   (run once at NEURON_LOGICAL_NC_CONFIG=1, once at =2);
 - index values above 2^24 (N = 2^24 + 3) and more than 2^24 edges;
 - feature-axis chunks (#141): forced chunks bitwise equal to one launch at
-  1728 atoms, and a 4096-atom layer-1 call (4.7e9 bytes) on the kernel; the
-  padding mask bitwise equal to the plan over the real edges;
+  1728 and 4096 atoms, a 4096-atom layer-1 call (4.7e9 bytes) in one launch
+  on the kernel; the padding mask bitwise equal to the plan over the real
+  edges;
 - the exemplar checker (``examples/mlip/check.py --candidate trnsparse``)
   when TRNSCI_MLIP_DIR points at a trnsci checkout's ``examples/mlip``;
 - a timing harness against aten ``index_add_`` / ``scatter_add_`` (MACE's
@@ -243,10 +244,13 @@ def test_feature_split_is_bitwise_1728(monkeypatch):
             assert torch.equal(v, split[k]), (patch[0], k)
 
 
-def test_4096_atoms_layer1_splits_features(monkeypatch):
+def test_4096_atoms_layer1_one_launch_and_split(monkeypatch):
     """#141: N = 4096, E = 229376 (the exemplar's padded bucket), F = 5120 is
-    4.7e9 bytes, above one launch: it runs as 2048 + 2048 + 1024 columns on the
-    kernel, never on the pytorch path."""
+    4.7e9 bytes per operand. It runs as one launch on the kernel, never on the
+    pytorch path (device aten index_add_ / index_select fail at this size),
+    and #140's 2^31-byte budget (2048 + 2048 + 1024 columns, cut from row
+    blocks) gives the same bits."""
+    seg = trnsparse.segment
     _no_pytorch_path(monkeypatch)
     calls = []
     real = _d.nki_segment_op
@@ -256,12 +260,19 @@ def test_4096_atoms_layer1_splits_features(monkeypatch):
     n, e = 4096, 229376
     _, rcv, _ = _graph(n, e, seed=4096)
     plan = trnsparse.segment_plan(rcv, n).to(DEV)
-    res, (m, go, h, ge) = _run_pair(rcv, n, 5120, plan, torch.Generator().manual_seed(2))
+    one, (m, go, h, ge) = _run_pair(rcv, n, 5120, plan, torch.Generator().manual_seed(2))
+    assert calls == [5120, 5120]
+    assert _rel(one["sum"], _ref_segsum(m, rcv, n)) <= 2e-5
+    assert torch.equal(one["gm"], go[rcv])
+    assert torch.equal(one["got"], h[rcv])
+    assert _rel(one["gh"], _ref_segsum(ge, rcv, n)) <= 2e-5
+    del m, go, h, ge
+    calls.clear()
+    monkeypatch.setattr(seg, "_SEG_MAX_BYTES", 2**31)
+    split, _ = _run_pair(rcv, n, 5120, plan, torch.Generator().manual_seed(2))
     assert calls == [2048, 2048, 1024] * 2
-    assert _rel(res["sum"], _ref_segsum(m, rcv, n)) <= 2e-5
-    assert torch.equal(res["gm"], go[rcv])
-    assert torch.equal(res["got"], h[rcv])
-    assert _rel(res["gh"], _ref_segsum(ge, rcv, n)) <= 2e-5
+    for k, v in one.items():
+        assert torch.equal(v, split[k]), k
 
 
 def test_padding_mask_bitwise_1728():
@@ -359,7 +370,7 @@ def test_timing_vs_aten(E):
     for F in (1, 3, 512, 2048, 5120):
         if E * F * 4 >= 2**31:
             # Feature-split launches (#141); aten at this size is not timed.
-            rows.append({"E": E, "F": F, "note": "above one launch's 2^31 bytes: split on F"})
+            rows.append({"E": E, "F": F, "note": "not timed: above 2^31 bytes (#141)"})
             continue
         m = torch.randn(E, F, generator=g)
         md = m.to(DEV)

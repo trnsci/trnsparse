@@ -78,11 +78,12 @@ reduce each 128-row tile on the TensorEngine: a 0/1 incidence tile times
 order fixed by the plan. Results are bitwise identical run to run and at
 LNC=1 and LNC=2. No index is computed on the device or passes through fp32,
 and there is no flattened `E·F` / `N·F` index (aws-neuron-sdk#1466, #1467,
-#1468). A call wider than one launch's 2^31-byte range (from about 4096
-atoms at F = 5120) splits the feature axis, one launch per chunk over the
-same plan, bitwise equal to one launch (#141); only a single column that
-is too wide (E or N near 2^29) takes the pytorch path. fp64 follows the
-suite policy (host torch under `auto`). See the `trnsparse.segment` module
+#1468). One launch addresses operands up to 2^34 bytes (8000 atoms at
+F = 5120 is 9.4e9 bytes, verified on trn2, #141); a wider call splits the
+feature axis, one launch per chunk over the same plan, bitwise equal to one
+launch. fp32 calls never fall back to device aten, whose `index_add_` /
+`index_select` fail at these sizes. fp64 follows the suite policy (host
+torch under `auto`). See the `trnsparse.segment` module
 docstring for the summation order and limits.
 
 ## Kernel-matrix products (`kernel_matmul`, #93)

@@ -67,11 +67,14 @@ sees only int32 edge and row ids, moved by DMA without conversion, and fp32
 row offsets in [-1, 127] (exact). There is no flattened E*F or N*F index
 and no int64 transpose, mask or ``index_select`` on the device
 (aws-neuron-sdk#1466, #1467, #1468). Range limits are checked on the host:
-E and N below 2^31, and every tensor a launch addresses below 2^31 bytes. A
-call wider than that splits the feature axis into chunks, one launch per
-chunk over the same plan (#141): columns are independent, so the result is
-bitwise equal to one launch. Only when a single column is too wide (E or N
-near 2^29) does ``auto`` use the pytorch path.
+E and N below 2^31, and every tensor a launch addresses below
+``_SEG_MAX_BYTES`` (2^34 bytes; one launch is verified on trn2 well past
+2^32 bytes, #141). A call wider than that splits the feature axis into
+chunks, one launch per chunk over the same plan: columns are independent, so
+the result is bitwise equal to one launch. Device aten is no fallback at
+these sizes (its ``index_add_`` / ``index_select`` fail on trn2 at 4.7e9
+bytes), and E below 2^31 means a single column always fits, so ``auto``
+keeps every fp32 call on the kernel.
 
 **dtypes.** The kernels compute in fp32 with fp32 accumulation: bf16 / fp16
 inputs are upcast exactly, and the result comes back in the input dtype.
@@ -93,10 +96,18 @@ from .nki import dispatch as _d
 from .nki.kernels import _SEG_CHUNK, _SEG_GROUP, _SEG_P, _SEG_PROGRAMS, _SEG_PSUM_N, _gather_split
 
 _INT32_MAX = 2**31 - 1
-# Largest tensor (bytes) one kernel launch addresses: the DMA adds int32 row
-# index x row stride, kept within a signed 32-bit byte offset. Wider calls
-# split the feature axis (`_feature_chunk`).
-_SEG_MAX_BYTES = 2**31
+# Largest tensor (bytes) one kernel launch addresses. Wider calls split the
+# feature axis (`_feature_chunk`). #140 set this to 2^31 on the assumption
+# that the indirect DMA forms row x stride as a signed 32-bit byte offset.
+# On trn2 (SDK 2.33.1) one launch is bitwise equal to the 2^31-byte chunks
+# at 4.7e9 bytes and matches the fp64 sum at 9.4e9 and 1.7e10 bytes, past
+# 2^32 bytes and 2^32 fp32 elements (#141), so the bound is 2^34 bytes,
+# about the largest operand a 24 GB logical core holds with its outputs.
+_SEG_MAX_BYTES = 2**34
+# Column chunks are cut from row blocks of at most this many bytes: device
+# aten copies a column slice of a view spanning more than 2^32 bytes about
+# 170x slower (2.0 s against 12 ms at 229376 x 5120 fp32, #141).
+_SEG_SLICE_BYTES = 2**31
 
 
 def _launch_rows(e: int, n: int) -> int:
@@ -423,7 +434,12 @@ def _kernel_launches(op_name: str, x: torch.Tensor, plan: SegmentPlan, rows: int
         raise NotImplementedError(f"trnsparse {op_name}: one feature column exceeds a launch")
     if w >= f:
         return _d.nki_segment_op(op_name, x, plan)[:rows]
-    parts = [_d.nki_segment_op(op_name, c.contiguous(), plan)[:rows] for c in x.split(w, dim=1)]
+    rb = max(1, _SEG_SLICE_BYTES // (f * x.element_size()))
+    blocks = [r.split(w, dim=1) for r in x.split(rb, dim=0)]
+    parts = []
+    for j in range(len(blocks[0])):
+        c = torch.cat([b[j] for b in blocks]) if len(blocks) > 1 else blocks[0][j].contiguous()
+        parts.append(_d.nki_segment_op(op_name, c, plan)[:rows])
     return torch.cat(parts, dim=1)
 
 
@@ -481,8 +497,9 @@ def _kernel_ok(what: str, x: torch.Tensor, e: int, n: int, f: int) -> bool:
     if not _d._kernel_route(what, x):
         return False
     if _feature_chunk(e, n, f) < 1:
-        # Even a one-column launch over these rows exceeds the range (E or N
-        # around 2^29); wider calls split the feature axis instead.
+        # Even a one-column launch over these rows exceeds the range (not
+        # reachable at the default bound, with E and N below 2^31); wider
+        # calls split the feature axis instead.
         if _d._REQUIRE_NKI:
             raise NotImplementedError(
                 f"trnsparse {what}: {_launch_rows(e, n)} fp32 rows of one column exceed one "
