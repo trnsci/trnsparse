@@ -81,8 +81,8 @@ and there is no flattened `E·F` / `N·F` index (aws-neuron-sdk#1466, #1467,
 #1468). One launch addresses operands up to 2^34 bytes (8000 atoms at
 F = 5120 is 9.4e9 bytes, verified on trn2, #141); a wider call splits the
 feature axis, one launch per chunk over the same plan, bitwise equal to one
-launch. fp32 calls never fall back to device aten, whose `index_add_` /
-`index_select` fail at these sizes. fp64 follows the suite policy (host
+launch. Size alone no longer sends an fp32 call to device aten, whose
+`index_add_` / `index_select` fail at these sizes. fp64 follows the suite policy (host
 torch under `auto`). See the `trnsparse.segment` module
 docstring for the summation order and limits.
 

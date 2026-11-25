@@ -73,8 +73,8 @@ E and N below 2^31, and every tensor a launch addresses below
 chunks, one launch per chunk over the same plan: columns are independent, so
 the result is bitwise equal to one launch. Device aten is no fallback at
 these sizes (its ``index_add_`` / ``index_select`` fail on trn2 at 4.7e9
-bytes), and E below 2^31 means a single column always fits, so ``auto``
-keeps every fp32 call on the kernel.
+bytes), and E below 2^31 means a single column always fits, so size alone
+never sends an fp32 call to the pytorch path.
 
 **dtypes.** The kernels compute in fp32 with fp32 accumulation: bf16 / fp16
 inputs are upcast exactly, and the result comes back in the input dtype.
