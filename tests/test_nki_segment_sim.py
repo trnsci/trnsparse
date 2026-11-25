@@ -158,3 +158,55 @@ def test_index_values_above_2_24():
     for row in sorted({int(i) for i in idx}):
         torch.testing.assert_close(out[row, 0].double(), m[idx == row, 0].double().sum())
     assert int(torch.count_nonzero(out)) == len({int(i) for i in idx})
+
+
+def test_feature_chunks_bitwise(monkeypatch):
+    # #141: a call above one launch's byte range splits F into chunks over the
+    # same plan. Forced here with a small budget: 2048 + 2048 + 1024 columns,
+    # and unaligned 700-column chunks, each bitwise equal to one launch.
+    from trnsparse import segment as seg
+
+    calls = _launches(monkeypatch)
+    g = torch.Generator().manual_seed(141)
+    n, e, F = 200, 1500, 5120
+    idx = torch.randint(0, n, (e,), generator=g)
+    plan = trnsparse.segment_plan(idx, n)
+    m = torch.randn(e, F, generator=g)
+    h = torch.randn(n, F, generator=g)
+    one = (trnsparse.segment_sum(m, idx, n, plan=plan), trnsparse.gather(h, idx, plan=plan))
+    assert len(calls) == 2
+    for patch in (
+        ("_SEG_MAX_BYTES", seg._launch_rows(e, n) * 4 * 3000),
+        ("_feature_chunk", lambda e, n, f: 700),
+    ):
+        calls.clear()
+        with monkeypatch.context() as mp:
+            mp.setattr(seg, *patch)
+            split = (
+                trnsparse.segment_sum(m, idx, n, plan=plan),
+                trnsparse.gather(h, idx, plan=plan),
+            )
+        assert len(calls) == (6 if patch[0] == "_SEG_MAX_BYTES" else 16)
+        assert all(torch.equal(a, b) for a, b in zip(one, split, strict=True))
+    assert _rel(one[0], _ref(m, idx, n)) <= 1e-6
+
+
+def test_padding_mask_plan(monkeypatch):
+    # #141: padded edges (piled on segment 0, NaN messages) take no slots and
+    # are never read by the sum; bitwise equal to the plan over the real edges.
+    g = torch.Generator().manual_seed(142)
+    n, e, pad = 300, 2000, 600
+    idx = torch.randint(0, n, (e,), generator=g)
+    pidx = torch.cat([idx, torch.zeros(pad, dtype=torch.long)])
+    mask = torch.cat([torch.zeros(e, dtype=torch.bool), torch.ones(pad, dtype=torch.bool)])
+    real = trnsparse.segment_plan(idx, n)
+    masked = trnsparse.segment_plan(pidx, n, padding=mask)
+    assert masked.slots == real.slots
+    m = torch.randn(e, 64, generator=g)
+    mp = torch.cat([m, torch.full((pad, 64), float("nan"))])
+    a = trnsparse.segment_sum(m, idx, n, plan=real)
+    assert torch.equal(a, trnsparse.segment_sum(mp, pidx, n, plan=masked))
+    h = torch.randn(n, 64, generator=g, requires_grad=True)
+    ge = torch.cat([torch.randn(e, 64, generator=g), torch.full((pad, 64), float("nan"))])
+    (gh,) = torch.autograd.grad(trnsparse.gather(h, pidx, plan=masked), h, ge)
+    assert _rel(gh, _ref(ge[:e], idx, n)) <= 1e-6

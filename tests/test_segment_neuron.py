@@ -11,6 +11,10 @@ The MLIP exemplar's graph block (trnsci/trnsci#170) on the device:
   with TRNSPARSE_SEG_COMPARE=<dir> compares against them bit for bit
   (run once at NEURON_LOGICAL_NC_CONFIG=1, once at =2);
 - index values above 2^24 (N = 2^24 + 3) and more than 2^24 edges;
+- feature-axis chunks (#141): forced chunks bitwise equal to one launch at
+  1728 and 4096 atoms, a 4096-atom layer-1 call (4.7e9 bytes) in one launch
+  on the kernel; the padding mask bitwise equal to the plan over the real
+  edges;
 - the exemplar checker (``examples/mlip/check.py --candidate trnsparse``)
   when TRNSCI_MLIP_DIR points at a trnsci checkout's ``examples/mlip``;
 - a timing harness against aten ``index_add_`` / ``scatter_add_`` (MACE's
@@ -20,6 +24,7 @@ The MLIP exemplar's graph block (trnsci/trnsci#170) on the device:
 
 from __future__ import annotations
 
+import gc
 import json
 import os
 import sys
@@ -194,6 +199,111 @@ def test_more_than_2_24_edges():
     assert torch.equal(gm.cpu(), go[idx])  # edge ids above 2^24 gathered exactly
 
 
+def _run_pair(idx, n, F, plan, g):
+    """segment_sum, its grad, gather and its grad on the device (host results)."""
+    e = idx.numel()
+    idx_d = idx.to(DEV)
+    m, go = torch.randn(e, F, generator=g), torch.randn(n, F, generator=g)
+    md = m.to(DEV).requires_grad_(True)
+    out = trnsparse.segment_sum(md, idx_d, n, plan=plan)
+    (gm,) = torch.autograd.grad(out, md, go.to(DEV))
+    res = {"sum": out.detach().cpu(), "gm": gm.cpu()}
+    del md, out, gm
+    gc.collect()  # the 4096-atom case needs the device memory back
+    h, ge = torch.randn(n, F, generator=g), torch.randn(e, F, generator=g)
+    hd = h.to(DEV).requires_grad_(True)
+    got = trnsparse.gather(hd, idx_d, plan=plan)
+    (gh,) = torch.autograd.grad(got, hd, ge.to(DEV))
+    res.update(got=got.detach().cpu(), gh=gh.cpu())
+    del hd, got, gh
+    gc.collect()
+    return res, (m, go, h, ge)
+
+
+def _no_pytorch_path(monkeypatch):
+    def boom(*a, **k):
+        raise AssertionError("took the pytorch path")
+
+    monkeypatch.setattr(trnsparse.segment, "_torch_segment_sum", boom)
+    monkeypatch.setattr(trnsparse.segment, "_torch_gather", boom)
+
+
+def test_feature_split_is_bitwise_1728(monkeypatch):
+    """#141: forced feature chunks (aligned 2048 / unaligned 1000 columns)
+    equal the one-launch kernel bit for bit, forward and both backwards."""
+    seg = trnsparse.segment
+    _no_pytorch_path(monkeypatch)
+    n, e = SHAPES["tic_bulk_1728"]
+    _, rcv, _ = _graph(n, e, seed=141)
+    plan = trnsparse.segment_plan(rcv, n).to(DEV)
+    one, (m, go, h, ge) = _run_pair(rcv, n, 5120, plan, torch.Generator().manual_seed(1))
+    assert _rel(one["sum"], _ref_segsum(m, rcv, n)) <= 2e-5
+    assert torch.equal(one["gm"], go[rcv]) and torch.equal(one["got"], h[rcv])
+    rows = seg._launch_rows(e, n)
+    for patch in (("_SEG_MAX_BYTES", rows * 4 * 3000), ("_feature_chunk", lambda e, n, f: 1000)):
+        with monkeypatch.context() as mp:
+            mp.setattr(seg, *patch)
+            split, _ = _run_pair(rcv, n, 5120, plan, torch.Generator().manual_seed(1))
+        for k, v in one.items():
+            assert torch.equal(v, split[k]), (patch[0], k)
+
+
+def test_4096_atoms_layer1_one_launch_and_split(monkeypatch):
+    """#141: N = 4096, E = 229376 (the exemplar's padded bucket), F = 5120 is
+    4.7e9 bytes per operand. It runs as one launch on the kernel, never on the
+    pytorch path (device aten index_add_ / index_select fail at this size),
+    and #140's 2^31-byte budget (2048 + 2048 + 1024 columns, cut from row
+    blocks) gives the same bits."""
+    seg = trnsparse.segment
+    _no_pytorch_path(monkeypatch)
+    calls = []
+    real = _d.nki_segment_op
+    monkeypatch.setattr(
+        _d, "nki_segment_op", lambda o, x, p: calls.append(x.shape[1]) or real(o, x, p)
+    )
+    n, e = 4096, 229376
+    _, rcv, _ = _graph(n, e, seed=4096)
+    plan = trnsparse.segment_plan(rcv, n).to(DEV)
+    one, (m, go, h, ge) = _run_pair(rcv, n, 5120, plan, torch.Generator().manual_seed(2))
+    assert calls == [5120, 5120]
+    assert _rel(one["sum"], _ref_segsum(m, rcv, n)) <= 2e-5
+    assert torch.equal(one["gm"], go[rcv])
+    assert torch.equal(one["got"], h[rcv])
+    assert _rel(one["gh"], _ref_segsum(ge, rcv, n)) <= 2e-5
+    del m, go, h, ge
+    calls.clear()
+    monkeypatch.setattr(seg, "_SEG_MAX_BYTES", 2**31)
+    split, _ = _run_pair(rcv, n, 5120, plan, torch.Generator().manual_seed(2))
+    assert calls == [2048, 2048, 1024] * 2
+    for k, v in one.items():
+        assert torch.equal(v, split[k]), k
+
+
+def test_padding_mask_bitwise_1728():
+    """#141: E padded to a 98304 bucket on node 0. With the mask the plan has
+    the real edges' slot count and the sums are bitwise those of the real
+    edges (NaN padding messages are never read)."""
+    n, e = SHAPES["tic_bulk_1728"]
+    _, rcv, g = _graph(n, e, seed=17)
+    pad = 98304 - e
+    pidx = torch.cat([rcv, torch.zeros(pad, dtype=torch.long)])
+    mask = torch.cat([torch.zeros(e, dtype=torch.bool), torch.ones(pad, dtype=torch.bool)])
+    real = trnsparse.segment_plan(rcv, n).to(DEV)
+    masked = trnsparse.segment_plan(pidx, n, padding=mask).to(DEV)
+    assert masked.slots == real.slots < trnsparse.segment_plan(pidx, n).slots
+    m = torch.randn(e, 512, generator=g)
+    mp = torch.cat([m, torch.full((pad, 512), float("nan"))])
+    a = trnsparse.segment_sum(m.to(DEV), rcv.to(DEV), n, plan=real).cpu()
+    b = trnsparse.segment_sum(mp.to(DEV), pidx.to(DEV), n, plan=masked).cpu()
+    assert torch.equal(a, b)
+    hd = torch.randn(n, 512, generator=g).to(DEV).requires_grad_(True)
+    ge = torch.randn(e, 512, generator=g)
+    gep = torch.cat([ge, torch.full((pad, 512), float("nan"))])
+    (ga,) = torch.autograd.grad(trnsparse.gather(hd, rcv.to(DEV), plan=real), hd, ge.to(DEV))
+    (gb,) = torch.autograd.grad(trnsparse.gather(hd, pidx.to(DEV), plan=masked), hd, gep.to(DEV))
+    assert torch.equal(ga.cpu(), gb.cpu())
+
+
 def test_exemplar_checker():
     """``check.py --candidate trnsparse --device neuron --blocks B --edge-cases``."""
     root = os.environ.get("TRNSCI_MLIP_DIR")
@@ -263,7 +373,8 @@ def test_timing_vs_aten(E):
     plan = trnsparse.segment_plan(idx, n).to(DEV)
     for F in (1, 3, 512, 2048, 5120):
         if E * F * 4 >= 2**31:
-            rows.append({"E": E, "F": F, "note": "above one launch's 2^31-byte range"})
+            # Feature-split launches (#141); aten at this size is not timed.
+            rows.append({"E": E, "F": F, "note": "not timed: above 2^31 bytes (#141)"})
             continue
         m = torch.randn(E, F, generator=g)
         md = m.to(DEV)

@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`segment_sum` / `gather`: the MLIP layer-1 width stays on the kernel
+  from 4096 atoms up (#141).** #140 sent any operand above 2^31 bytes to
+  device aten `index_add_` / `index_select`, which fail on trn2 at the
+  4096-atom shape (E = 229376, F = 5120: 4.7e9 bytes). On trn2 one kernel
+  launch is correct far past 2^31 bytes: bitwise equal to 2^31-byte chunks at
+  4.7e9 bytes, and equal to the fp64 sum at 9.4e9 bytes (8000 atoms). The
+  per-launch bound is now 2^34 bytes. Wider calls split the feature axis,
+  one launch per chunk (a multiple of the kernel's 2048-column group, or of a
+  512-column PSUM bank, when that wide) over the same plan. Columns are
+  independent, so a split call is bitwise equal to one launch. Chunks are cut
+  from row blocks of at most 2^31 bytes, because device aten copies a column
+  slice of a larger view about 170x slower.
+- **`segment_plan(idx, N, padding=mask)` (#141).** Edges marked in the mask
+  (padding to a compile bucket) take no slots and are skipped by every sum
+  over the plan. The slot count and the sums are those of the real edges
+  alone, bitwise, wherever the padding points; NaN padding messages are never
+  read. Before, padding piled on one segment raised every tile's slot count
+  (56 to 72 at 1728 atoms, 2.9x at 8000).
+
 - **`segment_sum(m, idx, N)` / `gather(h, idx)`: the graph segment sum
   (index-add) and row gather, each registered as the other's backward
   (#139).** This is the graph block of the MLIP exemplar
@@ -46,7 +65,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Not on the host densify path: `spmm` over an incidence matrix densifies
     on the host and is unusable at 1728 atoms.
   - fp64 follows the suite policy (#84). Inputs above 2^31 bytes per launch
-    take the pytorch path under `auto`.
+    split the feature axis (#141).
   - Tests:
     - CPU (`tests/test_segment.py`): a vendored slice of the exemplar's
       MACE-MP-0b2 capture (`tests/fixtures/mlip_graph_tiny.pt`), fp64

@@ -56,10 +56,19 @@ exemplar, trnsci/trnsci#170), with MACE's `scatter_sum` semantics.
   `idx` is `[E]` int64 / int32, sorted or not. Backward: `gather`.
 - `gather(h, idx, *, plan=None)` — `out[e] = h[idx[e]]`. Backward:
   `segment_sum`.
-- `segment_plan(idx, num_segments)` → `SegmentPlan` — sorts the edges by
-  segment once on the host (stable, int64) and builds the kernel's tile
-  layout. Build one per neighbour list (senders and receivers each) and pass
-  it as `plan=`; `.to(device)` stages its tables.
+- `segment_plan(idx, num_segments, *, padding=None)` → `SegmentPlan` — sorts
+  the edges by segment once on the host (stable, int64) and builds the
+  kernel's tile layout. Build one per neighbour list (senders and receivers
+  each) and pass it as `plan=`; `.to(device)` stages its tables.
+  - `padding`: an `[E]` bool mask of the edges that pad E to a compile
+    bucket. Padded edges take no slots, and every sum the plan computes skips
+    them: `segment_sum` ignores `m` there, and so does the backward of
+    `gather`. `gather` and the backward of `segment_sum` still fill padded
+    rows (with `h[idx[e]]` / `grad[idx[e]]`). The sums are bitwise those of
+    the plan over the real edges alone, wherever the padding points, on
+    every backend. Without a mask, padding edges are ordinary edges: give
+    them zero messages and spread them over segments 0, 1, 2, …, since
+    piling them on one segment raises the slot count of every tile (#141).
 
 Backends: `pytorch` is the reference (`index_add_` / `index_select`;
 deterministic on the CPU). On NKI, the `trnsparse::segment_sum_tiles` and
@@ -69,8 +78,13 @@ reduce each 128-row tile on the TensorEngine: a 0/1 incidence tile times
 order fixed by the plan. Results are bitwise identical run to run and at
 LNC=1 and LNC=2. No index is computed on the device or passes through fp32,
 and there is no flattened `E·F` / `N·F` index (aws-neuron-sdk#1466, #1467,
-#1468). fp64 follows the suite policy (host torch under `auto`). See the
-`trnsparse.segment` module docstring for the summation order and limits.
+#1468). One launch addresses operands up to 2^34 bytes (8000 atoms at
+F = 5120 is 9.4e9 bytes, verified on trn2, #141); a wider call splits the
+feature axis, one launch per chunk over the same plan, bitwise equal to one
+launch. Size alone no longer sends an fp32 call to device aten, whose
+`index_add_` / `index_select` fail at these sizes. fp64 follows the suite policy (host
+torch under `auto`). See the `trnsparse.segment` module
+docstring for the summation order and limits.
 
 ## Kernel-matrix products (`kernel_matmul`, #93)
 
