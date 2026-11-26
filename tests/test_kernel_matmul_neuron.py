@@ -8,6 +8,10 @@ determinism. With TRNSPARSE_KMV_DUMP=<dir> the determinism case also saves
 its output, so runs at NEURON_LOGICAL_NC_CONFIG=1 and =2 can be compared
 bitwise (see `benchmarks/bench_kernel_matmul_trn2.py --compare`).
 
+`test_subtile_*` run the row-tiled distance matmuls (#119,
+TRNSPARSE_KMV_SUBTILE=1) against the same tolerances and the default kernel;
+`test_norm_bias_on_device` adds TRNSPARSE_KMV_NORM_BIAS=1.
+
 The multi-core case (#102) needs several visible logical cores and skips
 otherwise:
 
@@ -341,3 +345,160 @@ def test_complex_v_on_device(self_op, on_device):
     got = out.cpu().to(torch.complex128)
     err = float((got - ref).abs().max() / ref.abs().max())
     assert err < 2e-5, err
+
+
+# ── Row-tiled distance matmuls (#119, TRNSPARSE_KMV_SUBTILE=1) ───────────────
+#
+# Same arithmetic and summation order as the default kernel (bitwise in the
+# simulator); on the device the gate is the default kernel's tolerances, and
+# the bitwise comparison with the default kernel is reported separately.
+
+
+def _both(monkeypatch, fn):
+    """fn() with the default kernel, then with TRNSPARSE_KMV_SUBTILE=1."""
+    monkeypatch.delenv("TRNSPARSE_KMV_NORM_BIAS", raising=False)
+    monkeypatch.delenv("TRNSPARSE_KMV_SUBTILE", raising=False)
+    base = fn()
+    monkeypatch.setenv("TRNSPARSE_KMV_SUBTILE", "1")
+    return base, fn()
+
+
+@pytest.mark.parametrize("kernel", ["rbf", "matern12", "matern32", "matern52"])
+@pytest.mark.parametrize(
+    "n,m,d,R",
+    [
+        (127, 129, 3, 7),
+        (1000, 4097, 3, 1),
+        (4097, 1000, 16, 513),
+        (700, 513, 40, 2),
+        (300, 1100, 3, 700),
+    ],
+)
+def test_subtile_cross_on_device(monkeypatch, kernel, n, m, d, R):
+    g = torch.Generator().manual_seed(n + m)
+    X, Y = torch.rand(n, d, generator=g), torch.rand(m, d, generator=g)
+    V = torch.randn(m, R, generator=g)
+    ell = 0.5 * d**0.5
+    ref = trnsparse.kernel_matmul_reference(X, Y, V, kernel, ell, 1.5)
+    Xd, Yd, Vd = X.to(DEV), Y.to(DEV), V.to(DEV)
+    base, st = _both(
+        monkeypatch, lambda: trnsparse.kernel_matmul(Xd, Yd, Vd, kernel, ell, 1.5).cpu()
+    )
+    assert _rel(st, ref) < 2e-5
+    assert _rel(st, base.double()) < 2e-5
+
+
+@pytest.mark.parametrize("kernel", ["rbf", "matern12", "matern52"])
+@pytest.mark.parametrize("n", [129, 4097, 20000])
+def test_subtile_square_operator_on_device(monkeypatch, kernel, n):
+    g = torch.Generator().manual_seed(n)
+    X, V = torch.rand(n, 3, generator=g), torch.randn(n, 33, generator=g)
+    op = trnsparse.KernelOperator(X, kernel, 0.1, 1.0, noise=1e-4, device=DEV)
+    ref = trnsparse.kernel_matmul_reference(X, None, V, kernel, 0.1, 1.0, noise=1e-4)
+    Vd = V.to(DEV)
+    base, st = _both(monkeypatch, lambda: op(Vd).cpu())
+    tol = 5e-5 if kernel == "matern12" else 2e-5  # as test_square_operator_on_device
+    assert _rel(st, ref) < tol
+    assert _rel(st, base.double()) < tol
+
+
+@pytest.mark.parametrize("blocked", [False, True], ids=["one-launch", "row-blocked"])
+@pytest.mark.parametrize("kernel", ["rbf", "matern12", "matern32", "matern52"])
+def test_subtile_diagonal_exact_on_device(monkeypatch, kernel, blocked):
+    """K_ii = s with row-tiled distance matmuls (#143), one launch and row-blocked."""
+    n = 1000 + 37
+    if blocked:
+        monkeypatch.setenv("TRNSPARSE_KMV_BLOCK_WORK", str(256 * n))
+    monkeypatch.setenv("TRNSPARSE_KMV_SUBTILE", "1")
+    g = torch.Generator().manual_seed(7)
+    X, V = 4.0 * torch.rand(n, 3, generator=g), torch.eye(n)
+    op = trnsparse.KernelOperator(X, kernel, 0.05, 1.3, noise=1e-2, device=DEV)
+    out = op(V.to(DEV)).cpu()
+    torch.testing.assert_close(out.diagonal(), torch.full((n,), 1.3 + 1e-2), rtol=3e-7, atol=0)
+    cross = op.cross(X, V.to(DEV)).cpu()
+    off = ~torch.eye(n, dtype=torch.bool)
+    assert torch.equal(out[off], cross[off])
+
+
+@pytest.mark.parametrize("R", [1, 128, 1500])
+@pytest.mark.parametrize("kernel", ["rbf", "matern12", "matern52"])
+def test_subtile_auto_group_32_on_device(monkeypatch, kernel, R):
+    """The 32-tile body at m >= 131072 (#108) with row tiling; R = 1500 runs passes of 4 tiles."""
+    monkeypatch.delenv("TRNSPARSE_KMV_GROUP", raising=False)
+    monkeypatch.setenv("TRNSPARSE_KMV_SUBTILE", "1")
+    g = torch.Generator().manual_seed(R)
+    m, q = 131072 + 77, 600
+    X, Y = torch.rand(m, 3, generator=g), torch.rand(q, 3, generator=g)
+    W = torch.randn(m, R, generator=g)
+    op = trnsparse.KernelOperator(X, kernel, 0.05, 1.0, device=DEV)
+    ref = trnsparse.kernel_matmul_reference(Y, X, W, kernel, 0.05, 1.0)
+    tol = 2e-4 if kernel == "matern12" else 3e-5  # as test_auto_group_32_on_device
+    assert _rel(op.cross(Y, W.to(DEV)), ref) < tol
+
+
+@pytest.mark.parametrize("group", [4, 7, 32])
+def test_subtile_group_sizes_on_device(monkeypatch, group):
+    monkeypatch.setenv("TRNSPARSE_KMV_GROUP", str(group))
+    monkeypatch.setenv("TRNSPARSE_KMV_SUBTILE", "1")
+    g = torch.Generator().manual_seed(group)
+    n = 8192 + 77
+    X, V = torch.rand(n, 3, generator=g), torch.randn(n, 33, generator=g)
+    op = trnsparse.KernelOperator(X, "matern32", 0.1, 1.0, noise=1e-4, device=DEV)
+    ref = trnsparse.kernel_matmul_reference(X, None, V, "matern32", 0.1, 1.0, noise=1e-4)
+    assert _rel(op(V.to(DEV)), ref) < 2e-5
+
+
+def test_subtile_bitwise_deterministic(monkeypatch):
+    monkeypatch.setenv("TRNSPARSE_KMV_SUBTILE", "1")
+    g = torch.Generator().manual_seed(4)
+    n = 50_000
+    X, V = torch.rand(n, 3, generator=g), torch.randn(n, 33, generator=g)
+    op = trnsparse.KernelOperator(X, "rbf", 0.05, 1.0, noise=1e-4, device=DEV)
+    Vd = V.to(DEV)
+    a, b = op(Vd).cpu(), op(Vd).cpu()
+    assert torch.equal(a, b)
+    out = os.environ.get("TRNSPARSE_KMV_DUMP")
+    if out:
+        lnc = os.environ.get("NEURON_LOGICAL_NC_CONFIG", "default")
+        os.makedirs(out, exist_ok=True)
+        torch.save(a, os.path.join(out, f"kmv_subtile_n{n}_lnc{lnc}.pt"))
+
+
+@pytest.mark.parametrize("kernel", ["rbf", "matern12", "matern32", "matern52"])
+@pytest.mark.parametrize("n", [4097, 20000])
+def test_norm_bias_on_device(monkeypatch, kernel, n):
+    """TRNSPARSE_KMV_NORM_BIAS=1 (|y|^2 in the PSUM reader, #119), with row tiling:
+    the default kernel's tolerances, an exact diagonal, and run-to-run bits."""
+    monkeypatch.setenv("TRNSPARSE_KMV_SUBTILE", "1")
+    monkeypatch.setenv("TRNSPARSE_KMV_NORM_BIAS", "1")
+    g = torch.Generator().manual_seed(n)
+    X, V = torch.rand(n, 3, generator=g), torch.randn(n, 33, generator=g)
+    op = trnsparse.KernelOperator(X, kernel, 0.1, 1.0, noise=1e-4, device=DEV)
+    ref = trnsparse.kernel_matmul_reference(X, None, V, kernel, 0.1, 1.0, noise=1e-4)
+    Vd = V.to(DEV)
+    a, b = op(Vd).cpu(), op(Vd).cpu()
+    assert torch.equal(a, b)
+    tol = 5e-5 if kernel == "matern12" else 2e-5
+    assert _rel(a, ref) < tol
+    q = 1000 + 37
+    Xq = 4.0 * torch.rand(q, 3, generator=g)
+    opq = trnsparse.KernelOperator(Xq, kernel, 0.05, 1.3, noise=1e-2, device=DEV)
+    out = opq(torch.eye(q).to(DEV)).cpu()
+    torch.testing.assert_close(out.diagonal(), torch.full((q,), 1.3 + 1e-2), rtol=3e-7, atol=0)
+
+
+@pytest.mark.parametrize("kernel", ["rbf", "matern12", "matern52"])
+def test_subtile_bitwise_default_kernel_on_device(monkeypatch, kernel):
+    """Informative: the TensorEngine's row tiles give the full array's bits.
+
+    Not required (the gate is the tolerances above), but expected: the
+    arithmetic and every summation order are the default kernel's.
+    """
+    g = torch.Generator().manual_seed(5)
+    n = 20_000
+    X, V = torch.rand(n, 3, generator=g), torch.randn(n, 33, generator=g)
+    op = trnsparse.KernelOperator(X, kernel, 0.05, 1.0, noise=1e-4, device=DEV)
+    Vd = V.to(DEV)
+    base, st = _both(monkeypatch, lambda: op(Vd).cpu())
+    diff = float((st - base).abs().max())
+    assert torch.equal(st, base), f"max |subtile - default| = {diff:.3e}"

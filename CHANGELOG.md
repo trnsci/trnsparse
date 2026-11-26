@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`kernel_matmul` / `KernelOperator`: opt-in row-tiled distance matmuls
+  (#119), `TRNSPARSE_KMV_SUBTILE=1`.** The distance GEMM's contraction is
+  d + 2 rows (5 at d = 3) of the TensorEngine's 128. With the variant, the
+  kernel uses `nc_matmul` row tiling (`tile_position` / `tile_size`): 4 x 32
+  row tiles when d + 2 <= 32, 2 x 64 when d + 2 <= 64, no tiling above. Y
+  tile k of a loop body goes to row tile k mod 4, so four distance matmuls
+  on different Y tiles are issued back to back and can run in parallel.
+  Their kernel tiles and @V products follow. The arithmetic and every
+  summation order are the default kernel's. Under `nki.simulate` the result
+  is bitwise the default kernel's at LNC=1 and LNC=2, including the exact
+  diagonal (#143) and row blocks (#100). V passes take at most 4 column tiles
+  (6 by default), so 4 PSUM banks stay free for the distance tiles in flight.
+  The instruction count is unchanged apart from 3 more DMAs per loop body
+  and per output block: the parallelism cuts TensorE time, not
+  instructions. The default kernel is unchanged; device validation and
+  throughput are pending.
+- **`TRNSPARSE_KMV_NORM_BIAS=1` (#119, opt-in, combinable with the
+  above).** D^T's |y|^2 term is per partition, so it moves out of the
+  augmented GEMM (contraction d + 1). It rides in the PSUM reader's
+  per-partition operand: the ScalarE `activation` bias for rbf (a |y|^2 +
+  log s, where log s was), the VectorE clamp for Matern (then `sqrt` with
+  scale a). The instruction count is the same and there is one more
+  (128 x tiles) DMA per body. The rounding moves from PSUM to the reader:
+  rbf is no longer bitwise the default kernel, but it is within its
+  tolerances in the simulator. The diagonal stays exact.
+- `benchmarks/bench_kernel_matmul_trn2.py --variants 0,1,3 --kernel
+  rbf,matern12,matern52` times the variants on the same operands, prints
+  each rate against the 5.06e10 entries/s per logical core baseline
+  (`--baseline`, #108), and reports whether each result equals the first
+  variant's bitwise.
+
 ### Fixed
 
 - **`test_feature_chunks_bitwise` no longer depends on the CI host's CPU

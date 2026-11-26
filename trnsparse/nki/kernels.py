@@ -2677,22 +2677,43 @@ _KMV_V_BATCH_BYTES = 64 * 1024  # SBUF per partition for one body's V rows in on
 _KMV_PSUM_BANKS = 8  # 16 KiB of PSUM per partition in 2 KiB banks
 _KMV_SCRATCH = (0, 1, 2, 3)  # SBUF intermediates per kernel tile, by kind (rbf, matern12/32/52)
 _KMV_SCRATCH_RING = 2  # slots of them per loop body, shared round-robin by its Y tiles
+# Sub-array row tiling of the distance matmul (#119, opt-in: variant bit 0,
+# TRNSPARSE_KMV_SUBTILE=1). Its contraction is d + 2 rows of the 128-row
+# TensorEngine; `nc_matmul` row tiling splits the array into 4 x 32 (or
+# 2 x 64) row tiles that run independent matmuls in parallel, so four Y
+# tiles' distance matmuls go to the four row tiles back to back. The
+# accumulators then leave at least 4 PSUM banks for the distance tiles in
+# flight: at most 4 V column tiles per pass.
+_KMV_SUBTILE = 1
+_KMV_SUBTILE_PASS_RT = 4
+# Row norm in the PSUM reader's per-partition operand (#119, opt-in: variant
+# bit 1, TRNSPARSE_KMV_NORM_BIAS=1). D^T's |y|^2 term is per partition (Y on
+# partitions), so it can leave the augmented GEMM: the contraction is d + 1,
+# [-2y, 1] . [x, |x|^2], and the term rides in the ScalarE activation bias
+# (rbf: exp(a D' + (a |y|^2 + log s))) or the VectorE clamp (Matern:
+# max(D' + |y|^2, 2^-110), then sqrt with scale a). Same instruction count;
+# the rounding moves from PSUM to the reader, so not the default bits.
+_KMV_NORM_BIAS = 2
 
 
-def kmv_plan(n: int, R: int, n_prog: int = 1):
+def kmv_pe_tile(size: int) -> int:
+    """TensorEngine tile size (32, 64 or 128) NKI derives for a stationary dimension of `size`."""
+    return 32 if size <= 32 else 64 if size <= 64 else 128
+
+
+def kmv_plan(n: int, R: int, n_prog: int = 1, per: int = _KMV_PASS_RT):
     """(NI, r_groups): X points per output block and the V column tiles per pass.
 
     Each output block is NI X points x one group of <= 128-column tiles of
     V, one PSUM accumulator (columns x NI, one bank) per tile, at most
-    `_KMV_PASS_RT` per pass over Y (R <= 768: one pass). NI = 512 (the
-    128 x 512 distance tile of #93), halved while there are fewer blocks
-    than cores.
+    `per` (`_KMV_PASS_RT`) per pass over Y (R <= 768: one pass). NI = 512
+    (the 128 x 512 distance tile of #93), halved while there are fewer
+    blocks than cores.
     """
     rtiles = [(r0, min(_KMV_RT, R - r0)) for r0 in range(0, R, _KMV_RT)]
     NI = _KMV_NI
     while NI > _TILE_M and -(-n // NI) < n_prog:
         NI //= 2
-    per = _KMV_PASS_RT
     return NI, [rtiles[i : i + per] for i in range(0, len(rtiles), per)]
 
 
@@ -2799,21 +2820,44 @@ def kmv_block_rows(n: int, m: int, work: int = _KMV_BLOCK_WORK, parts: int = 1) 
 
 if HAS_NKI:
 
-    def _kmv_aug_t(src, scr, r_lo, r_hi, ydir):
+    def _kmv_aug_t(src, scr, r_lo, r_hi, ydir, bias=None, prm=None, kind=0):
         """scr[:, r] = augmented coordinates of src[r], transposed, for r in [r_lo, r_hi).
 
         X side (ydir=0): [x, |x|^2, 1]; Y side (ydir=1): [-2y, 1, |y|^2].
+        With `bias` (`_KMV_NORM_BIAS`, r_lo = 0): X side [x, |x|^2] (bias is
+        not written), Y side [-2y, 1] and bias[p, t] = the per-partition term
+        of point t * 128 + p: a |y|^2 + log s for rbf, |y|^2 for Matern.
         """
         d = src.shape[1]
-        da = d + 2
+        da = d + 1 if bias is not None else d + 2
 
-        def tile(r0, rr):
+        def tile(r0, rr, ti=None):
             xr = nl.load(src[nl.ds(r0, rr), :])
             sq = nl.ndarray((rr, 1), dtype=nl.float32, buffer=nl.sbuf)
             junk = nl.ndarray((rr, d), dtype=nl.float32, buffer=nl.sbuf)
             nisa.activation_reduce(junk, nl.square, xr, reduce_op=nl.add, reduce_res=sq)
             aug = nl.ndarray((rr, da), dtype=nl.float32, buffer=nl.sbuf)
-            if ydir:
+            if bias is not None:
+                if ydir:
+                    nisa.tensor_scalar(aug[:, 0:d], xr, op0=nl.multiply, operand0=-2.0)
+                    nisa.memset(aug[:, d : d + 1], 1.0)
+                    if kind == 0:
+                        b = nl.ndarray((rr, 1), dtype=nl.float32, buffer=nl.sbuf)
+                        nisa.tensor_scalar(
+                            b,
+                            sq,
+                            op0=nl.multiply,
+                            operand0=prm[0:rr, 0:1],
+                            op1=nl.add,
+                            operand1=prm[0:rr, 1:2],
+                        )
+                    else:
+                        b = sq
+                    nl.store(bias[0:rr, nl.ds(ti, 1)], value=b)
+                else:
+                    nisa.tensor_copy(aug[:, 0:d], xr)
+                    nisa.tensor_copy(aug[:, d : d + 1], sq)
+            elif ydir:
                 nisa.tensor_scalar(aug[:, 0:d], xr, op0=nl.multiply, operand0=-2.0)
                 nisa.memset(aug[:, d : d + 1], 1.0)
                 nisa.tensor_copy(aug[:, d + 1 : d + 2], sq)
@@ -2829,13 +2873,16 @@ if HAS_NKI:
 
         n_full = (r_hi - r_lo) // _TILE_M
         if n_full:
-            nl.fori_loop(0, n_full, lambda t: tile(r_lo + t * _TILE_M, _TILE_M))
+            nl.fori_loop(0, n_full, lambda t: tile(r_lo + t * _TILE_M, _TILE_M, t))
         rem = r_hi - r_lo - n_full * _TILE_M
         if rem:
-            tile(r_lo + n_full * _TILE_M, rem)
+            tile(r_lo + n_full * _TILE_M, rem, n_full)
 
-    def _kmv_entries(d_ps, prm, kind, jr, ni, scratch):
+    def _kmv_entries(d_ps, prm, kind, jr, ni, scratch, bcol=None):
         """Kernel tile (jr, ni) in SBUF from the squared-distance tile in PSUM.
+
+        `bcol` (`_KMV_NORM_BIAS`): d_ps holds D - |y|^2 and bcol (jr, 1) the
+        per-partition term (`_kmv_aug_t`), added by the PSUM reader.
 
         `scratch`: `_KMV_SCRATCH[kind]` full-size SBUF tiles for the Matern
         intermediates, a slot of the body's ring (#108). Only the returned
@@ -2851,9 +2898,18 @@ if HAS_NKI:
             # Cancellation can leave D slightly negative for close points;
             # exp of it errs by the same relative amount as D itself, so no
             # clamp (it would cost a VectorE pass over every tile).
-            nisa.activation(k, nl.exp, d_ps, bias=log_s, scale=a)
+            nisa.activation(k, nl.exp, d_ps, bias=log_s if bcol is None else bcol, scale=a)
             return k
         t = scratch[0][0:jr, 0:ni]
+        if bcol is not None:
+            # max(D, 2^-110), then sqrt(a t): a * 2^-110 >= 2^-116 (ScalarE
+            # sqrt's accurate range, below) for a >= 2^-6, and below that the
+            # floor only stands in for k = s.
+            nisa.tensor_scalar(
+                t, d_ps, op0=nl.add, operand0=bcol, op1=nl.maximum, operand1=2.0**-110
+            )
+            nisa.activation(t, nl.sqrt, t, scale=a)
+            return _kmv_matern_tail(t, log_s, kind, jr, ni, scratch)
         # max(a * D, 2^-110) on VectorE straight from PSUM: sqrt needs a
         # non-negative input, and ScalarE sqrt is accurate only above 2^-116
         # (sqrt(2^-110) = 2^-55 stands in for an exact zero distance).
@@ -2867,6 +2923,10 @@ if HAS_NKI:
         # GpSimd rsqrt * t (1.1e-7) measured the same at the entry level and
         # cost 12% (Matern-1/2) to 30% (Matern-5/2) of the throughput.
         nisa.activation(t, nl.sqrt, t)
+        return _kmv_matern_tail(t, log_s, kind, jr, ni, scratch)
+
+    def _kmv_matern_tail(t, log_s, kind, jr, ni, scratch):
+        """Matern kernel tile from t = sqrt(a D) (`_kmv_entries`)."""
         if kind == 1:
             e = nl.ndarray((jr, ni), dtype=nl.float32, buffer=nl.sbuf)
             nisa.activation(e, nl.exp, t, bias=log_s, scale=-1.0)
@@ -2883,7 +2943,7 @@ if HAS_NKI:
         nisa.scalar_tensor_tensor(k, q, nl.add, 1.0, nl.multiply, e)
         return k
 
-    def _kmv_diag_coef(ya, xa, prm, kind, cr):
+    def _kmv_diag_coef(ya, xa, prm, kind, cr, rows=0, bcol=None):
         """(cr, 1) column noise + s - K~_ii for the square operator's rows i of one chunk (#143).
 
         ya, xa: (d + 2, cr) Y-side and X-side augmented coordinates of the
@@ -2896,14 +2956,27 @@ if HAS_NKI:
         diagonal (`affine_select` on p == q, then a row sum of one nonzero),
         and returns the column the finish step multiplies V_i by: the row's
         K~_ii V_i from the main loop cancels and s V_i takes its place.
+        `rows` > 0: the main loop's distance matmuls run in row tiles of that
+        size (#119), and so does this one (row tile 0), the same TensorEngine
+        mode.
         """
         d_ps = nl.ndarray((_TILE_M, _TILE_M), dtype=nl.float32, buffer=nl.psum)[0:cr, 0:cr]
-        nisa.nc_matmul(d_ps, ya, xa, accumulate=False)
+        if rows:
+            nisa.nc_matmul(
+                d_ps,
+                ya,
+                xa,
+                accumulate=False,
+                tile_position=(0, 0),
+                tile_size=(rows, kmv_pe_tile(cr)),
+            )
+        else:
+            nisa.nc_matmul(d_ps, ya, xa, accumulate=False)
         scr = [
             nl.ndarray((_TILE_M, _TILE_M), dtype=nl.float32, buffer=nl.sbuf)
             for _ in range(_KMV_SCRATCH[kind])
         ]
-        kt = _kmv_entries(d_ps, prm, kind, cr, cr, scr or None)
+        kt = _kmv_entries(d_ps, prm, kind, cr, cr, scr or None, bcol)
         sel = nl.ndarray((cr, cr), dtype=nl.float32, buffer=nl.sbuf)
         nisa.affine_select(
             sel,
@@ -2930,7 +3003,7 @@ if HAS_NKI:
         )
         return coef
 
-    def _kmv_body(x, y, v, params, kind, group, self_op, vn=None):
+    def _kmv_body(x, y, v, params, kind, group, self_op, vn=None, variant=0):
         """out = K(X, Y) @ V (+ noise * V if self_op, + noise * vn if vn given), K never materialised.
 
         Shapes (fp32):
@@ -2942,6 +3015,16 @@ if HAS_NKI:
             params: (128, 4) per-partition replicated [a, log s, noise, s]
             kind:   0 rbf, 1 matern12, 2 matern32, 3 matern52 (static)
             group:  Y tiles per rolled-loop body (static, 1 to `_KMV_MAX_GROUP`)
+            variant: static opt-in bits; `_KMV_SUBTILE` runs the distance
+                    matmuls in TensorEngine row tiles (#119): Y tile k of a
+                    body goes to row tile k mod q (q = 4 for d + 2 <= 32, 2
+                    for <= 64; no tiling above), its augmented coordinates
+                    and the X block's at that tile's SBUF partitions, and
+                    the q distance matmuls of tiles k..k+q-1 are issued back
+                    to back before their kernel tiles and @V products. The
+                    arithmetic and the order of every sum are unchanged.
+                    `_KMV_NORM_BIAS` moves the |y|^2 term out of the GEMM
+                    into the PSUM reader (contraction d + 1; see the constant).
         Returns:
             out:    (n, R) fp32
 
@@ -2952,13 +3035,20 @@ if HAS_NKI:
         n, d = x.shape
         m = n if self_op else y.shape[0]
         R = v.shape[1]
-        da = d + 2
+        fold = bool(variant & _KMV_NORM_BIAS)
+        da = d + 1 if fold else d + 2
         # The noise term reads V's rows of the output rows: v itself for the
         # whole square operator, vn for one row block of it.
         noisy = self_op or vn is not None
         v_noise = v if self_op else vn
         n_prog, pid = _program_split()
-        NI, r_groups = kmv_plan(n, R, n_prog)
+        # Row tiles of the distance matmul (#119): `rows` PE rows each, nq of them.
+        rows = kmv_pe_tile(da) if variant & _KMV_SUBTILE else _TILE_M
+        nq = _TILE_M // rows
+        if nq > 1:
+            NI, r_groups = kmv_plan(n, R, n_prog, _KMV_SUBTILE_PASS_RT)
+        else:
+            NI, r_groups = kmv_plan(n, R, n_prog)
         b_lo, b_hi, t0, tn = kmv_split(n, NI, n_prog, pid)
         group = max(1, min(group, _KMV_MAX_GROUP))
 
@@ -2967,26 +3057,55 @@ if HAS_NKI:
         # Prologue: augmented, transposed coordinates in HBM scratch, all of
         # X and Y on every core (O((n + m) d), negligible next to O(n m d),
         # and the same loops on both cores).
+        # With the norm fold, also the Y side's per-partition terms (ybias)
+        # and those of the output rows (xybias), one column per 128-point tile.
+        ybias = xybias = None
+        if fold:
+            prm = nl.load(params)
+            ybias = nl.ndarray((_TILE_M, -(-m // _TILE_M)), dtype=nl.float32, buffer=nl.shared_hbm)
         yt = nl.ndarray((da, m), dtype=nl.float32, buffer=nl.shared_hbm)
-        _kmv_aug_t(x if self_op else y, yt, 0, m, 1)
+        if fold:
+            _kmv_aug_t(x if self_op else y, yt, 0, m, 1, ybias, prm, kind)
+        else:
+            _kmv_aug_t(x if self_op else y, yt, 0, m, 1)
         xt = nl.ndarray((da, n), dtype=nl.float32, buffer=nl.shared_hbm)
-        _kmv_aug_t(x, xt, 0, n, 0)
+        if fold:
+            _kmv_aug_t(x, xt, 0, n, 0, ybias, prm, kind)
+        else:
+            _kmv_aug_t(x, xt, 0, n, 0)
         # Y-side coordinates of the output rows, for the diagonal correction
         # (#143): yt itself for the square operator; for a row block of it
         # the same instructions on the same rows (x is a slice of y), so the
         # same bits as the rows' columns of yt.
-        xyt = yt
+        xyt, xybias = yt, ybias
         if noisy and not self_op:
             xyt = nl.ndarray((da, n), dtype=nl.float32, buffer=nl.shared_hbm)
-            _kmv_aug_t(x, xyt, 0, n, 1)
-        prm = nl.load(params)
+            if fold:
+                xybias = nl.ndarray(
+                    (_TILE_M, -(-n // _TILE_M)), dtype=nl.float32, buffer=nl.shared_hbm
+                )
+                _kmv_aug_t(x, xyt, 0, n, 1, xybias, prm, kind)
+            else:
+                _kmv_aug_t(x, xyt, 0, n, 1)
+        if not fold:
+            prm = nl.load(params)
 
         # Y tiles: `nt` full ones and a ragged one of `jt` rows.
         nt = m // _TILE_M
         jt = m - nt * _TILE_M
 
-        def block(i0, ni, rg):
-            xb = nl.load(xt[:, nl.ds(i0, ni)])  # (d + 2, ni): moving operand
+        def block(i0, ni, rg, ti0=None):
+            # ti0: i0 // 128, for the output rows' terms of the norm fold.
+            if nq > 1:
+                # The X block at the partitions of every row tile (#119): the
+                # moving operand of a tiled matmul sits at its tile's rows.
+                x_all = nl.ndarray((_TILE_M, ni), dtype=nl.float32, buffer=nl.sbuf)
+                for q in range(nq):
+                    nisa.dma_copy(dst=x_all[q * rows : q * rows + da, :], src=xt[:, nl.ds(i0, ni)])
+                xq = [x_all[q * rows : q * rows + da, :] for q in range(nq)]
+                xb = xq[0]
+            else:
+                xb = nl.load(xt[:, nl.ds(i0, ni)])  # (d + 2, ni): moving operand
             chunks = [(c, min(_TILE_M, ni - c)) for c in range(0, ni, _TILE_M)]
             # V columns of this pass, and the pass's PSUM: one accumulator
             # bank per column tile, the rest a ring of distance tiles.
@@ -2998,7 +3117,8 @@ if HAS_NKI:
             # tiles in PSUM and VectorE adds that partial to the running sum.
             acc = [nl.ndarray((rr, ni), dtype=nl.float32, buffer=nl.sbuf) for _, rr in rg]
 
-            def part(j0, sizes, init):
+            def part(j0, sizes, init, tj0=None):
+                # tj0: j0 // 128, for the Y tiles' terms of the norm fold.
                 # Full-size allocations, sliced: one PSUM shape for every
                 # tile lets the allocator reuse banks across bodies.
                 ps = [
@@ -3019,8 +3139,31 @@ if HAS_NKI:
                     ]
                     for _ in range(min(_KMV_SCRATCH_RING, len(sizes)) if _KMV_SCRATCH[kind] else 0)
                 ]
-                # The body's Y coordinates in one DMA: (d + 2, sum(sizes)).
-                y_all = nl.load(yt[:, nl.ds(j0, sum(sizes))])
+                if nq > 1:
+                    # Y tile k at row tile k mod nq, slot k // nq: one strided
+                    # DMA per row tile for the full tiles, one for a ragged
+                    # last tile (#119).
+                    y_all = nl.ndarray(
+                        (_TILE_M, -(-len(sizes) // nq), _TILE_M), dtype=nl.float32, buffer=nl.sbuf
+                    )
+                    nf = sum(1 for jr in sizes if jr == _TILE_M)
+                    if nf:
+                        src = yt[:, nl.ds(j0, nf * _TILE_M)].reshape_dim(1, (nf, _TILE_M))
+                        for q in range(min(nq, nf)):
+                            cq = len(range(q, nf, nq))
+                            nisa.dma_copy(
+                                dst=y_all[q * rows : q * rows + da, 0:cq, :],
+                                src=src.slice(1, q, nf, nq),
+                            )
+                    if nf < len(sizes):
+                        q, jr = nf % nq, sizes[nf]
+                        nisa.dma_copy(
+                            dst=y_all[q * rows : q * rows + da, nf // nq, 0:jr],
+                            src=yt[:, nl.ds(j0 + nf * _TILE_M, jr)],
+                        )
+                else:
+                    # The body's Y coordinates in one DMA: (d + 2, sum(sizes)).
+                    y_all = nl.load(yt[:, nl.ds(j0, sum(sizes))])
                 # One DMA when every tile is full and the rows fit the budget.
                 full = all(jr == _TILE_M for jr in sizes)
                 full = full and len(sizes) * pr * 4 <= _KMV_V_BATCH_BYTES
@@ -3029,20 +3172,55 @@ if HAS_NKI:
                     # tile k of the body at [:, k, :].
                     src = v[nl.ds(j0, len(sizes) * _TILE_M), p0 : p0 + pr]
                     v_all = nl.load(src.reshape_dim(0, (len(sizes), _TILE_M)).permute((1, 0, 2)))
-                j = j0
-                for k, jr in enumerate(sizes):
-                    off = sum(sizes[:k])
-                    yb = y_all[:, off : off + jr]  # (d + 2, jr): stationary
-                    d_ps = ring[k % len(ring)][0:jr, 0:ni]
-                    nisa.nc_matmul(d_ps, yb, xb, accumulate=False)  # D^T, Y on partitions
-                    kt = _kmv_entries(d_ps, prm, kind, jr, ni, scr[k % len(scr)] if scr else None)
-                    vk = v_all[:, k, :] if full else nl.load(v[nl.ds(j, jr), p0 : p0 + pr])
+
+                if fold:
+                    # The body's per-partition terms in one DMA: (128, tiles).
+                    yb_all = nl.load(ybias[:, nl.ds(tj0, len(sizes))])
+
+                def product(k, jr, d_ps):
+                    # Kernel tile k from its distances, then out^T += V_j^T K^T.
+                    sk = scr[k % len(scr)] if scr else None
+                    if fold:
+                        kt = _kmv_entries(d_ps, prm, kind, jr, ni, sk, yb_all[0:jr, k : k + 1])
+                    else:
+                        kt = _kmv_entries(d_ps, prm, kind, jr, ni, sk)
+                    if full:
+                        vk = v_all[:, k, :]
+                    else:
+                        vk = nl.load(v[nl.ds(j0 + sum(sizes[:k]), jr), p0 : p0 + pr])
                     for ri, (r0, rr) in enumerate(rg):
                         # out^T += V_j^T K^T; the body's first Y tile opens
                         # the accumulation group (accumulate=False).
                         vb = vk[0:jr, r0 - p0 : r0 - p0 + rr]  # (jr, rr): stationary
                         nisa.nc_matmul(ps[ri], vb, kt, accumulate=k > 0)
-                    j = j + jr
+
+                if nq > 1:
+                    assert len(ring) >= min(nq, len(sizes))
+                    for g0 in range(0, len(sizes), nq):
+                        ks = range(g0, min(g0 + nq, len(sizes)))
+                        d_k = []
+                        for k in ks:
+                            q, jr = k % nq, sizes[k]
+                            yb = y_all[q * rows : q * rows + da, k // nq, 0:jr]  # stationary
+                            d_ps = ring[k % len(ring)][0:jr, 0:ni]
+                            nisa.nc_matmul(
+                                d_ps,
+                                yb,
+                                xq[q],
+                                accumulate=False,
+                                tile_position=(q * rows, 0),
+                                tile_size=(rows, kmv_pe_tile(jr)),
+                            )
+                            d_k.append(d_ps)
+                        for k, d_ps in zip(ks, d_k, strict=True):
+                            product(k, sizes[k], d_ps)
+                else:
+                    for k, jr in enumerate(sizes):
+                        off = sum(sizes[:k])
+                        yb = y_all[:, off : off + jr]  # (d + 2, jr): stationary
+                        d_ps = ring[k % len(ring)][0:jr, 0:ni]
+                        nisa.nc_matmul(d_ps, yb, xb, accumulate=False)  # D^T, Y on partitions
+                        product(k, jr, d_ps)
                 for ri in range(len(rg)):
                     if init:
                         nisa.tensor_copy(acc[ri], ps[ri])
@@ -3056,18 +3234,21 @@ if HAS_NKI:
             # their enclosing region, so this scopes each part's PSUM tiles
             # to the part instead of the whole block.
             k0 = min(group, nt)
-            nl.fori_loop(0, 1, lambda _: part(0, [_TILE_M] * k0 if k0 else [jt], True))
+            nl.fori_loop(0, 1, lambda _: part(0, [_TILE_M] * k0 if k0 else [jt], True, 0))
             n_groups = (nt - k0) // group
             span = group * _TILE_M
             if n_groups:
                 nl.fori_loop(
                     0,
                     n_groups,
-                    lambda gi: part(k0 * _TILE_M + gi * span, [_TILE_M] * group, False),
+                    lambda gi: part(
+                        k0 * _TILE_M + gi * span, [_TILE_M] * group, False, k0 + gi * group
+                    ),
                 )
             rest = [_TILE_M] * (nt - k0 - n_groups * group) + ([jt] if jt and k0 else [])
             if rest:
-                nl.fori_loop(0, 1, lambda _: part((k0 + n_groups * group) * _TILE_M, rest, False))
+                k1 = k0 + n_groups * group
+                nl.fori_loop(0, 1, lambda _: part(k1 * _TILE_M, rest, False, k1))
 
             def finish():
                 # out = (out^T)^T, 128 X rows at a time, through a pair of
@@ -3081,7 +3262,12 @@ if HAS_NKI:
                 if noisy:
                     for c, cr in chunks:
                         ya = nl.load(xyt[:, nl.ds(i0 + c, cr)])
-                        coefs.append(_kmv_diag_coef(ya, xb[:, c : c + cr], prm, kind, cr))
+                        xa = xb[:, c : c + cr]
+                        bc = None
+                        if fold:
+                            bc = nl.load(xybias[0:cr, nl.ds(ti0 + c // _TILE_M, 1)])
+                        rt = rows if nq > 1 else 0
+                        coefs.append(_kmv_diag_coef(ya, xa, prm, kind, cr, rt, bc))
                 t = 0
                 for ri, (r0, rr) in enumerate(rg):
                     for ci, (c, cr) in enumerate(chunks):
@@ -3101,30 +3287,32 @@ if HAS_NKI:
         for rg in r_groups:
             # The same trip count on every core (`kmv_split`).
             if b_hi > b_lo:
-                nl.fori_loop(b_lo, b_hi, lambda b, rg=rg: block(b * NI, NI, rg))
+                nl.fori_loop(
+                    b_lo, b_hi, lambda b, rg=rg: block(b * NI, NI, rg, b * (NI // _TILE_M))
+                )
             if tn:
-                block(t0, tn, rg)
+                block(t0, tn, rg, t0 // _TILE_M)
         return out
 
     @nki.jit
-    def _kmv_self_kernel(x, v, params, kind, group):
+    def _kmv_self_kernel(x, v, params, kind, group, variant=0):
         """(K(X, X) + noise I) @ V. See `_kmv_body`."""
-        return _kmv_body(x, None, v, params, int(kind), int(group), True)
+        return _kmv_body(x, None, v, params, int(kind), int(group), True, variant=int(variant))
 
     @nki.jit
-    def _kmv_cross_kernel(x, y, v, params, kind, group):
+    def _kmv_cross_kernel(x, y, v, params, kind, group, variant=0):
         """K(X, Y) @ V. See `_kmv_body`."""
-        return _kmv_body(x, y, v, params, int(kind), int(group), False)
+        return _kmv_body(x, y, v, params, int(kind), int(group), False, variant=int(variant))
 
     @nki.jit
-    def _kmv_selfblk_kernel(x, y, v, vn, params, kind, group):
+    def _kmv_selfblk_kernel(x, y, v, vn, params, kind, group, variant=0):
         """Row block of (K(Y, Y) + noise I) @ V: x = rows of y, vn = the same rows of v (#100).
 
         The same instructions per output row as `_kmv_self_kernel` (the
         augmented coordinates and the noise term are row-local), so a
         row-blocked square product is bit-identical to the one-launch one.
         """
-        return _kmv_body(x, y, v, params, int(kind), int(group), False, vn)
+        return _kmv_body(x, y, v, params, int(kind), int(group), False, vn, int(variant))
 
 
 # ── Graph segment sum / gather (#139) ─────────────────────────────────────────

@@ -697,6 +697,45 @@ class TestEagerHandle:
         dispatch._native_call("k", [torch.ones(1)])  # same cache, shape-free key
         assert len(dispatch._eager_handles) == 3
 
+    def test_kmv_launch_subtile_variant(self, eager, monkeypatch):
+        """TRNSPARSE_KMV_SUBTILE=1 (#119) adds the variant as one more static
+        argument, on the handle and on the custom op; unset, the call is unchanged."""
+        self._kmv(monkeypatch)
+        x, v, p = torch.ones(4, 3), torch.ones(4, 2), torch.ones(128, 4)
+        monkeypatch.delenv("TRNSPARSE_KMV_SUBTILE", raising=False)
+        monkeypatch.delenv("TRNSPARSE_KMV_NORM_BIAS", raising=False)
+        out = dispatch._kmv_launch(x, None, v, None, p, 0, 1, sim=False)
+        assert out[0] == "handle" and len(out[1]) == 5 and out[1][-2:] == (0, 1)
+        monkeypatch.setenv("TRNSPARSE_KMV_SUBTILE", "1")
+        out = dispatch._kmv_launch(x, None, v, None, p, 0, 1, sim=False)
+        assert out[0] == "handle" and out[1][-3:] == (0, 1, kernels._KMV_SUBTILE)
+        monkeypatch.setattr(dispatch, "_eager_call_ok", lambda tensors: False)
+        out = dispatch._kmv_launch(x, None, v, None, p, 0, 1, sim=False)
+        assert out[0] == "op" and out[1][-3:] == (0, 1, kernels._KMV_SUBTILE)
+
+    @pytest.mark.parametrize(
+        "raw,want", [("", 0), ("0", 0), ("off", 0), ("1", 1), (" true ", 1), ("ON", 1)]
+    )
+    def test_kmv_variant_env(self, monkeypatch, raw, want):
+        monkeypatch.delenv("TRNSPARSE_KMV_NORM_BIAS", raising=False)
+        monkeypatch.setenv("TRNSPARSE_KMV_SUBTILE", raw)
+        assert dispatch._kmv_variant() == want
+
+    def test_kmv_variant_env_rejects_other_values(self, monkeypatch):
+        monkeypatch.setenv("TRNSPARSE_KMV_SUBTILE", "2")
+        with pytest.raises(ValueError, match="TRNSPARSE_KMV_SUBTILE"):
+            dispatch._kmv_variant()
+
+    def test_kmv_norm_bias_env_bit(self, monkeypatch):
+        monkeypatch.delenv("TRNSPARSE_KMV_SUBTILE", raising=False)
+        monkeypatch.setenv("TRNSPARSE_KMV_NORM_BIAS", "1")
+        assert dispatch._kmv_variant() == kernels._KMV_NORM_BIAS
+        monkeypatch.setenv("TRNSPARSE_KMV_SUBTILE", "1")
+        assert dispatch._kmv_variant() == kernels._KMV_SUBTILE | kernels._KMV_NORM_BIAS
+        monkeypatch.setenv("TRNSPARSE_KMV_NORM_BIAS", "x")
+        with pytest.raises(ValueError, match="TRNSPARSE_KMV_NORM_BIAS"):
+            dispatch._kmv_variant()
+
     def test_kmv_launch_respects_flag(self, eager, monkeypatch):
         built, _ = eager
         self._kmv(monkeypatch)

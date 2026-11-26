@@ -2326,10 +2326,42 @@ def _kmv_block_work() -> int:
     return max(1, int(float(env))) if env else _kernels._KMV_BLOCK_WORK
 
 
+def _env_flag(name: str) -> bool:
+    raw = os.environ.get(name, "").strip().lower()
+    if raw in ("", "0", "false", "no", "off"):
+        return False
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    raise ValueError(f"{name} must be 0 or 1; got {raw!r}")
+
+
+def _kmv_variant() -> int:
+    """Static opt-in bits of the kernel (`kernels._kmv_body`); 0 is the default kernel.
+
+    TRNSPARSE_KMV_SUBTILE=1 runs the distance matmuls in TensorEngine row
+    tiles, four independent ones at a time (#119). The arithmetic is the
+    same; the simulator gives the default kernel's bits.
+    TRNSPARSE_KMV_NORM_BIAS=1 moves the |y|^2 term of the distance out of
+    the augmented GEMM into the PSUM reader's per-partition operand (#119):
+    contraction d + 1, same instruction count, different rounding.
+    """
+    variant = 0
+    if _env_flag("TRNSPARSE_KMV_SUBTILE"):
+        variant |= _kernels._KMV_SUBTILE
+    if _env_flag("TRNSPARSE_KMV_NORM_BIAS"):
+        variant |= _kernels._KMV_NORM_BIAS
+    return variant
+
+
 def _kmv_launch(x, y, v, vn, params, kind: int, group: int, sim: bool) -> torch.Tensor:
     """One kernel launch on operands already placed (device, or host for the simulator)."""
     from . import kernels as _k
 
+    # The opt-in variant is one more static argument; the default call is unchanged.
+    statics = (int(kind), int(group))
+    variant = _kmv_variant()
+    if variant:
+        statics += (variant,)
     if y is None:
         kernel, name, tensors = _k._kmv_self_kernel, "kmv_self", (x, v, params)
     elif vn is None:
@@ -2340,15 +2372,15 @@ def _kmv_launch(x, y, v, vn, params, kind: int, group: int, sim: bool) -> torch.
     # operand dtypes first, as `_launch` / `_run` / `_simulate` do.
     _check_kernel_operands(name, tensors)
     if sim:
-        out = nki.simulate(kernel)(*(_sim_np(t) for t in tensors), int(kind), int(group))
+        out = nki.simulate(kernel)(*(_sim_np(t) for t in tensors), *statics)
         return _sim_torch(out, v.device)
     if _get_dispatch_path() == "native":
         shapes = tuple(tuple(t.shape) for t in tensors)
         handle = _eager_handle(kernel, shapes) if _eager_call_ok(tensors) else None
         if handle is not None:
-            return handle(*tensors, int(kind), int(group))
-        return _get_native_ops()[name](*tensors, int(kind), int(group))
-    return kernel(*tensors, int(kind), int(group))
+            return handle(*tensors, *statics)
+        return _get_native_ops()[name](*tensors, *statics)
+    return kernel(*tensors, *statics)
 
 
 # ── Row blocks across logical NeuronCores (#102) ─────────────────────────────
