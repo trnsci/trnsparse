@@ -993,7 +993,9 @@ class TestLazyRegistration:
             if name.split("::")[1] in KEYED_OPS:
                 assert re.search(r"(Sym)?[Ii]nt key[,)]", schema), (name, schema)
             elif name.split("::")[1] in KMV_OPS:
-                assert re.search(r"(Sym)?[Ii]nt kind, (Sym)?[Ii]nt group\)", schema), (name, schema)
+                # The opt-in variant (#119) is a trailing static int, default 0.
+                pat = r"(Sym)?[Ii]nt kind, (Sym)?[Ii]nt group, (Sym)?[Ii]nt variant=0\)"
+                assert re.search(pat, schema), (name, schema)
             elif name.split("::")[1] in SEGMENT_OPS:
                 assert re.search(r"(Sym)?[Ii]nt rows_out, (Sym)?[Ii]nt nz\)", schema), (
                     name,
