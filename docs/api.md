@@ -148,6 +148,16 @@ to 32 (32 from m = 131072), which also minimises the fp32 summation error), `TRN
 per launch, default `6e10`), `TRNSPARSE_NKI_EAGER_HANDLE=0` (custom op instead
 of the cached `wrap_nki` handle).
 
+Opt-in kernel variants (#119, not yet validated on the device):
+`TRNSPARSE_KMV_SUBTILE=1` runs the distance matmuls in TensorEngine row
+tiles. The contraction uses d + 2 of 128 PE rows, so four matmuls on
+different Y tiles go to the four 32-row tiles (two 64-row tiles for
+d + 2 <= 64), with the same arithmetic and summation order as the default
+kernel. `TRNSPARSE_KMV_NORM_BIAS=1` moves the `|y|^2` term out of the GEMM
+into the PSUM reader's per-partition operand: the ScalarE `activation` bias
+for RBF, the VectorE clamp for Matern. Its rounding differs from the default
+kernel's, within the same tolerances.
+
 ## Screening
 
 - `schwarz_bounds(shell_pair_integrals)` — Cauchy-Schwarz bounds $Q_{pq} = \sqrt{(pq|pq)}$

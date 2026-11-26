@@ -514,30 +514,45 @@ bsr_spmm_t_keyed.register_autograd(_bsr_spmm_t_keyed_backward, setup_context=_sa
 @nki_op(
     "trnsparse::kmv_self",
     mutates_args={},
-    fake_fn=lambda x, v, params, kind, group: v.new_empty((x.shape[0], v.shape[1])),
+    fake_fn=lambda x, v, params, kind, group, variant=0: v.new_empty((x.shape[0], v.shape[1])),
 )
 def kmv_self(
-    x: torch.Tensor, v: torch.Tensor, params: torch.Tensor, kind: int, group: int
+    x: torch.Tensor,
+    v: torch.Tensor,
+    params: torch.Tensor,
+    kind: int,
+    group: int,
+    variant: int = 0,
 ) -> torch.Tensor:
-    # (K(X, X) + noise I) V; kind / group are compile-time, params a tensor.
-    return _k._kmv_self_kernel(x, v, params, int(kind), int(group))
+    # (K(X, X) + noise I) V; kind / group / variant are compile-time, params a
+    # tensor. variant: opt-in kernel bits (#119), 1 = row-tiled distance
+    # matmuls, 2 = |y|^2 in the PSUM reader.
+    return _k._kmv_self_kernel(x, v, params, int(kind), int(group), int(variant))
 
 
 @nki_op(
     "trnsparse::kmv_cross",
     mutates_args={},
-    fake_fn=lambda x, y, v, params, kind, group: v.new_empty((x.shape[0], v.shape[1])),
+    fake_fn=lambda x, y, v, params, kind, group, variant=0: v.new_empty((x.shape[0], v.shape[1])),
 )
 def kmv_cross(
-    x: torch.Tensor, y: torch.Tensor, v: torch.Tensor, params: torch.Tensor, kind: int, group: int
+    x: torch.Tensor,
+    y: torch.Tensor,
+    v: torch.Tensor,
+    params: torch.Tensor,
+    kind: int,
+    group: int,
+    variant: int = 0,
 ) -> torch.Tensor:
-    return _k._kmv_cross_kernel(x, y, v, params, int(kind), int(group))
+    return _k._kmv_cross_kernel(x, y, v, params, int(kind), int(group), int(variant))
 
 
 @nki_op(
     "trnsparse::kmv_selfblk",
     mutates_args={},
-    fake_fn=lambda x, y, v, vn, params, kind, group: v.new_empty((x.shape[0], v.shape[1])),
+    fake_fn=lambda x, y, v, vn, params, kind, group, variant=0: v.new_empty(
+        (x.shape[0], v.shape[1])
+    ),
 )
 def kmv_selfblk(
     x: torch.Tensor,
@@ -547,9 +562,10 @@ def kmv_selfblk(
     params: torch.Tensor,
     kind: int,
     group: int,
+    variant: int = 0,
 ) -> torch.Tensor:
     # One row block of the square operator (#100): x = rows of y, vn = those rows of v.
-    return _k._kmv_selfblk_kernel(x, y, v, vn, params, int(kind), int(group))
+    return _k._kmv_selfblk_kernel(x, y, v, vn, params, int(kind), int(group), int(variant))
 
 
 # Graph segment sum / gather (#139). Both ops take the value tensor plus the

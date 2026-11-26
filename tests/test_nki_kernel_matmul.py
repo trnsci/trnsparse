@@ -17,6 +17,7 @@ Needs `nki` but no Neuron device.
 from __future__ import annotations
 
 import inspect
+import re
 import shutil
 import warnings
 
@@ -98,11 +99,12 @@ def _inputs(n, m, d, R, kernel, self_op, seed=0):
     return x, y, v, params, ref
 
 
-def _run(x, y, v, params, kind, lnc, self_op, group=4):
+def _run(x, y, v, params, kind, lnc, self_op, group=4, variant=0):
+    extra = (variant,) if variant else ()
     if self_op:
-        args = (x, v, params, kind, group)
+        args = (x, v, params, kind, group, *extra)
         return np.asarray(simulate_kernel(K._kmv_self_kernel, args, {}, lnc=lnc, target="trn2"))
-    args = (x, y, v, params, kind, group)
+    args = (x, y, v, params, kind, group, *extra)
     return np.asarray(simulate_kernel(K._kmv_cross_kernel, args, {}, lnc=lnc, target="trn2"))
 
 
@@ -187,7 +189,7 @@ def test_dispatch_path_under_simulator():
         trnsparse.set_backend(old)
 
 
-def _run_blocked(x, y, v, params, kind, lnc, self_op, rows, group=4):
+def _run_blocked(x, y, v, params, kind, lnc, self_op, rows, group=4, variant=0):
     """The product as zero-padded row blocks of `rows`, as `nki_kernel_matmul` launches it (#100)."""
     n, d = x.shape
     yy = x if self_op else y
@@ -196,13 +198,14 @@ def _run_blocked(x, y, v, params, kind, lnc, self_op, rows, group=4):
         nb = min(rows, n - i0)
         xb = np.zeros((rows, d), np.float32)
         xb[:nb] = x[i0 : i0 + nb]
+        extra = (variant,) if variant else ()
         if self_op:
             vb = np.zeros((rows, v.shape[1]), np.float32)
             vb[:nb] = v[i0 : i0 + nb]
-            args = (xb, yy, v, vb, params, kind, group)
+            args = (xb, yy, v, vb, params, kind, group, *extra)
             kern = K._kmv_selfblk_kernel
         else:
-            args = (xb, yy, v, params, kind, group)
+            args = (xb, yy, v, params, kind, group, *extra)
             kern = K._kmv_cross_kernel
         ob = np.asarray(simulate_kernel(kern, args, {}, lnc=lnc, target="trn2"))
         outs.append(ob[:nb])
@@ -287,6 +290,159 @@ def test_dispatch_row_blocked_under_simulator(monkeypatch, self_op):
     assert np.array_equal(one.numpy(), direct)
 
 
+# ── Row-tiled distance matmuls (#119, TRNSPARSE_KMV_SUBTILE=1) ───────────────
+#
+# The variant moves each Y tile's augmented coordinates (and a copy of the X
+# block) to the SBUF partitions of a TensorEngine row tile and issues four
+# distance matmuls back to back; the arithmetic and every summation order are
+# the default kernel's, so the simulator must give the default kernel's bits:
+# 32-row tiles (d + 2 <= 32), 64-row tiles (d = 40), no tiling (d = 126),
+# ragged Y tiles, bodies that are not a multiple of 4 tiles, V passes of 4
+# column tiles instead of 6 (R = 700), the exact diagonal and row blocks.
+
+_ST = K._KMV_SUBTILE
+
+_SUBTILE_CASES = _SIM_CASES + [
+    (600, 600, 40, 3, "matern12"),
+    (300, 1100, 3, 700, "rbf"),
+    (513, 2100 + 37, 5, 130, "matern52"),
+]
+
+
+@pytest.mark.parametrize("case", _SUBTILE_CASES, ids=lambda c: "-".join(map(str, c)))
+@pytest.mark.parametrize("self_op", [True, False], ids=["square", "cross"])
+def test_subtile_is_bitwise_default_kernel(case, self_op):
+    n, m, d, R, kernel = case
+    if self_op and n != m:
+        pytest.skip("square operator needs m = n")
+    x, y, v, params, ref = _inputs(n, m, d, R, kernel, self_op)
+    kind = _KINDS.index(kernel)
+    lncs = (1, 2) if n * m <= 10**6 else (2,)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)
+        for lnc in lncs:
+            for group in (4, 7):
+                base = _run(x, y, v, params, kind, lnc, self_op, group)
+                st = _run(x, y, v, params, kind, lnc, self_op, group, variant=_ST)
+                assert np.array_equal(st, base), (lnc, group)
+    assert np.abs(st - ref).max() / np.abs(ref).max() < 5e-6
+
+
+@pytest.mark.parametrize("kernel", _KINDS)
+def test_subtile_square_diagonal_is_exact(kernel):
+    """K_ii = s with row-tiled distance matmuls, one launch and row-blocked (#143, #119)."""
+    n = 300
+    rng = np.random.default_rng(1)
+    x = (4.0 * rng.random((n, 3))).astype(np.float32)
+    v = np.eye(n, dtype=np.float32)
+    ell, s, noise = 0.05, 1.3, 1e-2
+    params = _params(_scale_coeff(kernel) / ell**2, s, noise, "cpu").numpy()
+    kind = _KINDS.index(kernel)
+    base = _run(x, None, v, params, kind, 2, True)
+    for out in (
+        _run(x, None, v, params, kind, 2, True, variant=_ST),
+        _run_blocked(x, None, v, params, kind, 1, True, 128, variant=_ST),
+    ):
+        np.testing.assert_allclose(np.diagonal(out), s + noise, rtol=3e-7, atol=0)
+        assert np.array_equal(out, base)
+
+
+@pytest.mark.parametrize("self_op", [True, False], ids=["square", "cross"])
+def test_subtile_row_blocked_is_bitwise_one_launch(self_op):
+    n, rows = 1300, 1024
+    m = n if self_op else 700
+    x, y, v, params, _ = _inputs(n, m, 3, 33, "matern52", self_op, seed=n)
+    one = _run(x, y, v, params, 3, 2, self_op)
+    blocked = _run_blocked(x, y, v, params, 3, 2, self_op, rows, variant=_ST)
+    _assert_blocked_matches(one, blocked)
+
+
+def test_subtile_plan_leaves_four_distance_banks():
+    """Every V pass of the variant leaves >= 4 PSUM banks for the distance tiles in flight."""
+    for R in (1, 128, 512, 513, 700, 1500):
+        _, groups = K.kmv_plan(1000, R, 1, K._KMV_SUBTILE_PASS_RT)
+        assert all(K._KMV_PSUM_BANKS - len(g) >= 4 for g in groups)
+        assert sum(rr for g in groups for _, rr in g) == R
+    assert [K.kmv_pe_tile(s) for s in (1, 5, 32, 33, 64, 65, 128)] == [32, 32, 32, 64, 64, 128, 128]
+
+
+# The norm fold (`_KMV_NORM_BIAS`, TRNSPARSE_KMV_NORM_BIAS=1) moves |y|^2 from
+# the GEMM to the PSUM reader: not the default bits (rbf's exp now rounds
+# a D' + b), but the same accuracy, the same bits at LNC=1 and LNC=2, with
+# and without row tiling, and an exact diagonal.
+
+_NB = K._KMV_NORM_BIAS
+
+
+@pytest.mark.parametrize("case", _SUBTILE_CASES, ids=lambda c: "-".join(map(str, c)))
+@pytest.mark.parametrize("self_op", [True, False], ids=["square", "cross"])
+def test_norm_bias_accurate_and_lnc_bitwise(case, self_op):
+    n, m, d, R, kernel = case
+    if self_op and n != m:
+        pytest.skip("square operator needs m = n")
+    x, y, v, params, ref = _inputs(n, m, d, R, kernel, self_op)
+    kind = _KINDS.index(kernel)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)
+        fb = _run(x, y, v, params, kind, 2, self_op, variant=_NB)
+        assert np.abs(fb - ref).max() / np.abs(ref).max() < 5e-6
+        assert np.array_equal(_run(x, y, v, params, kind, 2, self_op, variant=_NB | _ST), fb)
+        if n * m <= 10**6:
+            assert np.array_equal(_run(x, y, v, params, kind, 1, self_op, variant=_NB), fb)
+
+
+@pytest.mark.parametrize("kernel", _KINDS)
+def test_norm_bias_square_diagonal_is_exact(kernel):
+    n = 300
+    rng = np.random.default_rng(1)
+    x = (4.0 * rng.random((n, 3))).astype(np.float32)
+    v = np.eye(n, dtype=np.float32)
+    ell, s, noise = 0.05, 1.3, 1e-2
+    params = _params(_scale_coeff(kernel) / ell**2, s, noise, "cpu").numpy()
+    p0 = _params(_scale_coeff(kernel) / ell**2, s, 0.0, "cpu").numpy()
+    kind = _KINDS.index(kernel)
+    var = _NB | _ST
+    cross = _run(x, x, v, p0, kind, 2, False, variant=var)
+    off = ~np.eye(n, dtype=bool)
+    for out in (
+        _run(x, None, v, params, kind, 2, True, variant=var),
+        _run_blocked(x, None, v, params, kind, 1, True, 128, variant=var),
+    ):
+        np.testing.assert_allclose(np.diagonal(out), s + noise, rtol=3e-7, atol=0)
+        assert np.array_equal(out[off], cross[off])
+
+
+@pytest.mark.parametrize("self_op", [True, False], ids=["square", "cross"])
+def test_norm_bias_row_blocked_is_bitwise_one_launch(self_op):
+    n, rows = 1300, 1024
+    m = n if self_op else 700
+    x, y, v, params, _ = _inputs(n, m, 3, 33, "rbf", self_op, seed=n)
+    var = _NB | _ST
+    one = _run(x, y, v, params, 0, 2, self_op, variant=var)
+    blocked = _run_blocked(x, y, v, params, 0, 2, self_op, rows, variant=var)
+    _assert_blocked_matches(one, blocked)
+
+
+@pytest.mark.skipif(not dispatch._use_simulator(), reason="needs TRNSPARSE_USE_SIMULATOR=1")
+@pytest.mark.parametrize("self_op", [True, False], ids=["square", "cross"])
+def test_dispatch_subtile_env_under_simulator(monkeypatch, self_op):
+    """TRNSPARSE_KMV_SUBTILE=1 through `nki_kernel_matmul`: the default kernel's bits."""
+    n = 700
+    m = n if self_op else 300
+    x, y, v, params, _ = _inputs(n, m, 3, 5, "matern12", self_op, seed=12)
+    xt, vt, pt = (torch.from_numpy(a) for a in (x, v, params))
+    yt = None if self_op else torch.from_numpy(y)
+    monkeypatch.delenv("TRNSPARSE_KMV_SUBTILE", raising=False)
+    base = dispatch.nki_kernel_matmul(xt, yt, vt, pt, 1, 4)
+    monkeypatch.setenv("TRNSPARSE_KMV_SUBTILE", "1")
+    st = dispatch.nki_kernel_matmul(xt, yt, vt, pt, 1, 4)
+    assert np.array_equal(st.numpy(), base.numpy())
+    monkeypatch.setenv("TRNSPARSE_KMV_NORM_BIAS", "1")
+    fb = dispatch.nki_kernel_matmul(xt, yt, vt, pt, 1, 4).numpy()
+    direct = _run(x, y, v, params, 1, 1, self_op, 4, variant=_ST | _NB)
+    assert np.array_equal(fb, direct)
+
+
 def _compile_cases():
     f = np.zeros
     p = f((128, 4), np.float32)
@@ -365,20 +521,45 @@ def _compile_cases():
 _COMPILE = _compile_cases()
 
 
+_VARIANTS = [0, K._KMV_SUBTILE, K._KMV_SUBTILE | K._KMV_NORM_BIAS]
+_VARIANT_IDS = ["default", "subtile", "subtile-normbias"]
+
+
+def _variant_args(mk, variant):
+    return (*mk(), variant) if variant else mk()
+
+
+@pytest.mark.parametrize("variant", _VARIANTS, ids=_VARIANT_IDS)
 @pytest.mark.parametrize("lnc", [1, 2])
 @pytest.mark.parametrize("case", sorted(_COMPILE))
-def test_kmv_mlir_verifies(case, lnc):
+def test_kmv_mlir_verifies(case, lnc, variant):
     name, mk = _COMPILE[case]
     result = source_to_mlir(
-        getattr(K, name), *mk(), target="trn2", lnc=lnc, frontend=FrontendKind.TRACER
+        getattr(K, name),
+        *_variant_args(mk, variant),
+        target="trn2",
+        lnc=lnc,
+        frontend=FrontendKind.TRACER,
     )
     result.verify()
+    if variant:
+        # The distance matmuls carry their row tile (#119) when d + 2 <= 64;
+        # with two or more Y tiles (m >= 256) the first body uses tile 1 too.
+        args = mk()
+        d = args[0].shape[1]
+        m = args[0 if name == "_kmv_self_kernel" else 1].shape[0]
+        tiled = bool(re.search(r"row_pos=index %c(32|64|96)\b", str(result)))
+        if d + 2 > 64:
+            assert not tiled
+        elif m >= 256:
+            assert tiled
 
 
 @pytest.mark.skipif(shutil.which("neuronx-cc") is None, reason="neuronx-cc not on PATH")
+@pytest.mark.parametrize("variant", _VARIANTS, ids=_VARIANT_IDS)
 @pytest.mark.parametrize("lnc", [1, 2])
 @pytest.mark.parametrize("case", sorted(_COMPILE))
-def test_kmv_neff_compiles_with_nki_allocation(case, lnc, tmp_path):
+def test_kmv_neff_compiles_with_nki_allocation(case, lnc, variant, tmp_path):
     try:
         from nki.compiler import driver
         from nki.compiler.frontend import TracerFrontend
@@ -387,7 +568,9 @@ def test_kmv_neff_compiles_with_nki_allocation(case, lnc, tmp_path):
         pytest.skip(f"nki compiler driver API not available: {e}")
     name, mk = _COMPILE[case]
     fn = getattr(K, name).func
-    inputs = dict(zip(inspect.signature(fn).parameters, mk(), strict=True))
+    args = _variant_args(mk, variant)
+    params = list(inspect.signature(fn).parameters)[: len(args)]
+    inputs = dict(zip(params, args, strict=True))
     opts = CompileOptions(
         target="trn2", lnc=lnc, artifacts_dir=str(tmp_path), output_path=str(tmp_path / "file.neff")
     )
