@@ -108,6 +108,17 @@ _EMPTY_UNIT_COST = 0.25
 
 
 if HAS_NKI:
+    # PSUM accumulation groups (trnsci/trnsci#185). A matmul group's first
+    # write opens it with accumulate=False and later writes accumulate. On
+    # NeuronCore-v3 (Trn2) a matmul accumulating onto PSUM that a non-matmul
+    # instruction initialised (nl.zeros, memset) is undefined behaviour, so
+    # an accumulator is zeroed only when no matmul writes it.
+
+    def _psum_acc(shape, n_matmuls):
+        """fp32 PSUM tile for a group of `n_matmuls` matmuls (zeros if none)."""
+        if n_matmuls == 0:
+            return nl.zeros(shape, dtype=nl.float32, buffer=nl.psum)
+        return nl.ndarray(shape, dtype=nl.float32, buffer=nl.psum)
 
     @nki.jit
     def _bsr_spmm_kernel(blocks_pad, b_gathered):
@@ -138,12 +149,12 @@ if HAS_NKI:
 
         for m in nl.affine_range(M_tiles):
             for n in nl.affine_range(N // TILE_N):
-                psum = nl.zeros((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
+                psum = _psum_acc((TILE_M, TILE_N), K_max)
 
-                for k in nl.affine_range(K_max):
+                for k in range(K_max):
                     a_t = nl.load_transpose2d(blocks_pad[m, k, :, :])
                     b_tile = nl.load(b_gathered[m, k, :, n * TILE_N : (n + 1) * TILE_N])
-                    nisa.nc_matmul(psum, a_t, b_tile, accumulate=True)
+                    nisa.nc_matmul(psum, a_t, b_tile, accumulate=k > 0)
 
                 _pp = nl.ndarray((TILE_M, TILE_N), dtype=nl.float32)
                 _pn = nl.ndarray((TILE_M, TILE_N), dtype=nl.float32)
@@ -192,14 +203,14 @@ if HAS_NKI:
                 m_off = m * TILE_M
                 n_off = n * TILE_N
 
-                psum = nl.zeros((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
+                psum = _psum_acc((TILE_M, TILE_N), K // TILE_K)
 
                 # Q[m-tile] as a (1, TILE_M) row, broadcast over the k partitions.
                 q_m_row = nl.broadcast_to(
                     nl.load_transpose2d(q[m_off : m_off + TILE_M, :]), shape=(TILE_K, TILE_M)
                 )
 
-                for k in nl.affine_range(K // TILE_K):
+                for k in range(K // TILE_K):
                     k_off = k * TILE_K
 
                     # Work in the transposed frame (k on partitions): the masked
@@ -219,7 +230,7 @@ if HAS_NKI:
                     a_t = nl.multiply(a_t, mask_f)
                     b_tile = nl.load(b[k_off : k_off + TILE_K, n_off : n_off + TILE_N])
 
-                    nisa.nc_matmul(psum, a_t, b_tile, accumulate=True)
+                    nisa.nc_matmul(psum, a_t, b_tile, accumulate=k > 0)
 
                 _pp = nl.ndarray((TILE_M, TILE_N), dtype=nl.float32)
                 _pn = nl.ndarray((TILE_M, TILE_N), dtype=nl.float32)
@@ -262,22 +273,22 @@ if HAS_NKI:
 
         for m in nl.affine_range(M_tiles):
             for ki in nl.affine_range(K_max):
-                score_psum = nl.zeros((_TILE_M, _TILE_M), dtype=nl.float32, buffer=nl.psum)
+                score_psum = nl.ndarray((_TILE_M, _TILE_M), dtype=nl.float32, buffer=nl.psum)
                 if head_dim <= _TILE_K:
                     # NKI 0.3.0 simulator: nc_matmul's moving arg cannot be loaded with
                     # load_transpose2d — use nl.load + nl.transpose for K (moving tile).
                     q_t = nl.load_transpose2d(q_scaled_blocks[m, :, :])  # stationary
                     k_t = nl.load_transpose2d(k_gathered_pad[m, ki, :, :])  # moving
-                    nisa.nc_matmul(score_psum, q_t, k_t, accumulate=True)
+                    nisa.nc_matmul(score_psum, q_t, k_t, accumulate=False)
                 else:
-                    for hd in nl.affine_range(head_dim // _TILE_K):
+                    for hd in range(head_dim // _TILE_K):
                         q_c = nl.load_transpose2d(
                             q_scaled_blocks[m, :, hd * _TILE_K : (hd + 1) * _TILE_K]
                         )
                         k_c = nl.load_transpose2d(
                             k_gathered_pad[m, ki, :, hd * _TILE_K : (hd + 1) * _TILE_K]
                         )
-                        nisa.nc_matmul(score_psum, q_c, k_c, accumulate=True)
+                        nisa.nc_matmul(score_psum, q_c, k_c, accumulate=hd > 0)
 
                 _ssp = nl.ndarray((_TILE_M, _TILE_M), dtype=nl.float32)
                 _ssn = nl.ndarray((_TILE_M, _TILE_M), dtype=nl.float32)
@@ -337,25 +348,25 @@ if HAS_NKI:
             # reciprocal of the (128, 1) softmax denominator instead.
             row_denom_inv_m = nl.reciprocal(row_denom_m)
 
-            out_psum = nl.zeros((_TILE_M, head_dim), dtype=nl.float32, buffer=nl.psum)
+            out_psum = _psum_acc((_TILE_M, head_dim), K_max)
 
-            for ki in nl.affine_range(K_max):
+            for ki in range(K_max):
                 v_tile = nl.load(v_gathered_pad[m, ki, :, :])  # (128, head_dim)
 
-                score_psum = nl.zeros((_TILE_M, _TILE_M), dtype=nl.float32, buffer=nl.psum)
+                score_psum = nl.ndarray((_TILE_M, _TILE_M), dtype=nl.float32, buffer=nl.psum)
                 if head_dim <= _TILE_K:
                     q_t = nl.load_transpose2d(q_scaled_blocks[m, :, :])  # stationary
                     k_t = nl.load_transpose2d(k_gathered_pad[m, ki, :, :])  # moving
-                    nisa.nc_matmul(score_psum, q_t, k_t, accumulate=True)
+                    nisa.nc_matmul(score_psum, q_t, k_t, accumulate=False)
                 else:
-                    for hd in nl.affine_range(head_dim // _TILE_K):
+                    for hd in range(head_dim // _TILE_K):
                         q_c = nl.load_transpose2d(
                             q_scaled_blocks[m, :, hd * _TILE_K : (hd + 1) * _TILE_K]
                         )
                         k_c = nl.load_transpose2d(
                             k_gathered_pad[m, ki, :, hd * _TILE_K : (hd + 1) * _TILE_K]
                         )
-                        nisa.nc_matmul(score_psum, q_c, k_c, accumulate=True)
+                        nisa.nc_matmul(score_psum, q_c, k_c, accumulate=hd > 0)
 
                 _ssp = nl.ndarray((_TILE_M, _TILE_M), dtype=nl.float32)
                 _ssn = nl.ndarray((_TILE_M, _TILE_M), dtype=nl.float32)
@@ -371,7 +382,7 @@ if HAS_NKI:
                 _wh = nl.ndarray((_TILE_M, _TILE_M), dtype=vdt, buffer=nl.shared_hbm)
                 nl.store(_wh, value=_cast(weights, vdt, nl.float32))
                 weights_t = nl.load_transpose2d(_wh)  # (128,128) SBUF — stationary for nc_matmul
-                nisa.nc_matmul(out_psum, weights_t, v_tile, accumulate=True)
+                nisa.nc_matmul(out_psum, weights_t, v_tile, accumulate=ki > 0)
 
             _op = nl.ndarray((_TILE_M, head_dim), dtype=nl.float32)
             _on = nl.ndarray((_TILE_M, head_dim), dtype=nl.float32)
@@ -431,27 +442,27 @@ if HAS_NKI:
             row_denom_inv_m = nl.reciprocal(row_denom_m)
             d_m = nl.load(D_blocks[m, :, :])  # (128, 1)
 
-            dq_psum = nl.zeros((_TILE_M, head_dim), dtype=nl.float32, buffer=nl.psum)
+            dq_psum = _psum_acc((_TILE_M, head_dim), K_max)
 
-            for ki in nl.affine_range(K_max):
+            for ki in range(K_max):
                 # k_sbuf = K_ki as (128, head_dim) for nc_matmul(nl.transpose(dS), k_sbuf) = dS @ K
                 k_sbuf = nl.load(k_gathered_pad[m, ki, :, :])  # (128, head_dim) moving for dQ
 
                 # score = Q_m @ K_ki.T
-                score_psum = nl.zeros((_TILE_M, _TILE_M), dtype=nl.float32, buffer=nl.psum)
+                score_psum = nl.ndarray((_TILE_M, _TILE_M), dtype=nl.float32, buffer=nl.psum)
                 if head_dim <= _TILE_K:
                     q_t = nl.load_transpose2d(q_scaled_blocks[m, :, :])  # stationary
                     k_t = nl.load_transpose2d(k_gathered_pad[m, ki, :, :])  # moving
-                    nisa.nc_matmul(score_psum, q_t, k_t, accumulate=True)
+                    nisa.nc_matmul(score_psum, q_t, k_t, accumulate=False)
                 else:
-                    for hd in nl.affine_range(head_dim // _TILE_K):
+                    for hd in range(head_dim // _TILE_K):
                         q_c = nl.load_transpose2d(
                             q_scaled_blocks[m, :, hd * _TILE_K : (hd + 1) * _TILE_K]
                         )
                         k_c = nl.load_transpose2d(
                             k_gathered_pad[m, ki, :, hd * _TILE_K : (hd + 1) * _TILE_K]
                         )
-                        nisa.nc_matmul(score_psum, q_c, k_c, accumulate=True)
+                        nisa.nc_matmul(score_psum, q_c, k_c, accumulate=hd > 0)
 
                 _ssp = nl.ndarray((_TILE_M, _TILE_M), dtype=nl.float32)
                 _ssn = nl.ndarray((_TILE_M, _TILE_M), dtype=nl.float32)
@@ -462,20 +473,20 @@ if HAS_NKI:
                 P = nl.multiply(nl.exp(stable), row_denom_inv_m)
 
                 # dP = dO_m @ V_ki.T
-                dp_psum = nl.zeros((_TILE_M, _TILE_M), dtype=nl.float32, buffer=nl.psum)
+                dp_psum = nl.ndarray((_TILE_M, _TILE_M), dtype=nl.float32, buffer=nl.psum)
                 if head_dim <= _TILE_K:
                     do_t = nl.load_transpose2d(do_gathered_pad[m, ki, :, :])  # stationary
                     v_t = nl.load_transpose2d(v_gathered_pad[m, ki, :, :])  # moving
-                    nisa.nc_matmul(dp_psum, do_t, v_t, accumulate=True)
+                    nisa.nc_matmul(dp_psum, do_t, v_t, accumulate=False)
                 else:
-                    for hd in nl.affine_range(head_dim // _TILE_K):
+                    for hd in range(head_dim // _TILE_K):
                         do_c = nl.load_transpose2d(
                             do_gathered_pad[m, ki, :, hd * _TILE_K : (hd + 1) * _TILE_K]
                         )
                         v_c = nl.load_transpose2d(
                             v_gathered_pad[m, ki, :, hd * _TILE_K : (hd + 1) * _TILE_K]
                         )
-                        nisa.nc_matmul(dp_psum, do_c, v_c, accumulate=True)
+                        nisa.nc_matmul(dp_psum, do_c, v_c, accumulate=hd > 0)
 
                 _dpp = nl.ndarray((_TILE_M, _TILE_M), dtype=nl.float32)
                 _dpn = nl.ndarray((_TILE_M, _TILE_M), dtype=nl.float32)
@@ -488,7 +499,7 @@ if HAS_NKI:
                 _dsh = nl.ndarray((_TILE_M, _TILE_M), dtype=kdt, buffer=nl.shared_hbm)
                 nl.store(_dsh, value=_cast(dS, kdt, nl.float32))
                 dS_t = nl.load_transpose2d(_dsh)  # SBUF (transposed) — stationary
-                nisa.nc_matmul(dq_psum, dS_t, k_sbuf, accumulate=True)
+                nisa.nc_matmul(dq_psum, dS_t, k_sbuf, accumulate=ki > 0)
 
             _dqp = nl.ndarray((_TILE_M, head_dim), dtype=nl.float32)
             _dqn = nl.ndarray((_TILE_M, head_dim), dtype=nl.float32)
@@ -541,10 +552,10 @@ if HAS_NKI:
         dV = nl.ndarray((N_col * _TILE_M, head_dim), dtype=k_blocks.dtype, buffer=nl.shared_hbm)
 
         for ki in nl.affine_range(N_col):
-            dk_psum = nl.zeros((_TILE_M, head_dim), dtype=nl.float32, buffer=nl.psum)
-            dv_psum = nl.zeros((_TILE_M, head_dim), dtype=nl.float32, buffer=nl.psum)
+            dk_psum = _psum_acc((_TILE_M, head_dim), K_max_col)
+            dv_psum = _psum_acc((_TILE_M, head_dim), K_max_col)
 
-            for mi in nl.affine_range(K_max_col):
+            for mi in range(K_max_col):
                 # All tile loads local to this (ki, mi) iteration — NKI simulator requires
                 # nc_matmul args to be local to the innermost affine_range loop.
                 if head_dim <= _TILE_K:
@@ -563,18 +574,18 @@ if HAS_NKI:
                 row_denom_mi = nl.load(row_denom_gathered_col[ki, mi, :, :])
 
                 # score = Q_m @ K_ki.T
-                score_psum = nl.zeros((_TILE_M, _TILE_M), dtype=nl.float32, buffer=nl.psum)
+                score_psum = nl.ndarray((_TILE_M, _TILE_M), dtype=nl.float32, buffer=nl.psum)
                 if head_dim <= _TILE_K:
-                    nisa.nc_matmul(score_psum, q_t_mi, k_t, accumulate=True)
+                    nisa.nc_matmul(score_psum, q_t_mi, k_t, accumulate=False)
                 else:
-                    for hd in nl.affine_range(head_dim // _TILE_K):
+                    for hd in range(head_dim // _TILE_K):
                         q_c = nl.load_transpose2d(
                             q_gathered_col[ki, mi, :, hd * _TILE_K : (hd + 1) * _TILE_K]
                         )
                         k_c = nl.load_transpose2d(
                             k_blocks[ki, :, hd * _TILE_K : (hd + 1) * _TILE_K]
                         )
-                        nisa.nc_matmul(score_psum, q_c, k_c, accumulate=True)
+                        nisa.nc_matmul(score_psum, q_c, k_c, accumulate=hd > 0)
 
                 _ssp = nl.ndarray((_TILE_M, _TILE_M), dtype=nl.float32)
                 _ssn = nl.ndarray((_TILE_M, _TILE_M), dtype=nl.float32)
@@ -585,18 +596,18 @@ if HAS_NKI:
                 P = nl.multiply(nl.exp(stable_s), nl.reciprocal(row_denom_mi))
 
                 # dP = dO_m @ V_ki.T
-                dp_psum = nl.zeros((_TILE_M, _TILE_M), dtype=nl.float32, buffer=nl.psum)
+                dp_psum = nl.ndarray((_TILE_M, _TILE_M), dtype=nl.float32, buffer=nl.psum)
                 if head_dim <= _TILE_K:
-                    nisa.nc_matmul(dp_psum, do_t_mi, v_t, accumulate=True)
+                    nisa.nc_matmul(dp_psum, do_t_mi, v_t, accumulate=False)
                 else:
-                    for hd in nl.affine_range(head_dim // _TILE_K):
+                    for hd in range(head_dim // _TILE_K):
                         do_c = nl.load_transpose2d(
                             do_gathered_col[ki, mi, :, hd * _TILE_K : (hd + 1) * _TILE_K]
                         )
                         v_c = nl.load_transpose2d(
                             v_blocks[ki, :, hd * _TILE_K : (hd + 1) * _TILE_K]
                         )
-                        nisa.nc_matmul(dp_psum, do_c, v_c, accumulate=True)
+                        nisa.nc_matmul(dp_psum, do_c, v_c, accumulate=hd > 0)
 
                 _dpp = nl.ndarray((_TILE_M, _TILE_M), dtype=nl.float32)
                 _dpn = nl.ndarray((_TILE_M, _TILE_M), dtype=nl.float32)
@@ -606,10 +617,10 @@ if HAS_NKI:
                 dS = nl.multiply(P, nl.subtract(dP, d_mi))
 
                 # nc_matmul(dS, q_sbuf) = dS.T @ Q_m (scale baked into q_gathered_col)
-                nisa.nc_matmul(dk_psum, _cast(dS, qdt, nl.float32), q_sbuf, accumulate=True)
+                nisa.nc_matmul(dk_psum, _cast(dS, qdt, nl.float32), q_sbuf, accumulate=mi > 0)
 
                 # nc_matmul(P, do_sbuf) = P.T @ dO_m
-                nisa.nc_matmul(dv_psum, _cast(P, qdt, nl.float32), do_sbuf, accumulate=True)
+                nisa.nc_matmul(dv_psum, _cast(P, qdt, nl.float32), do_sbuf, accumulate=mi > 0)
 
             _dkp = nl.ndarray((_TILE_M, head_dim), dtype=nl.float32)
             _dkn = nl.ndarray((_TILE_M, head_dim), dtype=nl.float32)
@@ -655,15 +666,15 @@ if HAS_NKI:
                 m_off = m * TILE_M
                 n_off = n * TILE_N
 
-                psum = nl.zeros((TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
+                psum = _psum_acc((TILE_M, TILE_N), K // TILE_K)
 
-                for k in nl.affine_range(K // TILE_K):
+                for k in range(K // TILE_K):
                     k_off = k * TILE_K
 
                     a_t = nl.load_transpose2d(a[m_off : m_off + TILE_M, k_off : k_off + TILE_K])
                     b_tile = nl.load(b[k_off : k_off + TILE_K, n_off : n_off + TILE_N])
 
-                    nisa.nc_matmul(psum, a_t, b_tile, accumulate=True)
+                    nisa.nc_matmul(psum, a_t, b_tile, accumulate=k > 0)
 
                 _pp = nl.ndarray((TILE_M, TILE_N), dtype=nl.float32)
                 _pn = nl.ndarray((TILE_M, TILE_N), dtype=nl.float32)
@@ -759,12 +770,12 @@ if HAS_NKI:
                     value=nl.zeros((_TILE_M, TILE_N), dtype=b.dtype),
                 )
                 continue
-            psum = nl.zeros((_TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
+            psum = nl.ndarray((_TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
             for idx in range(lo, hi):
                 j = cols[idx]
                 a_t = nl.load_transpose2d(blocks[idx, :, :])
                 b_tile = nl.load(b[j * _TILE_K : (j + 1) * _TILE_K, n0 : n0 + TILE_N])
-                nisa.nc_matmul(psum, a_t, b_tile, accumulate=True)
+                nisa.nc_matmul(psum, a_t, b_tile, accumulate=idx > lo)
             _pp = nl.ndarray((_TILE_M, TILE_N), dtype=nl.float32)
             _pn = nl.ndarray((_TILE_M, TILE_N), dtype=nl.float32)
             nisa.activation(_pp, nl.relu, psum)
@@ -851,7 +862,7 @@ if HAS_NKI:
                 # A row alone (no reuse to gain, possibly more blocks than
                 # fit in SBUF at once): stream its blocks chunk by chunk.
                 m = rows[0]
-                psum = nl.zeros((_TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
+                psum = nl.ndarray((_TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum)
                 for c0 in range(row_ptrs[m], row_ptrs[m + 1], _BLOCKS_PER_DMA):
                     c1 = min(row_ptrs[m + 1], c0 + _BLOCKS_PER_DMA)
                     a_all = nl.load(blocks_t[:, c0 * _TILE_K : c1 * _TILE_K])
@@ -859,13 +870,15 @@ if HAS_NKI:
                         j = cols[idx]
                         i0 = (idx - c0) * _TILE_K
                         b_tile = nl.load(b[j * _TILE_K : (j + 1) * _TILE_K, n0 : n0 + TILE_N])
-                        nisa.nc_matmul(psum, a_all[:, i0 : i0 + _TILE_K], b_tile, accumulate=True)
+                        nisa.nc_matmul(
+                            psum, a_all[:, i0 : i0 + _TILE_K], b_tile, accumulate=idx > row_ptrs[m]
+                        )
                 nl.store(
                     out[m * _TILE_M : (m + 1) * _TILE_M, n0 : n0 + TILE_N],
                     value=nl.copy(psum, dtype=b.dtype),
                 )
                 continue
-            psums = [nl.zeros((_TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum) for _ in rows]
+            psums = [nl.ndarray((_TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum) for _ in rows]
             a_of = {}
             by_col = {}
             for r, m in enumerate(rows):
@@ -877,11 +890,15 @@ if HAS_NKI:
                     for idx in range(c0, c1):
                         a_of[idx] = (a_all, (idx - c0) * _TILE_K)
                         by_col.setdefault(cols[idx], []).append((r, idx))
+            opened = set()  # rows whose first matmul has opened their PSUM tile
             for j in sorted(by_col):
                 b_tile = nl.load(b[j * _TILE_K : (j + 1) * _TILE_K, n0 : n0 + TILE_N])
                 for r, idx in by_col[j]:
                     a_all, i0 = a_of[idx]
-                    nisa.nc_matmul(psums[r], a_all[:, i0 : i0 + _TILE_K], b_tile, accumulate=True)
+                    nisa.nc_matmul(
+                        psums[r], a_all[:, i0 : i0 + _TILE_K], b_tile, accumulate=r in opened
+                    )
+                    opened.add(r)
             for r, m in enumerate(rows):
                 nl.store(
                     out[m * _TILE_M : (m + 1) * _TILE_M, n0 : n0 + TILE_N],
@@ -953,8 +970,8 @@ if HAS_NKI:
             for idx in range(lo, hi):
                 j = cols[idx]
                 kj = nl.load(k_t[:, j * _TILE_M : (j + 1) * _TILE_M])
-                s_ps = nl.zeros((_TILE_M, _TILE_M), dtype=nl.float32, buffer=nl.psum)
-                nisa.nc_matmul(s_ps, qm, kj, accumulate=True)
+                s_ps = nl.ndarray((_TILE_M, _TILE_M), dtype=nl.float32, buffer=nl.psum)
+                nisa.nc_matmul(s_ps, qm, kj, accumulate=False)
                 s = nl.copy(s_ps, dtype=nl.float32)
                 t_max = nl.max(s, axis=1, keepdims=True)
                 if rm is None:
@@ -975,15 +992,15 @@ if HAS_NKI:
             rs = nl.rsqrt(den)
             rinv = nl.multiply(rs, rs)
 
-            o_ps = nl.zeros((_TILE_M, head_dim), dtype=nl.float32, buffer=nl.psum)
+            o_ps = nl.ndarray((_TILE_M, head_dim), dtype=nl.float32, buffer=nl.psum)
             for idx in range(lo, hi):
                 j = cols[idx]
                 kj = nl.load(k_t[:, j * _TILE_M : (j + 1) * _TILE_M])
                 vj = nl.load(v[j * _TILE_M : (j + 1) * _TILE_M, :])
-                st_ps = nl.zeros((_TILE_M, _TILE_M), dtype=nl.float32, buffer=nl.psum)
-                nisa.nc_matmul(st_ps, kj, qm, accumulate=True)  # S^T: keys on partitions
+                st_ps = nl.ndarray((_TILE_M, _TILE_M), dtype=nl.float32, buffer=nl.psum)
+                nisa.nc_matmul(st_ps, kj, qm, accumulate=False)  # S^T: keys on partitions
                 p_t = nl.exp(nl.subtract(nl.copy(st_ps, dtype=nl.float32), rm_b), dtype=v.dtype)
-                nisa.nc_matmul(o_ps, p_t, vj, accumulate=True)  # out += P @ V_j
+                nisa.nc_matmul(o_ps, p_t, vj, accumulate=idx > lo)  # out += P @ V_j
             o = nl.multiply(nl.copy(o_ps, dtype=nl.float32), rinv)
             nl.store(out[r0 : r0 + _TILE_M, :], value=nl.copy(o, dtype=v.dtype))
 
@@ -1203,19 +1220,21 @@ if HAS_NKI:
 
         for nt, rows in groups:
             n0 = nt * TILE_N
-            psums = [nl.zeros((_TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum) for _ in rows]
+            psums = [nl.ndarray((_TILE_M, TILE_N), dtype=nl.float32, buffer=nl.psum) for _ in rows]
             a_of = {}
             by_col = {}
             for r, m in enumerate(rows):
                 load_row(m, a_of)
                 for idx in range(row_ptrs[m], row_ptrs[m + 1]):
                     by_col.setdefault(cols[idx], []).append((r, idx))
+            opened = set()  # rows whose first matmul has opened their PSUM tile
             for j in sorted(by_col):
                 b_tile = nl.load(b[j * _TILE_K : (j + 1) * _TILE_K, n0 : n0 + TILE_N])
                 for r, idx in by_col[j]:
                     a_t, i0 = a_of[idx]
                     stat = a_t[:, i0, :] if sym[0] else a_t[:, i0 : i0 + _TILE_M]
-                    nisa.nc_matmul(psums[r], stat, b_tile, accumulate=True)
+                    nisa.nc_matmul(psums[r], stat, b_tile, accumulate=r in opened)
+                    opened.add(r)
             for r, m in enumerate(rows):
                 nl.store(
                     out[m * _TILE_M : (m + 1) * _TILE_M, n0 : n0 + TILE_N],
@@ -1307,20 +1326,20 @@ if HAS_NKI:
             rm_b = nl.broadcast_to(nl.load(rm_row[:, r0 : r0 + T]), shape=(T, T))
             ri_b = nl.broadcast_to(nl.load(rinv_row[:, r0 : r0 + T]), shape=(T, T))
             d_b = nl.broadcast_to(nl.load(d_row[:, r0 : r0 + T]), shape=(T, T))
-            dq_ps = nl.zeros((T, head_dim), dtype=nl.float32, buffer=nl.psum)
+            dq_ps = nl.ndarray((T, head_dim), dtype=nl.float32, buffer=nl.psum)
             for idx in range(lo, hi):
                 j = cols[idx]
                 c0 = j * T
                 kj_t = nl.load(k_t[:, c0 : c0 + T])
                 vj_t = nl.load(v_t[:, c0 : c0 + T])
                 kj = nl.load(k[c0 : c0 + T, :])  # (k, hd)
-                st_ps = nl.zeros((T, T), dtype=nl.float32, buffer=nl.psum)
-                nisa.nc_matmul(st_ps, kj_t, qm_t, accumulate=True)  # S^T (k, q)
+                st_ps = nl.ndarray((T, T), dtype=nl.float32, buffer=nl.psum)
+                nisa.nc_matmul(st_ps, kj_t, qm_t, accumulate=False)  # S^T (k, q)
                 pt = nl.multiply(nl.exp(nl.subtract(nl.copy(st_ps, dtype=nl.float32), rm_b)), ri_b)
-                dpt_ps = nl.zeros((T, T), dtype=nl.float32, buffer=nl.psum)
-                nisa.nc_matmul(dpt_ps, vj_t, dom_t, accumulate=True)  # dP^T (k, q)
+                dpt_ps = nl.ndarray((T, T), dtype=nl.float32, buffer=nl.psum)
+                nisa.nc_matmul(dpt_ps, vj_t, dom_t, accumulate=False)  # dP^T (k, q)
                 dst = nl.multiply(pt, nl.subtract(nl.copy(dpt_ps, dtype=nl.float32), d_b), dtype=dt)
-                nisa.nc_matmul(dq_ps, dst, kj, accumulate=True)  # dS @ K_j (q, hd)
+                nisa.nc_matmul(dq_ps, dst, kj, accumulate=idx > lo)  # dS @ K_j (q, hd)
             dq = nl.multiply(nl.copy(dq_ps, dtype=nl.float32), scale)
             nl.store(dQ[r0 : r0 + T, :], value=nl.copy(dq, dtype=dt))
 
@@ -1336,8 +1355,8 @@ if HAS_NKI:
                 continue
             kj_t = nl.load(k_t[:, c0 : c0 + T])
             vj_t = nl.load(v_t[:, c0 : c0 + T])
-            dk_ps = nl.zeros((T, head_dim), dtype=nl.float32, buffer=nl.psum)
-            dv_ps = nl.zeros((T, head_dim), dtype=nl.float32, buffer=nl.psum)
+            dk_ps = nl.ndarray((T, head_dim), dtype=nl.float32, buffer=nl.psum)
+            dv_ps = nl.ndarray((T, head_dim), dtype=nl.float32, buffer=nl.psum)
             for idx in range(lo, hi):
                 m = rows[idx]
                 r0 = m * T
@@ -1348,14 +1367,15 @@ if HAS_NKI:
                 rm_m = nl.load(rm_col[r0 : r0 + T, :])
                 ri_m = nl.load(rinv_col[r0 : r0 + T, :])
                 d_m = nl.load(d_col[r0 : r0 + T, :])
-                s_ps = nl.zeros((T, T), dtype=nl.float32, buffer=nl.psum)
-                nisa.nc_matmul(s_ps, qm_t, kj_t, accumulate=True)  # S (q, k)
+                s_ps = nl.ndarray((T, T), dtype=nl.float32, buffer=nl.psum)
+                nisa.nc_matmul(s_ps, qm_t, kj_t, accumulate=False)  # S (q, k)
                 p = nl.multiply(nl.exp(nl.subtract(nl.copy(s_ps, dtype=nl.float32), rm_m)), ri_m)
-                dp_ps = nl.zeros((T, T), dtype=nl.float32, buffer=nl.psum)
-                nisa.nc_matmul(dp_ps, dom_t, vj_t, accumulate=True)  # dP (q, k)
+                dp_ps = nl.ndarray((T, T), dtype=nl.float32, buffer=nl.psum)
+                nisa.nc_matmul(dp_ps, dom_t, vj_t, accumulate=False)  # dP (q, k)
                 ds = nl.multiply(p, nl.subtract(nl.copy(dp_ps, dtype=nl.float32), d_m), dtype=dt)
-                nisa.nc_matmul(dv_ps, _cast(p, dt, nl.float32), dom, accumulate=True)  # P^T dO_m
-                nisa.nc_matmul(dk_ps, ds, qm, accumulate=True)  # dS^T Qs_m (k, hd)
+                # P^T dO_m
+                nisa.nc_matmul(dv_ps, _cast(p, dt, nl.float32), dom, accumulate=idx > lo)
+                nisa.nc_matmul(dk_ps, ds, qm, accumulate=idx > lo)  # dS^T Qs_m (k, hd)
             nl.store(dK[c0 : c0 + T, :], value=nl.copy(dk_ps, dtype=dt))
             nl.store(dV[c0 : c0 + T, :], value=nl.copy(dv_ps, dtype=dt))
 
@@ -1661,6 +1681,9 @@ if HAS_NKI:
 
         ones = nl.ndarray((P, P), dtype=f32, buffer=nl.sbuf)
         nisa.memset(ones, 1.0)
+        # Operands of the matmul that zeroes a matvec PSUM tile (psum_zeros).
+        zop = nl.ndarray((1, _TILE_N), dtype=nl.bfloat16, buffer=nl.sbuf)
+        nisa.memset(zop, 0.0)
         st = nl.ndarray((P, 2 * TR + 2), dtype=f32, buffer=nl.sbuf)
         nisa.dma_copy(dst=st, src=state)
         thr = st[:, 2 * TR : 2 * TR + 1]
@@ -1882,10 +1905,11 @@ if HAS_NKI:
         rows_per_bank = max(1, min(n_own, _TILE_N // R))
 
         # PSUM: four tiles per scope (the setup, and each trip of the device
-        # loop; PSUM tiles cannot live across the loop), re-zeroed on every
-        # use, rather than fresh tiles in every unrolled step, which ran NKI's
-        # allocator out of PSUM (eight 2 KiB banks) so that the whole kernel
-        # fell back to neuronx-cc allocation and scheduling.
+        # loop; PSUM tiles cannot live across the loop), zeroed by a matmul
+        # or overwritten on every use, rather than fresh tiles in every
+        # unrolled step, which ran NKI's allocator out of PSUM (eight 2 KiB
+        # banks) so that the whole kernel fell back to neuronx-cc allocation
+        # and scheduling.
         pss = {}
 
         def psum_scope():
@@ -1894,13 +1918,24 @@ if HAS_NKI:
             pss["dot"] = [nl.ndarray((P, 3 * R), dtype=f32, buffer=nl.psum) for _ in range(2)]
             pss["n"] = 0
 
-        def psum_zeros(name, width):
+        def psum_tile(name, width):
             t = pss[name]
             if name == "dot":
                 t = t[pss["n"] % 2]
                 pss["n"] += 1
-            v = t[:, 0:width]
-            nisa.memset(v, 0.0)
+            return t[:, 0:width]
+
+        def psum_zeros(name, width):
+            """A zeroed PSUM view for the matvecs, whose matmuls all accumulate.
+
+            A matvec tile holds many accumulation groups (one per block row,
+            interleaved, overlapping in the spread layout, empty for rows
+            without blocks), so a matmul of zeros opens the whole view: on
+            NeuronCore-v3 a matmul must not accumulate onto PSUM that a
+            non-matmul instruction such as memset initialised
+            (trnsci/trnsci#185). 0 * 0 sums to +0.0, as memset wrote."""
+            v = psum_tile(name, width)
+            nisa.nc_matmul(v, zop[:, 0:P], zop[:, 0:width], accumulate=False)
             return v
 
         def block_matvec(dst, src, mats, ptrs, cl, cof):
@@ -2171,8 +2206,8 @@ if HAS_NKI:
                     nisa.tensor_reduce(
                         parts[:, i * R : (i + 1) * R], nl.add, jk.permute((0, 2, 1)), axis=2
                     )
-            ps = psum_zeros("dot", k * R)
-            nisa.nc_matmul(ps, ones, parts, accumulate=True, is_stationary_onezero=True)
+            ps = psum_tile("dot", k * R)
+            nisa.nc_matmul(ps, ones, parts, accumulate=False, is_stationary_onezero=True)
             return ps
 
         def dots(pairs):
@@ -2429,8 +2464,8 @@ if HAS_NKI:
             # w = A r' (own rows), then the exchange
             a_matvec(w_full[:, me * SW : me * SW + SWr], r_new)
             share(w_full)
-            gps = psum_zeros("dot", R)
-            nisa.nc_matmul(gps, ones, g_parts, accumulate=True, is_stationary_onezero=True)
+            gps = psum_tile("dot", R)
+            nisa.nc_matmul(gps, ones, g_parts, accumulate=False, is_stationary_onezero=True)
             # beta' = act' gamma' / gamma, c = beta' gamma' / alpha (old gamma = rr)
             inv_g = scal()
             nisa.tensor_scalar(inv_g, rr, op0=nl.maximum, operand0=_CG_TINY)
