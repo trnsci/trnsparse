@@ -17,6 +17,8 @@ from dataclasses import dataclass
 
 import torch
 
+from ._cat import cat as _cat
+
 
 @dataclass
 class CSRMatrix:
@@ -353,7 +355,7 @@ def _dense_nonzeros(
             parts.append(block.detach().cpu().index_select(0, local).to(A.device))
         else:
             parts.append(block.index_select(0, local.to(A.device)))
-    vals = torch.cat(parts) if parts else A.new_zeros(0)
+    vals = _cat(parts) if parts else A.new_zeros(0)
     return rows_h.contiguous().to(A.device), cols_h.contiguous().to(A.device), vals
 
 

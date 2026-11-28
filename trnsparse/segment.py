@@ -30,8 +30,8 @@ pytorch path needs no plan.
   ``_gather_rows_kernel`` NKI kernels, launched as the ``trnsparse::`` custom
   ops ``segment_sum_tiles`` and ``gather_rows`` on TorchNeuron. Each op
   registers the other as its backward (``register_autograd``). Other routes
-  (XLA, simulator) use a ``torch.autograd.Function`` with the same
-  backward.
+  (XLA, simulator), and feature-split calls on every route, use a
+  ``torch.autograd.Function`` with the same backward.
 
 **Summation order (NKI path, deterministic).** A plan cuts the segments into
 tiles of 128 rows and lays each tile's edges out in their stable sorted
@@ -71,7 +71,9 @@ E and N below 2^31, and every tensor a launch addresses below
 ``_SEG_MAX_BYTES`` (2^34 bytes; one launch is verified on trn2 well past
 2^32 bytes, #141). A call wider than that splits the feature axis into
 chunks, one launch per chunk over the same plan: columns are independent, so
-the result is bitwise equal to one launch. Device aten is no fallback at
+the result is bitwise equal to one launch. The chunks are copied into one
+preallocated output, never joined with a device ``torch.cat``, which is wrong
+past 2^32 bytes at LNC=1 on trn2 (#150). Device aten is no fallback at
 these sizes (its ``index_add_`` / ``index_select`` fail on trn2 at 4.7e9
 bytes), and E below 2^31 means a single column always fits, so size alone
 never sends an fp32 call to the pytorch path.
@@ -92,6 +94,7 @@ import math
 
 import torch
 
+from ._cat import row_blocks
 from .nki import dispatch as _d
 from .nki.kernels import _SEG_CHUNK, _SEG_GROUP, _SEG_P, _SEG_PROGRAMS, _SEG_PSUM_N, _gather_split
 
@@ -105,9 +108,10 @@ _INT32_MAX = 2**31 - 1
 # power-of-two boundary, 2^34 bytes (2^32 fp32 elements); a 1.7e10-byte
 # operand no longer fits one logical core at LNC=2.
 _SEG_MAX_BYTES = 2**34
-# Column chunks are cut from row blocks of at most this many bytes: device
-# aten copies a column slice of a view spanning more than 2^32 bytes about
-# 170x slower (2.0 s against 12 ms at 229376 x 5120 fp32, #141).
+# A split call copies column chunks in and out of the full-width tensors one
+# row block of at most this many bytes at a time: device aten copies a column
+# slice of a view spanning more than 2^32 bytes about 170x slower (2.0 s
+# against 12 ms at 229376 x 5120 fp32, #141).
 _SEG_SLICE_BYTES = 2**31
 
 
@@ -424,24 +428,57 @@ def _torch_gather(h: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
     return h.index_select(0, idx.to(h.device))
 
 
+def _one_launch(e: int, n: int, f: int) -> bool:
+    """True when an (E, N, F) call is one kernel launch (no feature split)."""
+    return _feature_chunk(e, n, f) >= f
+
+
+def _column_block(x: torch.Tensor, c0: int, c1: int) -> torch.Tensor:
+    """Columns ``c0:c1`` of 2-D ``x`` as a new contiguous tensor, copied one
+    row block of ``x`` (`_SEG_SLICE_BYTES`) at a time."""
+    blocks = row_blocks(x.shape[0], x.shape[1] * x.element_size(), _SEG_SLICE_BYTES)
+    if len(blocks) == 1:
+        return x[:, c0:c1].contiguous()
+    c = x.new_empty((x.shape[0], c1 - c0))
+    for r0, r1 in blocks:
+        c[r0:r1].copy_(x[r0:r1, c0:c1])
+    return c
+
+
 def _kernel_launches(op_name: str, x: torch.Tensor, plan: SegmentPlan, rows: int) -> torch.Tensor:
-    """`op_name` over `x`, one launch per feature chunk (`_feature_chunk`), all
-    with the same plan; the first `rows` rows of each, joined on the feature
-    axis. `split` and `cat` differentiate to each other, so on the native path
-    each chunk's backward is the other op on that chunk."""
+    """`op_name` over `x`: the first `rows` rows of the kernel output, one
+    launch per feature chunk (`_feature_chunk`), all with the same plan.
+
+    A split call preallocates the output once and copies each launch's
+    columns into it, one row block (`_SEG_SLICE_BYTES` of the output) at a
+    time, then drops that launch's input and output. There is no device
+    ``torch.cat``: at LNC=1 on trn2 a device ``cat`` into an output past 2^32
+    bytes writes to wrong places, its inputs included (#150,
+    aws-neuron/aws-neuron-sdk#1502). The output is row-major and each chunk a
+    column block, so a chunk cannot be one contiguous block of it; each copy
+    writes a column block of one row block, the mirror of the read that cuts
+    the chunk's input (`_column_block`). The copies move bits, so the result
+    is bitwise equal to one launch.
+
+    The split path is not differentiable through autograd tracking (the
+    in-place copies would record one CopySlices node per block). The callers
+    run it inside `_SegmentSumFn` / `_GatherFn` on every route, the native
+    one included, whose backward is the other op's (split) launch."""
     f = int(x.shape[1])
     w = _feature_chunk(plan.num_edges, plan.num_segments, f)
     if w < 1:
         raise NotImplementedError(f"trnsparse {op_name}: one feature column exceeds a launch")
     if w >= f:
         return _d.nki_segment_op(op_name, x, plan)[:rows]
-    rb = max(1, _SEG_SLICE_BYTES // (f * x.element_size()))
-    blocks = [r.split(w, dim=1) for r in x.split(rb, dim=0)]
-    parts = []
-    for j in range(len(blocks[0])):
-        c = torch.cat([b[j] for b in blocks]) if len(blocks) > 1 else blocks[0][j].contiguous()
-        parts.append(_d.nki_segment_op(op_name, c, plan)[:rows])
-    return torch.cat(parts, dim=1)
+    out = x.new_empty((rows, f))
+    blocks = row_blocks(rows, f * out.element_size(), _SEG_SLICE_BYTES)
+    for c0 in range(0, f, w):
+        c1 = min(c0 + w, f)
+        part = _d.nki_segment_op(op_name, _column_block(x, c0, c1), plan)
+        for r0, r1 in blocks:
+            out[r0:r1, c0:c1].copy_(part[r0:r1])
+        del part
+    return out
 
 
 def _kernel_segment_sum(m: torch.Tensor, plan: SegmentPlan) -> torch.Tensor:
@@ -453,7 +490,8 @@ def _kernel_gather(h: torch.Tensor, plan: SegmentPlan) -> torch.Tensor:
 
 
 class _SegmentSumFn(torch.autograd.Function):
-    """segment_sum on the pytorch / XLA / simulator routes; backward = gather."""
+    """segment_sum on the pytorch / XLA / simulator routes and for split calls
+    on the native route; backward = gather."""
 
     @staticmethod
     def forward(ctx, m, idx, n, plan, kernel):
@@ -471,7 +509,8 @@ class _SegmentSumFn(torch.autograd.Function):
 
 
 class _GatherFn(torch.autograd.Function):
-    """gather on the pytorch / XLA / simulator routes; backward = segment_sum."""
+    """gather on the pytorch / XLA / simulator routes and for split calls on
+    the native route; backward = segment_sum."""
 
     @staticmethod
     def forward(ctx, h, idx, plan, kernel):
@@ -563,7 +602,7 @@ def segment_sum(
         p = _check_plan(plan, e, n) if plan is not None else _plan_for(idx, n)
         x = _kernel_dtype_in(m2).contiguous()
         try:
-            if _d._native_path():
+            if _d._native_path() and _one_launch(e, n, f):
                 out = _kernel_segment_sum(x, p)
             else:
                 out = _SegmentSumFn.apply(x, idx, n, p, True)
@@ -609,7 +648,7 @@ def gather(
         p = _check_plan(plan, e, n) if plan is not None else _plan_for(idx, n)
         x = _kernel_dtype_in(h2).contiguous()
         try:
-            if _d._native_path():
+            if _d._native_path() and _one_launch(e, n, f):
                 out = _kernel_gather(x, p)
             else:
                 out = _GatherFn.apply(x, idx, p, True)

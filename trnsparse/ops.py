@@ -27,6 +27,8 @@ import warnings
 
 import torch
 
+from ._cat import cat as _cat
+from ._cat import stack as _stack
 from .formats import BSRMatrix, COOMatrix, CSRMatrix, _csr_to_dense_host
 from .nki.dispatch import _fp64_host_guard
 
@@ -252,13 +254,13 @@ def sparse_add(A: CSRMatrix, B: CSRMatrix, alpha: float = 1.0, beta: float = 1.0
 
     coo_a = A.to_coo()
     coo_b = B.to_coo()
-    indices = torch.stack(
+    indices = _stack(
         [
-            torch.cat([coo_a.row_indices, coo_b.row_indices]),
-            torch.cat([coo_a.col_indices, coo_b.col_indices]),
+            _cat([coo_a.row_indices, coo_b.row_indices]),
+            _cat([coo_a.col_indices, coo_b.col_indices]),
         ]
     )
-    values = torch.cat([alpha * coo_a.values, beta * coo_b.values])
+    values = _cat([alpha * coo_a.values, beta * coo_b.values])
 
     coalesced = torch.sparse_coo_tensor(indices, values, size=A.shape).coalesce()
     csr = coalesced.to_sparse_csr()
@@ -661,11 +663,11 @@ def _block_sparse_attn_rows(Q, K, V, mask_bsr, scale: float) -> torch.Tensor:
         if not cs:
             outs.append(Q.new_zeros(b, V.shape[1]))
             continue
-        k_rows = torch.cat([K[c * b : (c + 1) * b] for c in cs])
-        v_rows = torch.cat([V[c * b : (c + 1) * b] for c in cs])
+        k_rows = _cat([K[c * b : (c + 1) * b] for c in cs])
+        v_rows = _cat([V[c * b : (c + 1) * b] for c in cs])
         p = torch.softmax((Q[m * b : (m + 1) * b] @ k_rows.T) * scale, dim=-1)
         outs.append(p @ v_rows)
-    return torch.cat(outs)
+    return _cat(outs)
 
 
 def _attn_grads_with_graph(Q, K, V, dO, mask_bsr, ctx):

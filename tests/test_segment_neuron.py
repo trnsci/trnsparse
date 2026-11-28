@@ -199,8 +199,10 @@ def test_more_than_2_24_edges():
     assert torch.equal(gm.cpu(), go[idx])  # edge ids above 2^24 gathered exactly
 
 
-def _run_pair(idx, n, F, plan, g):
-    """segment_sum, its grad, gather and its grad on the device (host results)."""
+def _run_pair(idx, n, F, plan, g, check_inputs=False):
+    """segment_sum, its grad, gather and its grad on the device (host results).
+    With `check_inputs`, the device inputs are re-read afterwards and must be
+    unchanged (the device cat of #150 overwrote its inputs)."""
     e = idx.numel()
     idx_d = idx.to(DEV)
     m, go = torch.randn(e, F, generator=g), torch.randn(n, F, generator=g)
@@ -208,6 +210,8 @@ def _run_pair(idx, n, F, plan, g):
     out = trnsparse.segment_sum(md, idx_d, n, plan=plan)
     (gm,) = torch.autograd.grad(out, md, go.to(DEV))
     res = {"sum": out.detach().cpu(), "gm": gm.cpu()}
+    if check_inputs:
+        assert torch.equal(md.detach().cpu(), m), "segment_sum changed its input"
     del md, out, gm
     gc.collect()  # the 4096-atom case needs the device memory back
     h, ge = torch.randn(n, F, generator=g), torch.randn(e, F, generator=g)
@@ -215,6 +219,8 @@ def _run_pair(idx, n, F, plan, g):
     got = trnsparse.gather(hd, idx_d, plan=plan)
     (gh,) = torch.autograd.grad(got, hd, ge.to(DEV))
     res.update(got=got.detach().cpu(), gh=gh.cpu())
+    if check_inputs:
+        assert torch.equal(hd.detach().cpu(), h), "gather changed its input"
     del hd, got, gh
     gc.collect()
     return res, (m, go, h, ge)
@@ -253,7 +259,16 @@ def test_4096_atoms_layer1_one_launch_and_split(monkeypatch):
     4.7e9 bytes per operand. It runs as one launch on the kernel, never on the
     pytorch path (device aten index_add_ / index_select fail at this size),
     and #140's 2^31-byte budget (2048 + 2048 + 1024 columns, cut from row
-    blocks) gives the same bits."""
+    blocks) gives the same bits.
+
+    The device regression test for #150: run it at NEURON_LOGICAL_NC_CONFIG=1.
+    Through 0.18.0 the split joined its chunks with a device torch.cat into
+    the 4.7e9-byte gather output, which at LNC=1 is wrong in 63 % of the
+    elements and overwrites its inputs (aws-neuron/aws-neuron-sdk#1502). The
+    split now copies each launch's columns into one preallocated output; no
+    device torch.cat above 2^32 bytes may run, and the inputs stay intact. A
+    split call runs through the autograd.Function pair, so its backward
+    launches are split (and counted) too."""
     seg = trnsparse.segment
     _no_pytorch_path(monkeypatch)
     calls = []
@@ -273,8 +288,17 @@ def test_4096_atoms_layer1_one_launch_and_split(monkeypatch):
     del m, go, h, ge
     calls.clear()
     monkeypatch.setattr(seg, "_SEG_MAX_BYTES", 2**31)
-    split, _ = _run_pair(rcv, n, 5120, plan, torch.Generator().manual_seed(2))
-    assert calls == [2048, 2048, 1024] * 2
+    real_cat = torch.cat
+
+    def cat(tensors, *a, **k):  # checked before it runs: the bad cat corrupts its inputs
+        nbytes = sum(t.numel() * t.element_size() for t in tensors)
+        on_dev = any(t.device.type == DEV for t in tensors)
+        assert not on_dev or nbytes <= 2**32, f"device torch.cat of {nbytes} bytes"
+        return real_cat(tensors, *a, **k)
+
+    monkeypatch.setattr(torch, "cat", cat)
+    split, _ = _run_pair(rcv, n, 5120, plan, torch.Generator().manual_seed(2), check_inputs=True)
+    assert calls == [2048, 2048, 1024] * 4
     for k, v in one.items():
         assert torch.equal(v, split[k]), k
 

@@ -33,6 +33,7 @@ import warnings
 import numpy as np
 import torch
 
+from .._cat import cat as _cat
 from . import kernels as _kernels
 from .kernels import _TILE_K, _TILE_M, _TILE_N, HAS_NKI
 
@@ -1133,7 +1134,7 @@ def _bsr_pad_and_gather(A, B: torch.Tensor):
 
     # Pad A with a single zero block at index `n_blocks` for masked slots.
     zero_block = torch.zeros(1, b, b, dtype=A.dtype, device=A.blocks.device)
-    blocks_with_zero = torch.cat([A.blocks, zero_block], dim=0)
+    blocks_with_zero = _cat([A.blocks, zero_block], dim=0)
     masked_idx = torch.where(
         block_idx_grid >= 0, block_idx_grid, torch.tensor(A.n_blocks, dtype=torch.long)
     )
@@ -1293,7 +1294,7 @@ def _nki_bsr_spmm_complex(A, B: torch.Tensor) -> torch.Tensor:
     """
     out_dtype = torch.promote_types(A.blocks.dtype, B.dtype)
     n = B.shape[1]
-    b_parts = torch.cat([B.real, B.imag], dim=1) if B.is_complex() else B
+    b_parts = _cat([B.real, B.imag], dim=1) if B.is_complex() else B
     blocks = A.blocks
     a_parts = (blocks.real, blocks.imag) if blocks.is_complex() else (blocks,)
     prods = [nki_bsr_spmm(_BlockView(A, a), b_parts) for a in a_parts]
@@ -1727,7 +1728,7 @@ def _attn_gather(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, mask_bsr, sc
         extra = head_dim_k - head_dim
 
         def _pad_hd(t: torch.Tensor, ndim_extra: int) -> torch.Tensor:
-            return torch.cat([t, t.new_zeros(*t.shape[:-1], ndim_extra)], dim=-1)
+            return _cat([t, t.new_zeros(*t.shape[:-1], ndim_extra)], dim=-1)
 
         q_scaled_blocks = _pad_hd(q_scaled_blocks, extra)
         k_gathered_pad = _pad_hd(k_gathered_pad, extra)
@@ -2030,7 +2031,7 @@ def _attn_bwd_gather(
         extra = head_dim_k - head_dim
 
         def _pad_hd(t: torch.Tensor) -> torch.Tensor:
-            return torch.cat([t, t.new_zeros(*t.shape[:-1], extra)], dim=-1)
+            return _cat([t, t.new_zeros(*t.shape[:-1], extra)], dim=-1)
 
         Q = _pad_hd(Q)
         K = _pad_hd(K)
@@ -2461,9 +2462,9 @@ def _kmv_block(xs, ys, vs, ps, i0: int, rows: int, n: int, kind, group, sim):
     xb = xs[i0 : i0 + nb]
     vb = vs[i0 : i0 + nb] if self_op else None
     if nb < rows:
-        xb = torch.cat([xb, xb.new_zeros(rows - nb, xs.shape[1])])
+        xb = _cat([xb, xb.new_zeros(rows - nb, xs.shape[1])])
         if self_op:
-            vb = torch.cat([vb, vb.new_zeros(rows - nb, vs.shape[1])])
+            vb = _cat([vb, vb.new_zeros(rows - nb, vs.shape[1])])
     return _kmv_launch(xb, xs if self_op else ys, vs, vb, ps, kind, group, sim)
 
 
