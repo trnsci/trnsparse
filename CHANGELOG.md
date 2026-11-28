@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **PSUM accumulation groups now open with a matmul write
+  (trnsci/trnsci#185).** The kernels zeroed their fp32 PSUM accumulators
+  with `nl.zeros(..., buffer=nl.psum)` or a PSUM `memset` and then
+  accumulated with `nc_matmul(..., accumulate=True)`. The `nc_matmul`
+  documentation calls a matmul accumulating onto PSUM that a non-matmul
+  instruction initialised undefined behaviour on NeuronCore-v3 (Trn2): the
+  first matmul into a PSUM location must use `accumulate=False`. Device
+  results have matched references so far, but the pattern could break with a
+  compiler or runtime change. Now the first matmul of each group overwrites
+  (`accumulate=False`, or `accumulate=k > 0` over a Python `range`) in the
+  dense, BSR, screened and pre-transposed SpMM kernels, the screened-tile and
+  row-group kernels, and the gather and static attention kernels (forward and
+  backward). An accumulator is zeroed only when no matmul writes it (an
+  empty padded group). The fused CG / power-iteration matvec tiles hold many
+  groups (one per block row, interleaved, overlapping in the spread layout,
+  none for an empty row), so a matmul of bf16 zeros (one partition) now
+  zeroes each tile instead of the memset, one extra TensorE instruction per
+  matvec PSUM tile; the partition-sum dot products, one matmul each, now
+  overwrite instead. The GP kernel-matmul (`kernel_matmul`) tiles and
+  `segment_sum` already opened their groups with `accumulate=False` and are
+  unchanged. Simulator outputs are bitwise equal to the previous ones at
+  every simulator test shape. `tests/test_psum_accumulate_lint.py` fails on
+  the pattern.
+
 - **`test_feature_chunks_bitwise` no longer depends on the CI host's CPU
   (#146).** The simulator runs `nc_matmul` as `np.matmul`, and OpenBLAS
   picks its sgemm kernel by CPU. On some kernels the fp32 sum order for a
