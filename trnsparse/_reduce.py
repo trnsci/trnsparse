@@ -23,6 +23,8 @@ import os
 
 import torch
 
+from ._cat import cat as _cat
+
 REDUCTIONS = ("pairwise", "host64", "device")
 _FOLD_LEAF = 64
 _HOST = torch.device("cpu")
@@ -51,7 +53,7 @@ def fold_host64(t: torch.Tensor, leaf: int = _FOLD_LEAF) -> torch.Tensor:
     lev, m = fold_plan(n, leaf)
     npad = m << lev
     if npad != n:
-        t = torch.cat([t, t.new_zeros((npad - n, *t.shape[1:]))], 0)
+        t = _cat([t, t.new_zeros((npad - n, *t.shape[1:]))], 0)
     for _ in range(lev):
         h = t.shape[0] // 2
         t = t[:h] + t[h:]

@@ -724,6 +724,62 @@ def test_split_call_matches_independent_reference(monkeypatch, kernel_route):
     assert torch.equal(ts.gather(h, idx), h[idx])
 
 
+def _forbid_cat(monkeypatch):
+    """torch.cat that fails: a split call assembles its chunks without it (#150)."""
+
+    def cat(*a, **k):
+        raise AssertionError("torch.cat in a feature-split call")
+
+    monkeypatch.setattr(torch, "cat", cat)
+
+
+@pytest.mark.parametrize("route", ["cpu", "native"])
+def test_split_preallocates_output_bitwise(monkeypatch, kernel_route, route):
+    # #150: device torch.cat into an output past 2^32 bytes is wrong at LNC=1
+    # on trn2. A forced split (2048 + 2048 + 1024 columns, 700-row blocks)
+    # copies each launch's columns into one preallocated output, with no
+    # torch.cat at all, and is bitwise equal to one launch: forward and both
+    # backwards. On the native route the split call runs through the
+    # autograd.Function pair, so its backward launches are split too.
+    idx, _ = _graph(216, 3000, seed=150)
+    plan = ts.segment_plan(idx, 216)
+    one = _sum_gather_and_grads(idx, 216, 5120, plan, seed=150)
+    assert [w for _, w in kernel_route] == [5120] * 4
+    monkeypatch.setattr(dispatch, "_dispatch_path", route)
+    monkeypatch.setattr(seg, "_SEG_MAX_BYTES", seg._launch_rows(3000, 216) * 4 * 3000)
+    monkeypatch.setattr(seg, "_SEG_SLICE_BYTES", 5120 * 4 * 700)
+    assert dispatch._native_path() == (route == "native")
+    kernel_route.clear()
+    with monkeypatch.context() as mp:
+        _forbid_cat(mp)
+        split = _sum_gather_and_grads(idx, 216, 5120, plan, seed=150)
+    assert [w for _, w in kernel_route] == [2048, 2048, 1024] * 4
+    assert [op for op, _ in kernel_route[::3]] == [
+        "segment_sum_tiles",
+        "gather_rows",
+        "gather_rows",
+        "segment_sum_tiles",
+    ]
+    for a, b in zip(one, split, strict=True):
+        assert a.is_contiguous() and torch.equal(a, b)
+
+
+def test_split_does_not_touch_its_input(monkeypatch, kernel_route):
+    # The device cat of #150 also overwrote its inputs. The split call reads
+    # its input only.
+    idx, g = _graph(216, 3000, seed=151)
+    monkeypatch.setattr(seg, "_SEG_MAX_BYTES", seg._launch_rows(3000, 216) * 4 * 3000)
+    monkeypatch.setattr(seg, "_SEG_SLICE_BYTES", 5120 * 4 * 700)
+    m = torch.randn(3000, 5120, generator=g)
+    h = torch.randn(216, 5120, generator=g)
+    m0, h0 = m.clone(), h.clone()
+    out = ts.segment_sum(m, idx, 216)
+    got = ts.gather(h, idx)
+    assert torch.equal(m, m0) and torch.equal(h, h0)
+    assert torch.equal(got, h[idx])
+    assert rel(out, onehot_fp64(m, idx, 216)) <= 1e-6
+
+
 # ── padding mask (#141) ──────────────────────────────────────────────────────
 
 

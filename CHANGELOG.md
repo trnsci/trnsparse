@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A feature-split `segment_sum` / `gather` no longer joins its chunks
+  with a device `torch.cat` (#150).** At LNC=1 on Trn2 (SDK 2.33.1), device
+  aten `cat` into an output above 2^32 bytes writes to wrong places,
+  including its own inputs' memory (aws-neuron/aws-neuron-sdk#1502). The
+  forced split (`_SEG_MAX_BYTES = 2^31`) of a 4096-atom layer-1 `gather`
+  (229376 x 5120 fp32, 4.7e9 bytes) was wrong in 63 % of the elements; the
+  one-launch result was exact. Default calls split only above 2^34 bytes, so
+  MLIP-sized calls were not affected, but a split call that large at LNC=1
+  could have returned wrong values silently. A split call now preallocates
+  its output once and copies each launch's columns into it, one row block of
+  at most 2^31 bytes at a time, and cuts each launch's input the same way
+  (that cut was also a device `cat`, up to 2^34 bytes). The copies move bits,
+  so results are bitwise equal to one launch. On the native path a split
+  call now runs through the `torch.autograd.Function` pair, as the XLA and
+  simulator routes do, so its backward launches are split the same way. The
+  other device `torch.cat` / `torch.stack` calls that can exceed 2^32 bytes
+  (`from_dense` values, BSR SpMM zero-block padding and complex `[Re | Im]`
+  operands, attention head-dim padding, `kernel_matmul` complex operands and
+  row-block padding, `sparse_add`, the attention double-backward rows, the
+  pairwise-fold padding) go through `trnsparse._cat.cat`, which is
+  `torch.cat` up to 2^32 bytes and preallocates above it.
+
 ## [0.18.0] — 2026-11-28
 
 ### Fixed

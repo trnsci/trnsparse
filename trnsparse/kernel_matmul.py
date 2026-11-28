@@ -54,6 +54,7 @@ import warnings
 
 import torch
 
+from ._cat import cat as _cat
 from .nki import dispatch as _dispatch
 from .nki.kernels import _KMV_KINDS, _KMV_MAX_D, _KMV_MAX_GROUP, kmv_group
 
@@ -128,7 +129,7 @@ def _split_complex(V: torch.Tensor) -> tuple[torch.Tensor, int]:
     """
     if not V.is_complex():
         return V, 0
-    return torch.cat([V.real, V.imag], dim=1), V.shape[1]
+    return _cat([V.real, V.imag], dim=1), V.shape[1]
 
 
 def _join_complex(out: torch.Tensor, R: int) -> torch.Tensor:
